@@ -1,13 +1,17 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  correlatePeerRequestTurn,
   extractAssistantText,
+  inboxDir,
   isTalkRequest,
   isTalkResponse,
   isPeerRecord,
+  newRequestId,
+  nowIso,
   publicPeerId,
   recordPath,
   removeOwnedRecord,
@@ -15,6 +19,9 @@ import {
   requeueProcessing,
   resolveTarget,
   routeForRequest,
+  sessionDir,
+  waitForResponseOrPending,
+  waitersDir,
   type PeerRecord,
   type TalkRequest,
 } from "../../pi-extension/pi-peer/protocol.ts";
@@ -64,6 +71,41 @@ describe("peer session talk", () => {
     assert.match(prompt, /from="api&amp;review"/);
   });
 
+  it("prefixes request ids so filename sort follows enqueue time", () => {
+    const originalNow = Date.now;
+    let currentTime = 1_700_000_000_000;
+    try {
+      Date.now = () => currentTime;
+      const first = newRequestId();
+      currentTime = 2_500_000_000_000;
+      const second = newRequestId();
+      const firstTimestamp = first.split("_")[1];
+      const secondTimestamp = second.split("_")[1];
+      assert.match(first, /^req_[0-9a-z]+_[0-9a-f-]{36}$/);
+      assert.match(second, /^req_[0-9a-z]+_[0-9a-f-]{36}$/);
+      assert.equal(firstTimestamp.length, secondTimestamp.length, "timestamp prefixes retain a sortable width");
+      assert.deepEqual([second, first].sort(), [first, second], "filename order keeps older requests first");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("correlates peer request turns and preserves the host fallback state", () => {
+    const peerPrompt = requestMessage({
+      version: 1, type: "request", id: "req-1", from: "session-a", to: "session-b",
+      message: "Review", route: ["session-a"], createdAt: "now",
+    }, "alpha");
+    assert.equal(correlatePeerRequestTurn([{
+      role: "user", content: [{ type: "text", text: peerPrompt }],
+    }], "req-1"), true);
+    assert.equal(correlatePeerRequestTurn([{
+      role: "user", content: [{ type: "text", text: "A normal user turn" }],
+    }], "req-1"), false);
+    assert.equal(correlatePeerRequestTurn([{
+      role: "assistant", content: [{ type: "text", text: "Only assistant output" }],
+    }], "req-1"), undefined);
+  });
+
   it("rejects envelopes with empty identities", () => {
     const baseRequest = {
       version: 1, type: "request", id: "req-1", from: "session-a", to: "session-b",
@@ -74,6 +116,7 @@ describe("peer session talk", () => {
     assert.equal(isTalkRequest({ ...baseRequest, from: "" }), false, "empty from rejected");
     assert.equal(isTalkRequest({ ...baseRequest, to: "" }), false, "empty to rejected");
     assert.equal(isTalkRequest({ ...baseRequest, route: ["session-a", ""] }), false, "empty route member rejected");
+    assert.equal(isTalkRequest({ ...baseRequest, route: ["session-b", "session-a"] }), false, "route cannot revisit the destination");
     assert.equal(isTalkRequest({ ...baseRequest, route: [""] }), false, "fully empty route rejected");
 
     const baseResponse = {
@@ -369,6 +412,152 @@ describe("peer session talk", () => {
       mkdirSync(join(root, "latest"), { recursive: true });
       writeFileSync(join(root, "latest", "session-a.json"), JSON.stringify({ version: 1, type: "latest", sessionId: "session-a", events: [staleEvent], updatedAt: "t" }));
       assert.deepEqual(readHistory(root, "session-a").events, [], "stale thinking must not surface before the publisher rebuilds");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails fast with 'no longer live' when the target registration is missing or stale (heartbeat expired), and withdraws request + waiter", async () => {
+    const root = createTestDir();
+    try {
+      const request: TalkRequest = {
+        version: 1,
+        type: "request",
+        id: "req_liveness_dead",
+        from: "session-a",
+        to: "session-b",
+        message: "ping",
+        route: ["session-a"],
+        createdAt: nowIso(),
+      };
+      const record = {
+        schemaVersion: 1,
+        sessionId: "session-b",
+        name: "beta",
+        cwd: "/work/beta",
+        workspaceId: "workspace-1",
+        paneId: "pane-b",
+        terminalId: "term-b",
+        createdAt: nowIso(),
+      };
+      // (a) Missing registration (session_shutdown ran before the call).
+      mkdirSync(inboxDir(root, "session-b"), { recursive: true });
+      mkdirSync(waitersDir(root, "session-a"), { recursive: true });
+      mkdirSync(sessionDir(root), { recursive: true });
+      writeFileSync(join(inboxDir(root, "session-b"), `${request.id}.json`), JSON.stringify(request));
+      writeFileSync(join(waitersDir(root, "session-a"), `${request.id}.json`), JSON.stringify({
+        version: 1, type: "waiter", requestId: request.id, from: "session-a", to: "session-b", createdAt: nowIso(),
+      }));
+      await assert.rejects(
+        waitForResponseOrPending(root, request, 60_000, undefined, undefined, 5_000, 20),
+        /no longer live/,
+      );
+      assert.equal(existsSync(join(inboxDir(root, "session-b"), `${request.id}.json`)), false, "queued request withdrawn (missing record)");
+      assert.equal(existsSync(join(waitersDir(root, "session-a"), `${request.id}.json`)), false, "waiter withdrawn (missing record)");
+
+      // (b) Stale registration (peer crashed: heartbeat stopped refreshing).
+      const request2: TalkRequest = { ...request, id: "req_liveness_stale" };
+      writeFileSync(join(inboxDir(root, "session-b"), `${request2.id}.json`), JSON.stringify(request2));
+      writeFileSync(join(waitersDir(root, "session-a"), `${request2.id}.json`), JSON.stringify({
+        version: 1, type: "waiter", requestId: request2.id, from: "session-a", to: "session-b", createdAt: nowIso(),
+      }));
+      const recordPathB = recordPath(root, "session-b");
+      writeFileSync(recordPathB, JSON.stringify(record));
+      utimesSync(recordPathB, new Date(Date.now() - 90_000), new Date(Date.now() - 90_000));
+      await assert.rejects(
+        waitForResponseOrPending(root, request2, 60_000, undefined, undefined, 5_000, 20),
+        /no longer live/,
+      );
+      assert.equal(existsSync(join(inboxDir(root, "session-b"), `${request2.id}.json`)), false, "queued request withdrawn (stale record)");
+      assert.equal(existsSync(join(waitersDir(root, "session-a"), `${request2.id}.json`)), false, "waiter withdrawn (stale record)");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns pending when the target registration heartbeat is fresh, and keeps request + waiter for the later wake", async () => {
+    const root = createTestDir();
+    try {
+      const request: TalkRequest = {
+        version: 1,
+        type: "request",
+        id: "req_liveness_fresh",
+        from: "session-a",
+        to: "session-b",
+        message: "ping",
+        route: ["session-a"],
+        createdAt: nowIso(),
+      };
+      mkdirSync(inboxDir(root, "session-b"), { recursive: true });
+      mkdirSync(waitersDir(root, "session-a"), { recursive: true });
+      mkdirSync(sessionDir(root), { recursive: true });
+      writeFileSync(join(inboxDir(root, "session-b"), `${request.id}.json`), JSON.stringify(request));
+      const waiterPath = join(waitersDir(root, "session-a"), `${request.id}.json`);
+      writeFileSync(waiterPath, JSON.stringify({
+        version: 1, type: "waiter", requestId: request.id, from: "session-a", to: "session-b", createdAt: nowIso(),
+      }));
+      // Fresh registration: the target is alive (its poll tick heartbeats it),
+      // so a slow reply must end in pending, never a hard failure.
+      writeFileSync(recordPath(root, "session-b"), JSON.stringify({
+        schemaVersion: 1,
+        sessionId: "session-b",
+        name: "beta",
+        cwd: "/work/beta",
+        workspaceId: "workspace-1",
+        paneId: "pane-b",
+        terminalId: "term-b",
+        createdAt: nowIso(),
+      }));
+      const result = await waitForResponseOrPending(root, request, 60_000, undefined, undefined, 600, 20);
+      assert.equal(result.state, "pending", "fresh registration must not fail the wait");
+      assert.ok(existsSync(join(inboxDir(root, "session-b"), `${request.id}.json`)), "queued request kept for the pending wake");
+      const waiter = JSON.parse(readFileSync(waiterPath, "utf8"));
+      assert.ok(waiter.timedOutAt, "pending keeps the waiter marked timed out for the later wake");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors a short timeoutMs as the exact wait deadline (no 10-min floor)", async () => {
+    const root = createTestDir();
+    try {
+      const request: TalkRequest = {
+        version: 1,
+        type: "request",
+        id: "req_short_timeout",
+        from: "session-a",
+        to: "session-b",
+        message: "final?",
+        route: ["session-a"],
+        createdAt: nowIso(),
+      };
+      mkdirSync(inboxDir(root, "session-b"), { recursive: true });
+      mkdirSync(waitersDir(root, "session-a"), { recursive: true });
+      mkdirSync(sessionDir(root), { recursive: true });
+      writeFileSync(join(inboxDir(root, "session-b"), `${request.id}.json`), JSON.stringify(request));
+      const waiterPath = join(waitersDir(root, "session-a"), `${request.id}.json`);
+      writeFileSync(waiterPath, JSON.stringify({
+        version: 1, type: "waiter", requestId: request.id, from: "session-a", to: "session-b", createdAt: nowIso(),
+      }));
+      // Live registration: a slow reply ends as pending at the exact timeout.
+      writeFileSync(recordPath(root, "session-b"), JSON.stringify({
+        schemaVersion: 1,
+        sessionId: "session-b",
+        name: "beta",
+        cwd: "/work/beta",
+        workspaceId: "workspace-1",
+        paneId: "pane-b",
+        terminalId: "term-b",
+        createdAt: nowIso(),
+      }));
+      // A 400 ms timeout must not balloon to the 10 min default; a stale
+      // registration would then fail the same shape instead of returning pending.
+      const started = Date.now();
+      const result = await waitForResponseOrPending(root, request, 400);
+      const elapsed = Date.now() - started;
+      assert.equal(result.state, "pending");
+      assert.ok(elapsed < 4_000, `short timeout must return promptly (took ${elapsed} ms)`);
+      assert.ok(existsSync(join(inboxDir(root, "session-b"), `${request.id}.json`)), "request kept for pending wake");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

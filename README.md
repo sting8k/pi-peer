@@ -78,7 +78,11 @@ tool: talk_sessions
 
 Returns one line per live peer:
 `<public-id>  <name>  <status>` (the current session is marked
-`(current)`). The public id is `peer-<last 3 chars of the session id>`
+`(current)`). When a peer has queued inbound requests (files still
+present in its inbox), the line also shows `(N queued)` — e.g.
+`peer-123  pi-roo  working  (2 queued)`. A peer with an empty inbox
+stays in the plain format. The public id is `peer-<last 3 chars of the
+session id>`
 (e.g. `peer-123`) — the full session id stays internal. Status is one of
 `idle | working | blocked | done | unknown`.
 Stale panes (no live HerdR process) are excluded.
@@ -116,7 +120,7 @@ Parameters:
 | --- | --- | --- | --- |
 | `target` | string | yes | Public peer id (`peer-xxx`, from `talk_sessions`) or unique display name. |
 | `message` | string | yes | Non-empty request message. |
-| `timeoutMs` | number | no | Soft timeout, clamped to 1 000–3 600 000 ms. Default 600 000 ms (10 min). |
+| `timeoutMs` | number | no | Soft timeout, clamped to 1 000–3 600 000 ms. Default 600 000 ms (10 min). When it passes with the target still alive, the call returns a non-error `pending` result and the reply arrives later via wake. |
 
 ```text
 tool: talk_to target="peer-123" message="What is your independent take on the design?"
@@ -134,14 +138,44 @@ tool: talk_to target="peer-123" message="What is your independent take on the de
   by one central formatter; it is what `talk_sessions` returns and what
   examples lead with.
 - **Queueing.** A request is queued in the target's inbox immediately and is
-  delivered when the receiver's own `agent_start`/`agent_end` busy state is
-  idle; the target's HerdR status is shown for context. Progress updates
-  (`queued`/`processing`) are streamed while waiting.
+  delivered in filename order when the receiver's own `agent_start`/`agent_end`
+  busy state is idle; request ids prefix their creation time so older requests
+  are served first. The target's HerdR status is shown for context. Progress
+  updates (`queued`/`processing`) are streamed while waiting.
+- **Turn correlation.** When `agent_end` exposes the user prompt, the receiver
+  writes a reply only if its `<peer_message>` carries the exact `request_id`;
+  hosts that expose only assistant/error messages retain the compatibility
+  fallback, bounded by a consecutive-idle claim watchdog (~30s).
 - **Abort & timeout.** Aborting a `talk_to` call withdraws a **queued** request
-  only; an already-processing request is not interrupted. A soft timeout fires
-  at `timeoutMs` (default 10 min); while HerdR still confirms the target is
-  live, the wait continues up to a hard deadline of `max(timeoutMs, 10 min)`.
-  If the target is no longer live, the call fails.
+  only; an already-processing request is not interrupted. The call waits until
+  the exact `timeoutMs` deadline (default 10 min) and then returns a non-error
+  `pending` result if the target is still alive/processing. The target's
+  registration is the authoritative liveness signal: every live session
+  heartbeats it (refresh every 10 s), and a missing or stale registration
+  (peer shutdown or crash) fails the call immediately and withdraws the queued
+  request and the waiter — no blind wait, no false pending wake.
+- **Pending wake (default-on).** Every `talk_to` writes a waiter for the
+  request. When the hard deadline passes while the target is **still alive /
+  processing**, the call returns a **non-error `pending` result** telling the
+  caller not to resend: the reply is delivered later as a real user message
+  `<peer_pong ...>` that wakes the caller's session automatically. An
+  in-deadline reply is returned directly and consumes the waiter — no
+  duplicate wake. Abort removes both the queued request and the waiter, so no
+  wake ever fires for a cancelled call.
+- **Cleanup (GC).** The idle poll sweeps this session's own artifacts: a
+  pending waiter whose target has died is closed with a `<peer_pong ok="false">`
+  failure wake (the wake promise is kept even when the news is bad); an
+  un-timed waiter older than 90 min is an orphaned wait and is removed; a
+  reply without its waiter is an orphan and is removed. Session shutdown drops
+  the session's own waiters and replies (so a pending "do not resend" promise
+  does not survive a quit-then-restart); dead sessions' full artifact sets are
+  collected cross-session after a 24 h TTL plus one 5 min re-observation grace.
+- **Invalid requests are rejected, not dropped.** An inbox request that fails
+  validation (malformed JSON, missing fields, route cycle, wrong receiver) is
+  answered with an `ok=false` reply written to the caller's `replies/` dir as
+  long as the caller session id is recoverable, so the caller's waiter is
+  closed immediately instead of stranding until GC. Only a request with no
+  recoverable addressing is removed without a reply.
 - **Route protection.** Requests carry a route of already-visited sessions;
   cycles are rejected before a request is delivered.
 - **History.** Each session publishes a bounded history (max 10 events) rebuilt
@@ -151,11 +185,16 @@ tool: talk_to target="peer-123" message="What is your independent take on the de
   published.** No session ever reads **another** peer's transcript —
   `talk_latest` reads only the published artifact.
 - **Busy tracking.** Inbox delivery is gated by the receiver's `selfBusy`
-  flag, set from its own `agent_start`/`agent_end` events. A peer's HerdR
-  status is liveness/snapshot/progress information — it does not gate delivery.
-- **Liveness.** Peer records are removed on `session_shutdown`; sessions whose
-  HerdR pane is no longer alive are excluded from `talk_sessions` and delivery
-  failures surface as errors.
+  flag, set from its own `agent_start`/`agent_end` events and reset at
+  `session_start` so a missed end event cannot permanently block delivery. A
+  peer's HerdR status is liveness/snapshot/progress information — it does not gate delivery.
+- **Liveness.** Every live session heartbeats its registration (touch every
+  10 s). A missing registration (shutdown) fails a `talk_to` immediately; a
+  stale one (crash) fails it after two consecutive checks (~10 s). Sessions
+  with a stale registration are excluded from `talk_sessions` and cannot be
+  targeted. Delivery is fire-and-forget: a host-side delivery failure leaves
+  the request claimed and surfaces through liveness rather than an error
+  reply.
 - **Opt-out.** Set `PI_PEER_DISABLED=1` for sessions that must not appear as
   peers or receive requests.
 
@@ -170,6 +209,7 @@ Peer artifacts live under `<agent-dir>/pi-peer/talk/<workspace-id>/`, where
 | `latest/` | Latest published history per peer (one JSON file per session). |
 | `inbox/` | Queued requests per target session. |
 | `replies/<caller-session-id>/` | Responses written by the answering peer, one file per request id. |
+| `waiters/<caller-session-id>/` | Caller-owned pending wake trackers, one file per request id (written for every `talk_to`; consumed on direct reply, abort, or after a `<peer_pong>` wake). |
 
 Writes are atomic (temp file + rename); the mailbox directory is created with
 `0700` permissions. The namespace is a clean break from the legacy
@@ -179,9 +219,9 @@ Writes are atomic (temp file + rename); the mailbox directory is created with
 
 ```sh
 npm install
-npm test              # 27 tests (3 suites)
+npm test              # 31 tests (3 suites)
 npm run test:focused  # 24 tests, no integration
-npm run test:integration  # 3 mocked two-peer lifecycle tests
+npm run test:integration  # 6 mocked two-peer lifecycle tests
 npm run typecheck     # tsc --noEmit
 ```
 

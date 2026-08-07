@@ -8,7 +8,7 @@ export const TalkToParams = Type.Object({
     description: "Message to send to the peer session.",
   }),
   timeoutMs: Type.Optional(Type.Number({
-    description: "Optional soft timeout in milliseconds. After it elapses, talk_to keeps waiting while HerdR confirms the peer is live, up to a minimum hard deadline of 10 minutes.",
+    description: "Optional wait in milliseconds before returning a non-error pending result. Effective deadline is the exact timeoutMs (default 10 min, clamped 1 000–3 600 000 ms); when it passes with the target still alive, the call returns a non-error pending result and this session is woken later with the reply. Liveness is verified periodically; a confirmed-dead target fails the call.",
   })),
 });
 

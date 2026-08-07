@@ -44,9 +44,10 @@ the public id is a presentation-only alias derived by one central formatter.
   state); the target's HerdR status is shown for context. Progress updates
   (`queued`/`processing`) are streamed.
 - **Abort & timeout.** Abort withdraws a queued request only
-  (already-processing work is not interrupted). Soft timeout defaults to 10
-  minutes (clamped 1 000–3 600 000 ms); while HerdR still confirms the target
-  is live, the wait continues to a hard deadline of `max(timeoutMs, 10 min)`.
+  (already-processing work is not interrupted). The wait ends after the exact
+  `timeoutMs` (default 10 min, clamped 1 000–3 600 000 ms); a live target that
+  has not replied by then yields a non-error `pending` result and the reply
+  arrives later via wake.
 - **History.** Bounded (max 10 events) per-peer history of **completed**
   events: user, assistant text, tool call, tool result. Thinking is never
   published; each peer rebuilds history from its own current-lineage session

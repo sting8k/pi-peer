@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 
 import { readJson, safeKey, writeAtomic } from "./storage.ts";
@@ -54,7 +54,22 @@ export interface TalkResponse {
   createdAt: string;
 }
 
-export type TalkProgressState = "queued" | "processing";
+export interface TalkWaiter {
+  version: 1;
+  type: "waiter";
+  requestId: string;
+  from: string;
+  to: string;
+  targetName?: string;
+  createdAt: string;
+  timedOutAt?: string;
+}
+
+export type TalkWaitResult =
+  | { state: "completed"; response: TalkResponse }
+  | { state: "pending" };
+
+export type TalkProgressState = "queued" | "processing" | "pending";
 export type TalkProgressDetails = {
   source: "talk_to";
   requestId: string;
@@ -65,6 +80,26 @@ export type TalkProgressDetails = {
 
 export const POLL_MS = 250;
 export const STATUS_POLL_MS = 5_000;
+export const HEARTBEAT_INTERVAL_MS = 10_000;
+/** A registration older than this is treated as a dead peer (no heartbeat). */
+export const RECORD_STALE_MS = 60_000;
+/**
+ * Max age for a waiter that never timed out: an in-flight wait loop ends no
+ * later than its hard deadline (exact timeoutMs, clamped to 1–60 min), so an
+ * un-timed waiter older than this is an orphaned wait (caller process died).
+ * A crashed session's own waiter directory is not polled after its process
+ * exits; cross-session GC collects those artifacts after DEAD_SESSION_TTL_MS.
+ */
+export const WAITER_TTL_MS = 90 * 60_000;
+/**
+ * Cross-session GC: a registration older than this (no heartbeat, no clean
+ * shutdown) is a dead session whose whole artifact set is removed. 24 h is
+ * far beyond any laptop suspension; deletion also requires one 5-minute
+ * re-observation grace interval after the TTL is crossed.
+ */
+export const DEAD_SESSION_TTL_MS = 24 * 60 * 60_000;
+/** Cadence for the cross-session dead-session sweep on the idle poll. */
+export const DEAD_SESSION_SWEEP_MS = 5 * 60_000;
 export const DEFAULT_TIMEOUT_MS = 600_000;
 
 /**
@@ -91,6 +126,10 @@ export function sessionDir(root: string): string {
 
 export function inboxDir(root: string, sessionId: string): string {
   return join(root, "inbox", safeKey(sessionId));
+}
+
+export function waitersDir(root: string, sessionId: string): string {
+  return join(root, "waiters", safeKey(sessionId));
 }
 
 export function repliesDir(root: string, sessionId: string): string {
@@ -130,6 +169,7 @@ export function isTalkRequest(value: any): value is TalkRequest {
     && value.route.length > 0
     && value.route.every((entry: unknown) => typeof entry === "string" && entry.length > 0)
     && value.route.at(-1) === value.from
+      && !value.route.includes(value.to)
     && new Set(value.route).size === value.route.length;
 }
 
@@ -147,9 +187,128 @@ export function isTalkResponse(value: any): value is TalkResponse {
     && (value.ok ? typeof value.message === "string" : typeof value.error === "string");
 }
 
+export function isTalkWaiter(value: any): value is TalkWaiter {
+  return value?.version === 1
+    && value.type === "waiter"
+    && typeof value.requestId === "string"
+    && value.requestId.length > 0
+    && typeof value.from === "string"
+    && value.from.length > 0
+    && typeof value.to === "string"
+    && value.to.length > 0
+    && (value.targetName === undefined || typeof value.targetName === "string")
+    && typeof value.createdAt === "string"
+    && (value.timedOutAt === undefined || typeof value.timedOutAt === "string");
+}
+
 export function ensureRecord(root: string, record: PeerRecord): void {
   const path = recordPath(root, record.sessionId);
-  if (!existsSync(path)) writeAtomic(path, record);
+  // Heartbeat: a live session refreshes its registration on a schedule so
+  // peers can treat a stale record as death (a crashed process stops
+  // refreshing). Check mtime first (one syscall on 39/40 ticks) and only
+  // read + possibly touch the record when a refresh is actually due.
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(path).mtimeMs;
+  } catch {
+    // Missing or unreadable: (re)create the registration.
+    writeAtomic(path, record);
+    return;
+  }
+  if (Date.now() - mtimeMs < HEARTBEAT_INTERVAL_MS) return;
+  const current = readJson(path);
+  // Never clobber a record owned by a newer runtime; self-repair corrupt
+  // records so an unreadable registration cannot stay alive forever.
+  if (isPeerRecord(current) && current.registrationId !== record.registrationId) return;
+  try {
+    // Touch the record (one syscall) instead of re-serializing it.
+    utimesSync(path, new Date(), new Date());
+  } catch {
+    // utimes failed (unlinked concurrently): restore the registration.
+    writeAtomic(path, record);
+  }
+}
+
+/**
+ * Cross-session GC: remove artifacts of sessions that no longer exist or
+ * whose registration is older than DEAD_SESSION_TTL_MS (crashed / killed, no
+ * clean session_shutdown). A stale/missing registration must remain a dead
+ * observation for one sweep interval before deletion, so a peer waking from
+ * suspension can refresh its record before its queued work is destroyed.
+ * A live session is identified by a fresh registration record, which is
+ * written before any artifact of a startup. Runs on a slow cadence from any
+ * live session's idle poll.
+ */
+export function sweepDeadSessions(root: string, deadSince: Map<string, number> = new Map()): void {
+  const sessionDirPath = sessionDir(root);
+  if (!existsSync(sessionDirPath)) return;
+  const now = Date.now();
+  const liveIds = new Set<string>();
+  const observedIds = new Set<string>();
+  for (const name of readdirSync(sessionDirPath).filter((n) => n.endsWith(".json"))) {
+    const id = name.slice(0, -".json".length);
+    observedIds.add(id);
+    const path = join(sessionDirPath, name);
+    let dead = false;
+    try {
+      dead = now - statSync(path).mtimeMs > DEAD_SESSION_TTL_MS;
+    } catch {
+      dead = true;
+    }
+    if (dead) {
+      const firstDead = deadSince.get(id) ?? now;
+      deadSince.set(id, firstDead);
+      if (now - firstDead < DEAD_SESSION_SWEEP_MS) {
+        // One stale read is not enough: the peer may be waking from sleep.
+        liveIds.add(id);
+        continue;
+      }
+      deadSince.delete(id);
+      rmSync(path, { force: true });
+      removeDeadSessionArtifacts(root, id);
+    } else {
+      deadSince.delete(id);
+      liveIds.add(id);
+    }
+  }
+  // Artifact dirs/files whose session record no longer exists at all also get
+  // one grace interval, covering a concurrent registration write or cleanup.
+  const artifactIds = new Set<string>();
+  for (const sub of ["inbox", "replies", "waiters"] as const) {
+    const dir = join(root, sub);
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      observedIds.add(name);
+      artifactIds.add(name);
+    }
+  }
+  const latestPath = join(root, "latest");
+  if (existsSync(latestPath)) {
+    for (const name of readdirSync(latestPath).filter((n) => n.endsWith(".json"))) {
+      const id = name.slice(0, -".json".length);
+      observedIds.add(id);
+      artifactIds.add(id);
+    }
+  }
+  for (const id of artifactIds) {
+    if (liveIds.has(id)) continue;
+    const firstDead = deadSince.get(id) ?? now;
+    deadSince.set(id, firstDead);
+    if (now - firstDead >= DEAD_SESSION_SWEEP_MS) {
+      deadSince.delete(id);
+      removeDeadSessionArtifacts(root, id);
+    }
+  }
+  for (const id of deadSince.keys()) {
+    if (!observedIds.has(id)) deadSince.delete(id);
+  }
+}
+
+function removeDeadSessionArtifacts(root: string, id: string): void {
+  rmSync(join(root, "latest", `${id}.json`), { force: true });
+  rmSync(join(root, "inbox", id), { recursive: true, force: true });
+  rmSync(join(root, "replies", id), { recursive: true, force: true });
+  rmSync(join(root, "waiters", id), { recursive: true, force: true });
 }
 
 export function removeOwnedRecord(root: string, record: PeerRecord): void {
@@ -167,6 +326,30 @@ export function loadRecords(root: string): PeerRecord[] {
     .filter((name) => name.endsWith(".json"))
     .map((name) => readJson(join(sessionDir(root), name)))
     .filter(isPeerRecord);
+}
+
+/**
+ * Correlate an agent_end event with the peer request that should have
+ * triggered its turn. `undefined` preserves compatibility with hosts that
+ * report only assistant/error messages at agent_end.
+ */
+export function correlatePeerRequestTurn(messages: any[] | undefined, requestId: string): boolean | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  let sawUserMessage = false;
+  for (const message of messages) {
+    if (message?.role !== "user") continue;
+    sawUserMessage = true;
+    const blocks = typeof message.content === "string"
+      ? [{ type: "text", text: message.content }]
+      : Array.isArray(message.content) ? message.content : [];
+    const text = blocks
+      .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+      .map((block: any) => block.text)
+      .join("\n");
+    const match = text.match(/<peer_message\b[^>]*\brequest_id="([^"]+)"/);
+    if (match?.[1] === requestId) return true;
+  }
+  return sawUserMessage ? false : undefined;
 }
 
 export function extractAssistantText(messages: any[] | undefined): string | null {
@@ -228,21 +411,38 @@ export async function waitForDelay(ms: number, signal?: AbortSignal): Promise<vo
   });
 }
 
-export async function waitForResponse(
+export function isRegisteredLive(root: string, sessionId: string): boolean {
+  const path = recordPath(root, sessionId);
+  try {
+    return existsSync(path) && Date.now() - statSync(path).mtimeMs <= RECORD_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+export async function waitForResponseOrPending(
   root: string,
   request: TalkRequest,
   timeoutMs: number,
-  peer: HerdrPeerContext,
-  getStatus: (peerContext: HerdrPeerContext, signal?: AbortSignal) => Promise<HerdrAgentStatus>,
   signal?: AbortSignal,
   onState?: (state: TalkProgressState) => void,
-): Promise<TalkResponse> {
+  hardDeadlineMs?: number,
+  statusPollMs?: number,
+): Promise<TalkWaitResult> {
   const path = join(repliesDir(root, request.from), `${request.id}.json`);
+  const waiterPath = join(waitersDir(root, request.from), `${request.id}.json`);
   const pendingPath = join(inboxDir(root, request.to), `${request.id}.json`);
   const processingPath = `${pendingPath}.processing`;
-  const softDeadline = Date.now() + timeoutMs;
-  const hardDeadline = Date.now() + Math.max(timeoutMs, DEFAULT_TIMEOUT_MS);
-  let statusCheckAt = softDeadline;
+  // The registration heartbeat is the authoritative liveness signal: a local
+  // FS read (cannot fail transiently) refreshed by the target's own poll tick
+  // and gone or stale the instant the target shuts down or crashes. Previously
+  // the first probe was scheduled at softDeadline, which equals hardDeadline
+  // when timeoutMs defaults to DEFAULT_TIMEOUT_MS, so the "peer is no longer
+  // live" branch was unreachable by default.
+  const statusIntervalMs = statusPollMs ?? STATUS_POLL_MS;
+  const hardDeadline = Date.now() + (hardDeadlineMs ?? timeoutMs);
+  let statusCheckAt = Date.now() + statusIntervalMs;
+  let consecutiveStale = 0;
   let reportedProcessing = false;
   try {
     while (Date.now() <= hardDeadline) {
@@ -263,25 +463,58 @@ export async function waitForResponse(
           onState?.("processing");
         }
         rmSync(path, { force: true });
-        return value;
+        rmSync(waiterPath, { force: true });
+        return { state: "completed", response: value };
       }
       const now = Date.now();
       if (now >= statusCheckAt) {
-        try {
-          await getStatus(peer, signal);
-        } catch {
-          if (signal?.aborted) throw new Error("Aborted");
-          break;
+        // A missing registration is an instant, authoritative death signal
+        // (session_shutdown removed it): no reply and no wake will ever arrive.
+        if (!existsSync(recordPath(root, request.to))) {
+          rmSync(pendingPath, { force: true });
+          rmSync(waiterPath, { force: true });
+          throw new Error(`Peer ${publicPeerId(request.to)} is no longer live`);
         }
-        statusCheckAt = now + STATUS_POLL_MS;
+        // A stale registration (heartbeat expired) also means death, but
+        // requires two consecutive observations (spaced >= statusIntervalMs):
+        // laptop sleep / a single blocked tick freezes the observer too, and
+        // every record comes back stale at once while all peers are healthy.
+        if (!isRegisteredLive(root, request.to)) {
+          consecutiveStale += 1;
+          if (consecutiveStale >= 2) {
+            rmSync(pendingPath, { force: true });
+            rmSync(waiterPath, { force: true });
+            throw new Error(`Peer ${publicPeerId(request.to)} is no longer live`);
+          }
+        } else {
+          consecutiveStale = 0;
+        }
+        statusCheckAt = now + statusIntervalMs;
       }
       await waitForDelay(POLL_MS, signal);
     }
-    throw new Error(`Peer ${publicPeerId(request.to)} did not reply before timeout`);
+    // Hard deadline reached while the target is still alive/processing: keep
+    // the waiter and the pending inbox request, and return a pending result so
+    // the caller reports "do not resend". A later reply is picked up by the
+    // wake scanner (wakePendingPongs) and delivered as a <peer_pong> user message.
+    markTimedOut(waiterPath);
+    return { state: "pending" };
   } catch (error) {
-    rmSync(pendingPath, { force: true });
+    if (signal?.aborted) {
+      // Abort withdraws a queued request only; an already-processing request
+      // (.processing) is not interrupted. The waiter is removed so no wake
+      // fires later for a caller that is no longer listening.
+      rmSync(pendingPath, { force: true });
+      rmSync(waiterPath, { force: true });
+    }
     throw error;
   }
+}
+
+function markTimedOut(waiterPath: string): void {
+  const current = readJson(waiterPath);
+  if (!isTalkWaiter(current) || current.timedOutAt) return;
+  writeAtomic(waiterPath, { ...current, timedOutAt: nowIso() });
 }
 
 export async function liveRecords(
@@ -294,6 +527,9 @@ export async function liveRecords(
   const result: Array<{ record: PeerRecord; status: HerdrAgentStatus }> = [];
   for (const record of loadRecords(root)) {
     if (record.workspaceId !== workspaceId) continue;
+    // A crashed process stops heartbeating its registration; its stale record
+    // is not a live peer even if the HerdR pane still exists.
+    if (!isRegisteredLive(root, record.sessionId)) continue;
     try {
       const status = await getStatus({
         paneId: record.paneId,
@@ -325,7 +561,20 @@ export function requestMessage(request: TalkRequest, fromName: string): string {
   ].join("\n");
 }
 
-/** Build a request id for a new talk_to request. */
+export function peerPongMessage(waiter: TalkWaiter, response: TalkResponse, senderName?: string): string {
+  // The pong comes from the responder (response.from === waiter.to), never
+  // from the caller (waiter.from). response.from is the authoritative source.
+  const source = senderName ?? waiter.targetName ?? publicPeerId(response.from);
+  return [
+    `<peer_pong request_id="${escapeAttribute(waiter.requestId)}" from="${escapeAttribute(source)}" from_session="${escapeAttribute(response.from)}" peer_id="${escapeAttribute(publicPeerId(response.from))}" ok="${response.ok ? "true" : "false"}">`,
+    "Another Pi session has finished a pending response.",
+    "",
+    response.ok ? (response.message ?? "") : (response.error ?? ""),
+    "</peer_pong>",
+  ].join("\n");
+}
+
+/** Build a request id whose base36 timestamp prefix keeps inbox filename sort chronological. */
 export function newRequestId(): string {
-  return `req_${randomUUID()}`;
+  return `req_${Date.now().toString(36)}_${randomUUID()}`;
 }

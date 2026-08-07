@@ -7,6 +7,7 @@
 | `PeerRecord` | Registration for a live Pi session: `sessionId` (full id, internal identity), `name`, `cwd`, `workspaceId`, HerdR pane/terminal/tab, `registrationId`, `createdAt`. |
 | `TalkRequest` | Versioned request envelope: `id`, `from`, `to`, `message`, `route` (visited session ids), `createdAt`. |
 | `TalkResponse` | Versioned response envelope: `requestId`, `from`, `to`, `ok`, `message` or `error`, `createdAt`. |
+| `TalkWaiter` | Caller-owned pending-wake tracker: `requestId`, `from`, `to`, `targetName?`, `createdAt`, `timedOutAt?`. Written for every `talk_to`; consumed on direct reply, abort, or after the `<peer_pong>` wake. |
 | `TalkEvent` | Completed conversation event published by a session: `type` (user/assistant/toolCall/toolResult), `id`, `createdAt`, `message`. |
 | `LatestPeerHistory` | Bounded per-peer history artifact: up to 10 `TalkEvent`s, rebuilt from the session's own current lineage. |
 | `HerdrPeerContext` | Workspace identity resolved from HerdR pane env + CLI: `workspaceId`, `paneId`, `terminalId`, `tabId`, `socketPath`. |
@@ -33,12 +34,16 @@ Business rules:
 - `session_start` → ensure runtime, write `sessions/<session-id>.json`,
   publish `latest/<session-id>.json` from the session's own lineage.
 - Inbox drain (idle interval) → read `inbox/<peer-id>/*.json`, deliver via
-  `sendMessage` with `customType: talk_request`, track as active request.
+  `sendUserMessage` with the peer_message content, track as active request.
 - `agent_start` → busy = true (self-tracked). `agent_end` → busy = false,
   republish history, and if an active request exists write
   `replies/<caller-session-id>/<request-id>.json` with the final assistant text.
-- `talk_to` → resolve target, route-check, write request to target inbox,
-  stream `queued`/`processing`, wait for response (soft timeout / abort).
+- `talk_to` → resolve target, route-check, write waiter + request to target
+  inbox, stream `queued`/`processing`, wait for response (soft timeout / abort).
+  In-deadline reply returns `completed` and consumes reply + waiter. A hard
+  deadline with a live target returns a non-error `pending` result (caller
+  instructed not to resend) and keeps the waiter; the idle poll later delivers
+  the reply as a `<peer_pong>` user message when the peer finishes.
 - `talk_latest` → read target's `latest/<session-id>.json`, slice last N
   events, annotate in-progress turns.
 - `talk_sessions` → list live records for the workspace, filter dead panes via
@@ -66,7 +71,8 @@ closed.
 ├── sessions/<session-id>.json
 ├── latest/<session-id>.json
 ├── inbox/<peer-id>/<request-id>.json
-└── replies/<caller-session-id>/<request-id>.json
+├── replies/<caller-session-id>/<request-id>.json
+└── waiters/<caller-session-id>/<request-id>.json
 ```
 
 - `<agent-dir>` = `PI_CODING_AGENT_DIR` or `~/.pi/agent`.

@@ -1,9 +1,8 @@
 import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Static } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "./schemas.ts";
 import {
@@ -13,7 +12,7 @@ import {
   type HerdrAgentStatus,
   type HerdrPeerContext,
 } from "./herdr.ts";
-import { readJson, writeAtomic } from "./storage.ts";
+import { readJson, safeKey, writeAtomic } from "./storage.ts";
 import {
   HISTORY_LIMIT,
   entriesToTalkEvents,
@@ -24,10 +23,14 @@ import {
 } from "./history.ts";
 import {
   DEFAULT_TIMEOUT_MS,
+  correlatePeerRequestTurn,
+  DEAD_SESSION_SWEEP_MS,
   ensureRecord,
   extractAssistantText,
   inboxDir,
+  isRegisteredLive,
   isTalkRequest,
+  isTalkResponse,
   liveRecords,
   loadRecords,
   newRequestId,
@@ -36,6 +39,7 @@ import {
 
   POLL_MS,
   recordPath,
+  RECORD_STALE_MS,
   removeOwnedRecord,
   repliesDir,
   requeueProcessing,
@@ -43,12 +47,19 @@ import {
   resolveTarget,
   routeForRequest,
   sessionDir,
-  waitForResponse,
+  sweepDeadSessions,
+  waitForResponseOrPending,
+  waitersDir,
+  WAITER_TTL_MS,
+  isTalkWaiter,
+  peerPongMessage,
   type PeerRecord,
   type TalkProgressDetails,
   type TalkProgressState,
   type TalkRequest,
   type TalkResponse,
+  type TalkWaitResult,
+  type TalkWaiter,
 } from "./protocol.ts";
 
 type TalkTo = Static<typeof TalkToParams>;
@@ -59,6 +70,12 @@ export type TalkDeps = {
   getPeerStatus?: typeof getHerdrPeerStatusAsync;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
+  /** Test/runtime-only override for the hard wait deadline (never a schema option). */
+  hardDeadlineMs?: number;
+  /** Test/runtime-only override for the liveness check cadence (never a schema option). */
+  statusPollMs?: number;
+  /** Test/runtime-only override for the lost-delivery watchdog tick count (never a schema option). */
+  activeRequestWatchdogTicks?: number;
 };
 
 type Runtime = {
@@ -66,7 +83,81 @@ type Runtime = {
   record: PeerRecord;
   root: string;
   activeRequest: TalkRequest | null;
+  activeIdleTicks: number;
 };
+
+const DEFAULT_ACTIVE_REQUEST_WATCHDOG_TICKS = Math.ceil(30_000 / POLL_MS); // ~30s of consecutive idle ticks
+function failStuckActiveRequest(runtime: Runtime): void {
+  const request = runtime.activeRequest;
+  if (!request) return;
+  const response: TalkResponse = {
+    version: 1,
+    type: "response",
+    requestId: request.id,
+    from: runtime.record.sessionId,
+    to: request.from,
+    ok: false,
+    error: "Peer did not start a turn for the request",
+    createdAt: nowIso(),
+  };
+  try {
+    writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
+  } catch {
+    return;
+  }
+  rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
+  runtime.activeRequest = null;
+  runtime.activeIdleTicks = 0;
+}
+
+/**
+ * Best-effort rejection of an invalid/malformed inbox request: write an
+ * `ok=false` reply to the caller's replies dir whenever its caller session id
+ * can be recovered (from the parsed envelope or, when the JSON is corrupt, by
+ * regex on the raw text), then remove the inbox file. The reply reuses the
+ * inbox filename as request id so the caller's waiter (correlated by id) is
+ * closed immediately instead of stranding until GC. A fully unaddressable
+ * file is dropped without a reply - nobody can be woken by it.
+ */
+function rejectInvalidRequest(root: string, responderSessionId: string, path: string, readValue: unknown): void {
+  const rawText = (() => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      return "";
+    }
+  })();
+  const asObj = typeof readValue === "object" && readValue !== null
+    ? readValue as Record<string, unknown>
+    : null;
+  const from = asObj && typeof asObj.from === "string" && asObj.from.length > 0
+    ? asObj.from
+    : rawText.match(/"from"\s*:\s*"([^"]+)"/)?.[1];
+  if (!from) {
+    // Unaddressable: no caller session id, cannot deliver a reply anywhere.
+    return;
+  }
+  // The caller's waiter correlates by the inbox filename, which is the
+  // request id the sender wrote, so the reply must reuse that exact id.
+  const requestId = basename(path, ".json");
+  const error = readValue === null
+    ? "Malformed request (unparseable JSON)"
+    : "Invalid request rejected before delivery (failed protocol validation)";
+  try {
+    writeAtomic(join(repliesDir(root, from), `${safeKey(requestId)}.json`), {
+      version: 1,
+      type: "response",
+      requestId,
+      from: responderSessionId,
+      to: from,
+      ok: false,
+      error,
+      createdAt: nowIso(),
+    } satisfies TalkResponse);
+  } catch {
+    // Reply write failed (unwritable replies dir): drop and let GC clean up.
+  }
+}
 
 async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
   if (runtime.activeRequest || isBusy()) return;
@@ -77,6 +168,10 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
     const path = join(dir, name);
     const request = readJson(path);
     if (!isTalkRequest(request) || request.to !== runtime.record.sessionId) {
+      // Never drop silently: write an ok=false reply when the caller's
+      // addressing can still be recovered, so its waiter is closed instead of
+      // stranding until GC. Only a fully unaddressable file is left to GC.
+      rejectInvalidRequest(runtime.root, runtime.record.sessionId, path, request);
       rmSync(path, { force: true });
       continue;
     }
@@ -87,14 +182,14 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
       continue;
     }
     runtime.activeRequest = request;
+    runtime.activeIdleTicks = 0;
     try {
       const sender = loadRecords(runtime.root).find((record) => record.sessionId === request.from);
-      await pi.sendMessage({
-        customType: "talk_request",
-        content: requestMessage(request, sender?.name ?? publicPeerId(request.from)),
-        display: true,
-        details: request,
-      }, { triggerTurn: true, deliverAs: "steer" });
+      // Deliver as a real user message so the request is treated exactly like a
+      // user turn on the receiving peer (appears as typed by the user, always
+      // triggers a turn). Drain only runs while idle, so no delivery mode is
+      // needed; the peer's own history surface already renders it as a user msg.
+      await pi.sendUserMessage(requestMessage(request, sender?.name ?? publicPeerId(request.from)));
     } catch (error) {
       writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), {
         version: 1,
@@ -108,8 +203,139 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
       } satisfies TalkResponse);
       rmSync(processing, { force: true });
       runtime.activeRequest = null;
+      runtime.activeIdleTicks = 0;
     }
     return;
+  }
+}
+
+/**
+ * Wake scanner: when this peer is idle and a reply has landed for a request it
+ * timed out on (tracked by a waiter), deliver the reply as a <peer_pong> user
+ * message so the caller's session resumes as a real user turn. Runs after the
+ * inbox drain inside the single poll interval; consumes reply + waiter only
+ * after the send succeeded so a failed send retries on the next tick.
+ */
+async function wakePendingPongs(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
+  if (runtime.activeRequest || isBusy()) return;
+  const dir = waitersDir(runtime.root, runtime.record.sessionId);
+  if (!existsSync(dir)) return;
+  const names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+  for (const name of names) {
+    const waiterPath = join(dir, name);
+    const waiter = readJson(waiterPath);
+    if (!isTalkWaiter(waiter) || waiter.from !== runtime.record.sessionId) {
+      rmSync(waiterPath, { force: true });
+      continue;
+    }
+    // Only a timed-out waiter may be woken. An un-timed waiter is still owned
+    // by an in-flight waitForResponseOrPending, which consumes reply + waiter
+    // itself; waking it would delete the reply out from under the direct wait.
+    if (!waiter.timedOutAt) continue;
+    const replyPath = join(repliesDir(runtime.root, runtime.record.sessionId), `${waiter.requestId}.json`);
+    const reply = readJson(replyPath);
+    if (
+      !isTalkResponse(reply)
+      || reply.requestId !== waiter.requestId
+      || reply.from !== waiter.to
+      || reply.to !== runtime.record.sessionId
+    ) {
+      continue;
+    }
+    try {
+      await pi.sendUserMessage(peerPongMessage(waiter, reply, waiter.targetName));
+    } catch {
+      // Leave waiter + reply in place; retry on a later idle tick.
+      return;
+    }
+    rmSync(replyPath, { force: true });
+    rmSync(waiterPath, { force: true });
+    return;
+  }
+}
+
+export async function sweepStaleArtifacts(
+  pi: ExtensionAPI,
+  runtime: Runtime,
+  isBusy: () => boolean,
+  staleSince: Map<string, number> = new Map(),
+): Promise<void> {
+  if (runtime.activeRequest || isBusy()) return;
+  const { root, record } = runtime;
+  const sessionId = record.sessionId;
+  // Waiters owned by this session:
+  //  - a timed-out (pending) waiter with no reply whose TARGET has died can
+  //    never carry a real answer, but the caller was promised a wake: close
+  //    the promise with a <peer_pong ok="false"> failure wake, then remove it.
+  //    Death is only declared after the staleness persists >= RECORD_STALE_MS:
+  //    after laptop sleep every record is stale at once while all peers are
+  //    healthy, and a single fresh observation cancels the pending verdict.
+  //  - an un-timed waiter older than WAITER_TTL_MS is an orphaned wait (the
+  //    in-flight wait loop has long since exited; max hard deadline is 60 min).
+  const waiters = waitersDir(root, sessionId);
+  const waiterIds = new Set<string>();
+  if (existsSync(waiters)) {
+    for (const name of readdirSync(waiters).filter((n) => n.endsWith(".json")).sort()) {
+      const waiterPath = join(waiters, name);
+      waiterIds.add(name.slice(0, -".json".length));
+      const waiter = readJson(waiterPath);
+      if (!isTalkWaiter(waiter) || waiter.from !== sessionId) {
+        rmSync(waiterPath, { force: true });
+        continue;
+      }
+      if (waiter.timedOutAt) {
+        // A reply exists: wakePendingPongs (next in the tick chain) delivers it.
+        if (existsSync(join(repliesDir(root, sessionId), `${waiter.requestId}.json`))) {
+          staleSince.delete(waiter.requestId);
+          continue;
+        }
+        if (!isRegisteredLive(root, waiter.to)) {
+          const firstStale = staleSince.get(waiter.requestId) ?? Date.now();
+          staleSince.set(waiter.requestId, firstStale);
+          if (Date.now() - firstStale < RECORD_STALE_MS) continue;
+          staleSince.delete(waiter.requestId);
+          try {
+            await pi.sendUserMessage(peerPongMessage(waiter, {
+              version: 1,
+              type: "response",
+              requestId: waiter.requestId,
+              from: waiter.to,
+              to: sessionId,
+              ok: false,
+              error: "Peer session is no longer live and never replied",
+              createdAt: nowIso(),
+            } satisfies TalkResponse, waiter.targetName));
+            rmSync(waiterPath, { force: true });
+            return; // one user-message send per tick, like drainInbox/wakePendingPongs
+          } catch {
+            // Leave the waiter; retry on a later idle tick.
+            return;
+          }
+        }
+        staleSince.delete(waiter.requestId);
+        continue;
+      }
+      const created = Date.parse(waiter.createdAt);
+      if (!Number.isFinite(created) || Date.now() - created > WAITER_TTL_MS) {
+        rmSync(waiterPath, { force: true });
+      }
+    }
+  }
+  // Prune grace state for waiters that no longer exist (abort, shutdown),
+  // including when the waiters directory itself was removed.
+  for (const key of staleSince.keys()) {
+    if (!waiterIds.has(key)) staleSince.delete(key);
+  }
+  // Replies whose waiter is gone can never be consumed (late abort, swept
+  // waiter, dead caller): orphans.
+  const replies = repliesDir(root, sessionId);
+  if (existsSync(replies)) {
+    for (const name of readdirSync(replies).filter((n) => n.endsWith(".json"))) {
+      const requestId = name.slice(0, -".json".length);
+      if (!existsSync(join(waitersDir(root, sessionId), `${requestId}.json`))) {
+        rmSync(join(replies, name), { force: true });
+      }
+    }
   }
 }
 
@@ -117,6 +343,8 @@ async function executeTalkTo(
   params: TalkTo,
   runtime: Runtime,
   getStatus: typeof getHerdrPeerStatusAsync,
+  hardDeadlineMs?: number,
+  statusPollMs?: number,
   signal?: AbortSignal,
   onUpdate?: AgentToolUpdateCallback<TalkProgressDetails>,
 ): Promise<any> {
@@ -155,15 +383,36 @@ async function executeTalkTo(
     details: { source: "talk_to", requestId: request.id, target: publicPeerId(targetRecord.sessionId), targetStatus, state },
   });
   const path = join(inboxDir(runtime.root, targetRecord.sessionId), `${request.id}.json`);
-  writeAtomic(path, request);
+  const waiter: TalkWaiter = {
+    version: 1,
+    type: "waiter",
+    requestId: request.id,
+    from: runtime.record.sessionId,
+    to: targetRecord.sessionId,
+    targetName: targetRecord.name,
+    createdAt: nowIso(),
+  };
+  // Default-on: a waiter is written for every request before the inbox write
+  // so a timed-out talk_to can still be woken later by <peer_pong>.
+  writeAtomic(join(waitersDir(runtime.root, runtime.record.sessionId), `${request.id}.json`), waiter);
+  try {
+    writeAtomic(path, request);
+  } catch (error) {
+    rmSync(join(waitersDir(runtime.root, runtime.record.sessionId), `${request.id}.json`), { force: true });
+    throw error;
+  }
   emitState("queued");
-  const response = await waitForResponse(runtime.root, request, timeoutMs, {
-    paneId: targetRecord.paneId,
-    terminalId: targetRecord.terminalId,
-    tabId: targetRecord.tabId,
-    socketPath: runtime.peer.socketPath,
-    workspaceId: targetRecord.workspaceId,
-  }, getStatus, signal, emitState);
+  const waitResult = await waitForResponseOrPending(runtime.root, request, timeoutMs, signal, emitState, hardDeadlineMs, statusPollMs);
+  if (waitResult.state === "pending") {
+    return {
+      content: [{
+        type: "text",
+        text: `Request ${request.id} to ${targetRecord.name} (${publicPeerId(targetRecord.sessionId)}) is still processing; the peer did not reply within the wait deadline. Do not resend: this session will be woken automatically when the peer finishes.`,
+      }],
+      details: { source: "talk_to", requestId: request.id, target: publicPeerId(targetRecord.sessionId), targetStatus, state: "pending" },
+    };
+  }
+  const response = waitResult.response;
   if (!response.ok) throw new Error(response.error ?? "Peer request failed");
   return {
     content: [{ type: "text", text: response.message ?? "" }],
@@ -220,6 +469,16 @@ async function executeTalkLatest(
   };
 }
 
+/** Queue depth of a peer: count of `.json` request files still present in
+ * its inbox dir (queued or currently claimed as `.processing`). A missing
+ * inbox dir means zero, never an error.
+ */
+function inboxCount(root: string, sessionId: string): number {
+  const dir = inboxDir(root, sessionId);
+  if (!existsSync(dir)) return 0;
+  return readdirSync(dir).filter((name) => name.endsWith(".json") || name.endsWith(".json.processing")).length;
+}
+
 export function registerTalkTools(
   pi: ExtensionAPI,
   deps: TalkDeps = {},
@@ -238,6 +497,17 @@ export function registerTalkTools(
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
   let drainInFlight: Promise<void> | null = null;
+  // Suspension-grace state: requestId -> first tick the target was observed
+  // stale. Only staleness persisting >= RECORD_STALE_MS may close a pending
+  // wake with a failure pong (laptop sleep makes every record stale at once).
+  const staleSince = new Map<string, number>();
+  // Cross-session GC also needs two observations: a peer waking from sleep
+  // must refresh its registration before its artifacts can be removed.
+  const deadSince = new Map<string, number>();
+  let lastDeadSweepAt = 0;
+  const activeRequestWatchdogTicks = typeof deps.activeRequestWatchdogTicks === "number" && Number.isFinite(deps.activeRequestWatchdogTicks)
+    ? Math.max(1, Math.trunc(deps.activeRequestWatchdogTicks))
+    : DEFAULT_ACTIVE_REQUEST_WATCHDOG_TICKS;
 
   const ensureRuntime = async (ctx: any, signal?: AbortSignal): Promise<Runtime> => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -271,12 +541,35 @@ export function registerTalkTools(
       // are not lifecycle-owned and are left in place.
       removeOwnedRecord(current.root, current.record);
     }
-    runtime = { peer, record, root, activeRequest: null };
+    runtime = { peer, record, root, activeRequest: null, activeIdleTicks: 0 };
     if (!interval) {
       interval = setInterval(() => {
-        if (!runtime || drainInFlight) return;
-        ensureRecord(runtime.root, runtime.record);
-        drainInFlight = drainInbox(pi, runtime, isBusy)
+        if (!runtime) return;
+        const currentRuntime = runtime;
+        // Heartbeat first, unconditionally: the registration liveness signal
+        // must not depend on sendUserMessage semantics (fire-and-forget in
+        // the host today, declared Promise<void>) or on the drain chain.
+        ensureRecord(currentRuntime.root, currentRuntime.record);
+        if (currentRuntime.activeRequest) {
+          if (isBusy()) {
+            currentRuntime.activeIdleTicks = 0;
+          } else if (++currentRuntime.activeIdleTicks >= activeRequestWatchdogTicks) {
+            failStuckActiveRequest(currentRuntime);
+          }
+        }
+        if (drainInFlight) return;
+        drainInFlight = drainInbox(pi, currentRuntime, isBusy)
+          .then(() => {
+            // Cross-session GC on a slow cadence: dead sessions' artifacts
+            // (registration, latest, inbox, replies, waiters) are removed by
+            // whichever live session reaches the interval first.
+            if (Date.now() - lastDeadSweepAt >= DEAD_SESSION_SWEEP_MS) {
+              sweepDeadSessions(currentRuntime.root, deadSince);
+              lastDeadSweepAt = Date.now();
+            }
+          })
+          .then(() => sweepStaleArtifacts(pi, currentRuntime, isBusy, staleSince))
+          .then(() => wakePendingPongs(pi, currentRuntime, isBusy))
           .catch(() => {})
           .finally(() => { drainInFlight = null; });
       }, POLL_MS);
@@ -293,9 +586,11 @@ export function registerTalkTools(
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
       const peers = await liveRecords(current.root, current.record.workspaceId, current.peer.socketPath, getStatus, signal);
-      const lines = peers.map(({ record, status }) =>
-        `${publicPeerId(record.sessionId)}  ${record.name}  ${status}${record.sessionId === current.record.sessionId ? "  (current)" : ""}`,
-      );
+      const lines = peers.map(({ record, status }) => {
+        const base = `${publicPeerId(record.sessionId)}  ${record.name}  ${status}${record.sessionId === current.record.sessionId ? "  (current)" : ""}`;
+        const queued = inboxCount(current.root, record.sessionId);
+        return queued > 0 ? `${base}  (${queued} queued)` : base;
+      });
       return {
         content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No live peer sessions." }],
         details: { source: "talk_sessions", workspaceId: current.record.workspaceId, count: lines.length },
@@ -323,17 +618,31 @@ export function registerTalkTools(
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
-      return executeTalkTo(params as TalkTo, current, getStatus, signal, onUpdate);
+      return executeTalkTo(
+        params as TalkTo,
+        current,
+        getStatus,
+        deps.hardDeadlineMs,
+        deps.statusPollMs,
+        signal,
+        onUpdate,
+      );
     },
   });
 
   pi.on("session_start", (_event, ctx) => {
+    // A reload/resume may miss the prior agent_end; never carry stale busy state across a session bind.
+    selfBusy = false;
     void ensureRuntime(ctx)
-      .then((current) => publishHistoryFromOwnSession(current, ctx))
+      .then((current) => {
+        ctx.ui?.setStatus("pi-peer", publicPeerId(current.record.sessionId));
+        publishHistoryFromOwnSession(current, ctx);
+      })
       .catch(() => {});
   });
   pi.on("agent_start", () => {
     if (!hasBusyOverride) selfBusy = true;
+    if (runtime?.activeRequest) runtime.activeIdleTicks = 0;
   });
   pi.on("agent_end", (event, ctx) => {
     if (!hasBusyOverride) selfBusy = false;
@@ -344,7 +653,13 @@ export function registerTalkTools(
     const message = extractAssistantText((event as any).messages);
     if (!runtime.activeRequest) return;
     const request = runtime.activeRequest;
+    // A normal user turn can finish while a queued peer request is still
+    // marked active. If the host exposes the user prompt, only the exact
+    // `<peer_message request_id="...">` turn may consume the request;
+    // hosts that expose no user message keep the legacy fallback.
+    if (correlatePeerRequestTurn((event as any).messages, request.id) === false) return;
     runtime.activeRequest = null;
+    runtime.activeIdleTicks = 0;
     const response: TalkResponse = {
       version: 1,
       type: "response",
@@ -358,9 +673,43 @@ export function registerTalkTools(
     writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
     rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
   });
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    ctx.ui?.setStatus("pi-peer", undefined);
     if (runtime) {
-      removeOwnedRecord(runtime.root, runtime.record);
+      const active = runtime.activeRequest;
+      try {
+        if (active) {
+          // The caller may still be waiting (direct wait) or may already have
+          // timed out (pending wake). Either way it must not hang or be promised
+          // a wake that can never arrive: answer with a terminal error reply so
+          // the caller fails instead of waiting out the deadline.
+          writeAtomic(join(repliesDir(runtime.root, active.from), `${active.id}.json`), {
+            version: 1,
+            type: "response",
+            requestId: active.id,
+            from: runtime.record.sessionId,
+            to: active.from,
+            ok: false,
+            error: "Peer session shut down before finishing the request",
+            createdAt: nowIso(),
+          } satisfies TalkResponse);
+        }
+      } finally {
+        // The .processing claim and the registration removal must not be
+        // skipped if the error reply write fails: leaking the claim would let
+        // a same-id restart re-deliver the request, and leaking the
+        // registration (the authoritative liveness signal) would make every
+        // future caller believe a dead session is alive.
+        if (active) {
+          rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${active.id}.json.processing`), { force: true });
+        }
+        removeOwnedRecord(runtime.root, runtime.record);
+        // This session can no longer be woken or wake itself: drop its own
+        // waiters and replies (the error reply for the active request lives in
+        // the CALLER's replies dir and stays for the caller to consume).
+        rmSync(waitersDir(runtime.root, runtime.record.sessionId), { recursive: true, force: true });
+        rmSync(repliesDir(runtime.root, runtime.record.sessionId), { recursive: true, force: true });
+      }
     }
     if (interval) clearInterval(interval);
     interval = null;

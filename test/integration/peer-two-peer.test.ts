@@ -1,10 +1,23 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
+import { inboxDir, repliesDir, waitersDir } from "../../pi-extension/pi-peer/protocol.ts";
 import { createTestDir } from "../peer/helpers.ts";
+
+function waitUntil(predicate: () => boolean, message: string, timeoutMs = 3_000): Promise<void> {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - started > timeoutMs) return reject(new Error(`Timed out waiting for: ${message}`));
+      setTimeout(poll, 25);
+    };
+    poll();
+  });
+}
 
 describe("peer two-peer lifecycle", () => {
   it("delivers a blocking request and captures the peer agent_end response", async () => {
@@ -21,10 +34,9 @@ describe("peer two-peer lifecycle", () => {
         on(name: string, handler: (...args: any[]) => any) {
           handlers.set(name, [...(handlers.get(name) ?? []), handler]);
         },
-        async sendMessage(message: any, options: any) {
-          sentMessages.push(message);
-          assert.equal(message.customType, "talk_request");
-          assert.equal(options.triggerTurn, true);
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
           if (reply) {
             setTimeout(() => {
               for (const handler of handlers.get("agent_end") ?? []) {
@@ -82,6 +94,21 @@ describe("peer two-peer lifecycle", () => {
       assert.match(listResult.content[0].text, /peer-pha  alpha  idle  \(current\)/);
       assert.match(listResult.content[0].text, /peer-eta  beta  idle/);
 
+      // Queue depth: peer-eta has 1 queued + 1 in-flight (.json.processing); current session has none.
+      const etaInbox = inboxDir(root, "session-beta");
+      mkdirSync(etaInbox, { recursive: true });
+      for (let i = 0; i < 2; i++) {
+        writeFileSync(join(etaInbox, `req_q_${i}.json`), JSON.stringify({
+          version: 1, type: "request", id: `req_q_${i}`, from: "session-alpha", to: "session-elsewhere",
+          message: "q", route: ["session-alpha"], createdAt: new Date().toISOString(),
+        }));
+      }
+      renameSync(join(etaInbox, "req_q_1.json"), join(etaInbox, "req_q_1.json.processing"));
+      const queuedList = await sender.tools.get("talk_sessions").execute("list-queued", {}, undefined, undefined, sender.ctx);
+      assert.match(queuedList.content[0].text, /peer-eta  beta  idle  \(2 queued\)/);
+      assert.match(queuedList.content[0].text, /peer-pha  alpha  idle  \(current\)/);
+      assert.doesNotMatch(queuedList.content[0].text, /peer-pha  alpha  idle  \(current\)  \(\d+ queued\)/);
+
       const senderRecordPath = join(root, "sessions", "session-alpha.json");
       rmSync(senderRecordPath, { force: true });
       assert.equal(existsSync(senderRecordPath), false, "simulate an older reload cleanup removing the current record");
@@ -115,7 +142,7 @@ describe("peer two-peer lifecycle", () => {
       const progressUpdates: any[] = [];
       const pending = sender.tools.get("talk_to").execute(
         "talk-1",
-        { target: "peer-eta", message: "Review Alpha's answer.", timeoutMs: 50 },
+        { target: "peer-eta", message: "Review Alpha's answer.", timeoutMs: 2_000 },
         undefined,
         (update: any) => progressUpdates.push(update),
         sender.ctx,
@@ -177,7 +204,7 @@ describe("peer two-peer lifecycle", () => {
         on(name: string, handler: (...args: any[]) => any) {
           handlers.set(name, [...(handlers.get(name) ?? []), handler]);
         },
-        async sendMessage() {},
+        async sendUserMessage() {},
       };
       registerTalkTools(api, {
         getCurrentPeer: async () => ({
@@ -248,7 +275,7 @@ describe("peer two-peer lifecycle", () => {
         on(name: string, handler: (...args: any[]) => any) {
           handlers.set(name, [...(handlers.get(name) ?? []), handler]);
         },
-        async sendMessage() {},
+        async sendUserMessage() {},
       };
       registerTalkTools(api, {
         getCurrentPeer: async () => ({
@@ -307,6 +334,305 @@ describe("peer two-peer lifecycle", () => {
       const resumed = await tool.execute("c10", { target: "peer-eta", count: 10 }, undefined, undefined, sender.ctx);
       assert.equal(resumed.details.events.length, 6, "no duplicates after resume");
       assert.deepEqual(resumed.details.events.map((e: any) => e.type), ["user", "toolCall", "toolResult", "assistant", "user", "assistant"]);
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a direct result when the peer replies in-deadline and never wakes the sender", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, cwd: string, paneId: string, reply?: string, busy: () => boolean = () => false) => {
+      const tools = new Map<string, any>();
+      const sentMessages: any[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
+          if (content.startsWith("<peer_message") && reply) {
+            setTimeout(() => {
+              for (const handler of handlers.get("agent_end") ?? []) {
+                handler({ messages: [{ role: "assistant", content: [{ type: "text", text: reply }] }] }, ctx);
+              }
+            }, 300);
+          }
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: busy,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "/work/alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "/work/beta", "pane-beta", "Fast reply");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-fast", { target: "peer-eta", message: "Fast?", timeoutMs: 2_000 },
+        undefined, undefined, sender.ctx,
+      );
+      assert.equal(result.details.state, "completed");
+      assert.equal(result.content[0].text, "Fast reply");
+      assert.ok(result.details.requestId, "completed result carries the request id");
+      const requestId: string = result.details.requestId;
+      // In-deadline reply: waiter + reply files are consumed, no wake pong.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const pongs = sender.sentMessages.filter((m: string) => m.startsWith("<peer_pong"));
+      assert.equal(pongs.length, 0, "no wake pong after a direct completed reply");
+      const replyFile = join(repliesDir(root, "session-alpha"), `${requestId}.json`);
+      assert.equal(existsSync(replyFile), false, "reply consumed by the direct wait");
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${requestId}.json`);
+      assert.equal(existsSync(waiterFile), false, "waiter consumed by the direct wait");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("timeout returns pending non-error and later wakes the sender with one <peer_pong>", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, cwd: string, paneId: string, busy: () => boolean = () => false) => {
+      const tools = new Map<string, any>();
+      const sentMessages: any[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: busy,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "/work/alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "/work/beta", "pane-beta", () => true);
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      peerStatuses.set("pane-beta", "working");
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-slow", { target: "peer-eta", message: "Long task?", timeoutMs: 50 },
+        undefined, undefined, sender.ctx,
+      );
+      // timeoutMs 50 clamps to the 1 s minimum; that exact deadline passes with
+      // the target alive -> pending, non-error.
+      assert.equal(result.details.state, "pending");
+      assert.match(result.content[0].text, /do not resend/i);
+      assert.match(result.content[0].text, /still processing/i);
+      assert.equal(sender.sentMessages.length, 0, "sender itself sent no messages (pending is not a send)");
+
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${result.details.requestId}.json`);
+      assert.ok(existsSync(waiterFile), "waiter remains after pending timeout");
+
+      // Receiver finishes later: agent_end writes the reply into caller's replies dir.
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${result.details.requestId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: result.details.requestId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Slow success", createdAt: new Date().toISOString(),
+      }));
+
+      // Sender poll wakes once with a <peer_pong> containing the reply text.
+      await waitUntil(() => sender.sentMessages.some((m: string) => m.startsWith("<peer_pong")), "sender wake pong");
+      const pongs = sender.sentMessages.filter((m: string) => m.startsWith("<peer_pong"));
+      assert.equal(pongs.length, 1, "exactly one wake pong");
+      assert.match(pongs[0], /request_id="[^"]+"/);
+      assert.match(pongs[0], /from_session="session-beta"/);
+      assert.match(pongs[0], /ok="true"/);
+      assert.match(pongs[0], /Slow success/);
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after successful wake");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), false, "reply cleaned after successful wake");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("abort removes waiter + queued request and never wakes later", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, paneId: string) => {
+      const tools = new Map<string, any>();
+      const sentMessages: any[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: () => false,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "pane-beta");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      peerStatuses.set("pane-beta", "working");
+      const abortController = new AbortController();
+      const aborted = sender.tools.get("talk_to").execute(
+        "talk-abort", { target: "peer-eta", message: "Cancel me.", timeoutMs: 50 },
+        abortController.signal, undefined, sender.ctx,
+      );
+      // Capture the request id from the inbox BEFORE abort, since abort removes
+      // the file (and the waiter) and we need it to assert cleanup + no wake.
+      const inbox = join(root, "inbox", "session-beta");
+      await waitUntil(() => existsSync(inbox) && readdirSync(inbox).some((f: string) => f.endsWith(".json")), "queued request to appear");
+      const reqId = readdirSync(inbox).find((f: string) => f.endsWith(".json"))!.replace(/\.json$/, "");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      abortController.abort();
+      await assert.rejects(aborted, /Aborted/);
+
+      const waiterDir = waitersDir(root, "session-alpha");
+      await waitUntil(() => !existsSync(join(waiterDir, `${reqId}.json`)), "waiter removed on abort");
+      assert.equal(existsSync(join(inbox, `${reqId}.json`)), false, "queued request removed on abort");
+      assert.equal(existsSync(join(waiterDir, `${reqId}.json`)), false, "waiter removed on abort");
+
+      // Receiver later finishes; write a stray reply for the aborted id.
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${reqId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: reqId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Late reply", createdAt: new Date().toISOString(),
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const pongs = sender.sentMessages.filter((m: string) => m.startsWith("<peer_pong"));
+      assert.equal(pongs.length, 0, "no wake for an aborted request");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("session_shutdown answers an in-flight request with an error reply and drops the .processing claim", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, cwd: string, paneId: string) => {
+      const tools = new Map<string, any>();
+      const sentMessages: any[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId,
+          terminalId: `terminal-${paneId}`,
+          tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock",
+          workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: () => false,
+        hardDeadlineMs: 2000,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "/work/alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "/work/beta", "pane-beta");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const pending = sender.tools.get("talk_to").execute(
+        "talk-shutdown", { target: "peer-eta", message: "Answer before I leave.", timeoutMs: 3_000 },
+        undefined, undefined, sender.ctx,
+      );
+      // Receiver is idle, so its poll tick claims the request (.processing).
+      const inbox = inboxDir(root, "session-beta");
+      await waitUntil(() => existsSync(inbox) && readdirSync(inbox).some((f: string) => f.endsWith(".processing")), "request claimed by receiver");
+      const reqId = readdirSync(inbox).find((f: string) => f.endsWith(".processing"))!.replace(/\.json\.processing$/, "");
+      assert.ok(existsSync(join(inbox, `${reqId}.json.processing`)), "request is processing");
+
+      // Receiver shuts down mid-request: it must answer with a terminal error
+      // reply and release the .processing claim instead of abandoning the caller.
+      for (const handler of receiver.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, receiver.ctx);
+
+      const replyDir = repliesDir(root, "session-alpha");
+      await waitUntil(() => existsSync(join(replyDir, `${reqId}.json`)), "error reply written for in-flight request");
+      const reply = JSON.parse(readFileSync(join(replyDir, `${reqId}.json`), "utf8"));
+      assert.equal(reply.ok, false);
+      assert.match(reply.error, /shut down before finishing/);
+      assert.equal(existsSync(join(inbox, `${reqId}.json.processing`)), false, ".processing claim released on shutdown");
+      await assert.rejects(pending, /shut down before finishing/);
     } finally {
       for (const peer of [sender, receiver]) {
         for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);

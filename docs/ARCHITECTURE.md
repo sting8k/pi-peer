@@ -39,24 +39,35 @@ no mux spawning anywhere in the runtime.
 ## Peer Talk Flow
 
 ```
-session_start ──► ensureRuntime: write sessions/<session-id>.json
+session_start ──► reset selfBusy + ensureRuntime: write sessions/<session-id>.json
                       │  publish latest/<session-id>.json (current lineage)
 agent_start ──────────► busy = true
    │  (inbox drain on idle interval)
    ▼
-inbox/<peer-id>/*.json ──► agent_start/steer turn ──► sendMessage(talk_request)
+inbox/<peer-id>/*.json ──► agent_start/user turn ──► sendUserMessage(peer_message)
    │  agent_end ──► busy = false
    │              ├─ publish latest/<session-id>.json
    │              └─ write replies/<caller-session-id>/<request-id>.json (final assistant text)
    ▼
-talk_to caller: waitForResponse(replies/<caller-session-id>/<request-id>.json) ──► returns text
+talk_to caller: waitForResponseOrPending(replies/<caller-session-id>/<request-id>.json)
+   ├─ reply in deadline ──► completed, consume reply + waiter (no wake)
+   └─ hard deadline, target alive ──► pending, keep waiter
+        │  (idle poll: wakePendingPongs)
+        ▼
+   waiters/<caller-session-id>/*.json + replies/… ──► sendUserMessage(peer_pong) ──► consume reply + waiter
 session_shutdown ──► remove sessions/<session-id>.json, stop polling
 ```
 
 ### Invariants
 
 - A session may process **one** inbox request at a time; requests are consumed
-  in filename order while the peer is idle.
+  in filename order while the peer is idle. Request ids carry a base36 creation
+  timestamp prefix so this order follows enqueue time.
+- `selfBusy` resets synchronously at `session_start`, so a missed `agent_end` cannot permanently block inbox delivery.
+- `agent_end` correlates the completed turn to the claimed request's
+  `<peer_message request_id="…">` when the host exposes a user message;
+  assistant-only/error events use the compatibility fallback, bounded by a
+  consecutive-idle claim watchdog (~30s).
 - A request is never delivered to its own session, and never routed through a
   session it has already visited (route cycles rejected).
 - History is **bounded** (10 events) and **thinking-free**; it is rebuilt from
@@ -69,7 +80,9 @@ session_shutdown ──► remove sessions/<session-id>.json, stop polling
   the published `latest/<session-id>.json` artifact.
 - Registration records are removed at `session_shutdown`; panes that are no
   longer alive on the HerdR socket are excluded from discovery and cause
-  delivery failures rather than silent drops.
+  delivery failures rather than silent drops. Invalid/malformed inbox requests
+  are rejected with an `ok=false` reply whenever the caller's session id is
+  recoverable, so a caller's waiter is closed instead of stranded.
 - Identity is dual-layer: the **full session id** is the internal identity
   (artifact paths, routes, inbox/reply addressing, history source), while the
   **public peer id** (`peer-<last 3 chars>`) is a presentation-only alias used
@@ -78,6 +91,13 @@ session_shutdown ──► remove sessions/<session-id>.json, stop polling
   (never pick-first).
 - Writes are atomic (temp file + rename) and the mailbox directory is created
   with mode `0700`.
+- Every `talk_to` writes a caller-owned **waiter** before the inbox write.
+  An in-deadline reply or an abort consumes the waiter immediately; a hard
+  deadline with a live target keeps it (marked `timedOutAt`) so the caller can
+  be woken later. The idle poll delivers exactly one `<peer_pong>` user message
+  per pending reply and only then consumes the reply + waiter; a failed send
+  leaves both files for retry (host delivery is fire-and-forget, so the retry
+  path is only reachable when the runtime itself is no longer active).
 
 ## Storage Layout
 
@@ -86,7 +106,8 @@ session_shutdown ──► remove sessions/<session-id>.json, stop polling
 ├── sessions/<session-id>.json        # registration
 ├── latest/<session-id>.json          # bounded event history
 ├── inbox/<peer-id>/<request-id>.json # queued requests
-└── replies/<caller-session-id>/<request-id>.json  # responses
+├── replies/<caller-session-id>/<request-id>.json  # responses
+└── waiters/<caller-session-id>/<request-id>.json  # pending wake trackers
 ```
 
 `<agent-dir>` is `PI_CODING_AGENT_DIR` or `~/.pi/agent`. Workspace ids and peer

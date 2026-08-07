@@ -1,250 +1,154 @@
 # pi-peer
 
-Standalone peer-to-peer Pi communication over a HerdR workspace.
+Peer-to-peer communication between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other blocking requests.
 
-`pi-peer` is a small, standalone Pi coding-agent extension. It registers exactly
-three tools — `talk_to`, `talk_sessions`, and `talk_latest` — that let two
-independently running Pi sessions in the same HerdR workspace exchange
-blocking requests, list each other, and read each other's bounded conversation
-history. It is not a subagent framework: no delegation, no agent roles, no loop
-workflows, no advisor surface.
+It is not a subagent framework: no delegation, no agent roles, no loop workflows, no advisor surface. Three tools, nothing else.
 
-## Why standalone
+## Features
 
-- **One purpose.** Only peer communication. Everything else (delegation, agent
-  config, mux spawning, advisor) lives in separate products, not here.
-- **Source independence.** The runtime has no imports from any host
-  subagent/loop/advisor module. It talks to the world through the Pi extension
-  API and the HerdR environment.
-- **Small surface.** Three tools, no slash commands, no message renderers, no
-  widgets. What you see is what ships.
-- **Clean namespace.** History and mailboxes live under
-  `<agent-dir>/pi-peer/talk/` — separate from any other product's storage, so a
-  cutover never mixes old and new artifacts.
+- **`talk_to`** — send a request to another live session and get its answer back.
+- **`talk_sessions`** — list live peers, their status, and how many requests are queued for them.
+- **`talk_latest`** — read a peer's most recent completed conversation events.
+- **No daemon.** Peers coordinate through an atomic file mailbox in the agent directory.
+- **No blind waits.** A dead peer fails a call immediately; a slow peer returns a `pending` result and wakes you later.
+- **Private by default.** Thinking is never published, and no session ever reads another session's transcript.
+
+## How it works
+
+```
+                     HerdR workspace
+    ┌────────────────┐                    ┌────────────────┐
+    │  Pi session A  │                    │  Pi session B  │
+    │    peer-a1b    │                    │    peer-c3d    │
+    └───────┬────────┘                    └───────▲────────┘
+            │                                     │
+            │ 1. talk_to(target="peer-c3d")       │ 2. arrives as
+            ▼                                     │    a user message
+    ┌───────────────────────────────────────────────────────┐
+    │    <agent-dir>/pi-peer/talk/<workspace-id>/           │
+    │    sessions/   inbox/   replies/   waiters/   latest/ │
+    └───────────────────────────────────────────────────────┘
+            ▲                                     │
+            │ 4. reply, or a <peer_pong> wake     │ 3. B answers
+            │    when the deadline passed         ▼
+            └─────────────────────────────────────┘
+```
+
+Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run.
 
 ## Requirements
 
-- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) with
-  HerdR.
-- An active HerdR pane for each Pi session (`HERDR_ENV=1`, `HERDR_PANE_ID`
-  set, and `HERDR_SOCKET_PATH` pointing at the workspace socket).
+- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) running inside a HerdR pane.
+- `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket.
 - Node 18+ for development.
 
-### Environment variables
-
-| Variable | Meaning |
-| --- | --- |
-| `PI_PEER_DISABLED=1` | Opt-out: the extension entrypoint returns before registering any tool. |
-| `HERDR_ENV`, `HERDR_PANE_ID` | Required: session identity and pane ownership come from these. |
-| `HERDR_SOCKET_PATH` | Required, absolute path to the HerdR workspace socket. |
-| `PI_CODING_AGENT_DIR` | Optional: overrides the agent directory (default `~/.pi/agent`). |
-
 ## Install
-
-Install from GitHub:
 
 ```sh
 pi install git:github.com/sting8k/pi-peer
 ```
 
-`pi-peer` registers its tools when a Pi session starts inside a HerdR pane.
+Tools register automatically when a Pi session starts inside a HerdR pane. Set `PI_PEER_DISABLED=1` for sessions that must not appear as peers or receive requests, and `PI_CODING_AGENT_DIR` to override the agent directory (default `~/.pi/agent`).
 
-### Migrating from the pi-roo extension
+Migrating from the pi-roo extension, which used to bundle these tools: set `features.talk=false` in your pi-roo config, install pi-peer, then reload every Pi session. The storage namespace changed (`pi-roo/talk` → `pi-peer/talk`), so the cutover is a clean break with no dual-read migration.
 
-If you already run the pi-roo extension (which used to bundle the `talk`
-tools):
+## Usage
 
-1. Disable the old talk tools before installing pi-peer:
-   `features.talk=false` in your pi-roo config.
-2. Install `pi-peer` and **reload all Pi sessions**.
-
-The storage namespace changed (`pi-roo/talk` → `pi-peer/talk`), so the cutover
-is a clean break: every peer must reload to re-register in the new namespace.
-There is no dual-read migration.
-
-## Tools
-
-Exactly three tools are registered.
-
-### `talk_sessions`
-
-List live Pi peer sessions in the current HerdR workspace.
-
-Parameters: none.
+Find out who is around, then ask one of them for a second opinion:
 
 ```text
 tool: talk_sessions
+
+peer-a1b  alpha   idle  (current)
+peer-c3d  beta    working  (2 queued)
+peer-e5f  gamma   idle
 ```
-
-Returns one line per live peer:
-`<public-id>  <name>  <status>` (the current session is marked
-`(current)`). When a peer has queued inbound requests (files still
-present in its inbox), the line also shows `(N queued)` — e.g.
-`peer-123  pi-roo  working  (2 queued)`. A peer with an empty inbox
-stays in the plain format. The public id is `peer-<last 3 chars of the
-session id>`
-(e.g. `peer-123`) — the full session id stays internal. Status is one of
-`idle | working | blocked | done | unknown`.
-Stale panes (no live HerdR process) are excluded.
-
-### `talk_latest`
-
-Fetch the N most recent **completed** conversation events published by another
-live peer. Default `count` is 1, max 10.
-
-Parameters:
-
-| Name | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `target` | string | yes | Public peer id (`peer-xxx`, from `talk_sessions`) or unique display name. |
-| `count` | integer | no | 1–10, default 1. |
 
 ```text
-tool: talk_latest target="peer-123" count=3
+tool: talk_to target="peer-c3d" message="Review my auth refactor: does the session fixation fix hold?"
 ```
 
-Events are returned oldest-first. The output includes the peer's name/status and
-a snapshot note when the peer's current turn is in progress
-("excludes the peer's in-progress turn"). No session reads another peer's
-transcript: each peer publishes history rebuilt from its own current-lineage
-session, and `talk_latest` reads only that published artifact.
+The request is queued immediately and delivered when `peer-c3d` goes idle, as a real user message in its session. Its answer comes back as the tool result.
+
+## Tools
+
+### `talk_sessions`
+
+Lists live peers, one per line: `<public-id>  <name>  <status>`. The current session is marked `(current)`, and a peer with pending inbound requests shows `(N queued)`. Status is one of `idle | working | blocked | done | unknown`. Stale panes are excluded. No parameters.
+
+A public id is `peer-` plus the last three characters of the session id; the full session id stays internal.
 
 ### `talk_to`
 
-Send a blocking request to another live Pi session and return its final
-response.
-
-Parameters:
+Sends a blocking request to another live session and returns its final response.
 
 | Name | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `target` | string | yes | Public peer id (`peer-xxx`, from `talk_sessions`) or unique display name. |
+| `target` | string | yes | Public peer id (`peer-xxx`) or unique display name. |
 | `message` | string | yes | Non-empty request message. |
-| `timeoutMs` | number | no | Soft timeout, clamped to 1 000–3 600 000 ms. Default 600 000 ms (10 min). When it passes with the target still alive, the call returns a non-error `pending` result and the reply arrives later via wake. |
+| `timeoutMs` | number | no | Wait deadline, clamped to 1 000–3 600 000 ms. Default 600 000 ms (10 min). |
+
+When `timeoutMs` passes while the target is still working, the call returns a non-error `pending` result telling you not to resend. The reply arrives later as a `<peer_pong>` user message that wakes your session.
+
+### `talk_latest`
+
+Fetches the N most recent **completed** conversation events published by a peer, oldest first.
+
+| Name | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `target` | string | yes | Public peer id (`peer-xxx`) or unique display name. |
+| `count` | integer | no | 1–10, default 1. |
 
 ```text
-tool: talk_to target="peer-123" message="What is your independent take on the design?"
+tool: talk_latest target="peer-c3d" count=3
 ```
 
-## Semantics
+Each peer publishes its own bounded history (max 10 events: user, assistant text, tool calls, tool results). `talk_latest` reads only that published artifact — it never touches another session's transcript, and thinking is never published. In-progress turns are excluded and flagged in the output.
 
-- **Resolution.** A target is a public peer id (`peer-xxx`) or a unique
-  display name. Raw full session ids and id prefixes are not targets. Two
-  live records with the same public id fail closed as ambiguous (never
-  resolved by pick-first). Talking to the current session is rejected.
-- **Peer identity.** The full session id is the internal identity used for
-  artifact paths, routes, inbox/reply addressing, and history correlation.
-  The public id (`peer-<last 3 chars>`) is a presentation-only alias derived
-  by one central formatter; it is what `talk_sessions` returns and what
-  examples lead with.
-- **Queueing.** A request is queued in the target's inbox immediately and is
-  delivered in filename order when the receiver's own `agent_start`/`agent_end`
-  busy state is idle; request ids prefix their creation time so older requests
-  are served first. The target's HerdR status is shown for context. Progress
-  updates (`queued`/`processing`) are streamed while waiting.
-- **Turn correlation.** When `agent_end` exposes the user prompt, the receiver
-  writes a reply only if its `<peer_message>` carries the exact `request_id`;
-  hosts that expose only assistant/error messages retain the compatibility
-  fallback, bounded by a consecutive-idle claim watchdog (~30s).
-- **Abort & timeout.** Aborting a `talk_to` call withdraws a **queued** request
-  only; an already-processing request is not interrupted. The call waits until
-  the exact `timeoutMs` deadline (default 10 min) and then returns a non-error
-  `pending` result if the target is still alive/processing. The target's
-  registration is the authoritative liveness signal: every live session
-  heartbeats it (refresh every 10 s), and a missing or stale registration
-  (peer shutdown or crash) fails the call immediately and withdraws the queued
-  request and the waiter — no blind wait, no false pending wake.
-- **Pending wake (default-on).** Every `talk_to` writes a waiter for the
-  request. When the hard deadline passes while the target is **still alive /
-  processing**, the call returns a **non-error `pending` result** telling the
-  caller not to resend: the reply is delivered later as a real user message
-  `<peer_pong ...>` that wakes the caller's session automatically. An
-  in-deadline reply is returned directly and consumes the waiter — no
-  duplicate wake. Abort removes both the queued request and the waiter, so no
-  wake ever fires for a cancelled call.
-- **Cleanup (GC).** The idle poll sweeps this session's own artifacts: a
-  pending waiter whose target has died is closed with a `<peer_pong ok="false">`
-  failure wake (the wake promise is kept even when the news is bad); an
-  un-timed waiter older than 90 min is an orphaned wait and is removed; a
-  reply without its waiter is an orphan and is removed. Session shutdown drops
-  the session's own waiters and replies (so a pending "do not resend" promise
-  does not survive a quit-then-restart); dead sessions' full artifact sets are
-  collected cross-session after a 24 h TTL plus one 5 min re-observation grace.
-- **Invalid requests are rejected, not dropped.** An inbox request that fails
-  validation (malformed JSON, missing fields, route cycle, wrong receiver) is
-  answered with an `ok=false` reply written to the caller's `replies/` dir as
-  long as the caller session id is recoverable, so the caller's waiter is
-  closed immediately instead of stranding until GC. Only a request with no
-  recoverable addressing is removed without a reply.
-- **Route protection.** Requests carry a route of already-visited sessions;
-  cycles are rejected before a request is delivered.
-- **History.** Each session publishes a bounded history (max 10 events) rebuilt
-  from its **own** current-lineage session (fail-closed: if no linkable entry
-  exists, nothing is published — stale history is replaced with empty). Events
-  are user, assistant text, tool call, and tool result. **Thinking is never
-  published.** No session ever reads **another** peer's transcript —
-  `talk_latest` reads only the published artifact.
-- **Busy tracking.** Inbox delivery is gated by the receiver's `selfBusy`
-  flag, set from its own `agent_start`/`agent_end` events and reset at
-  `session_start` so a missed end event cannot permanently block delivery. A
-  peer's HerdR status is liveness/snapshot/progress information — it does not gate delivery.
-- **Liveness.** Every live session heartbeats its registration (touch every
-  10 s). A missing registration (shutdown) fails a `talk_to` immediately; a
-  stale one (crash) fails it after two consecutive checks (~10 s). Sessions
-  with a stale registration are excluded from `talk_sessions` and cannot be
-  targeted. Delivery is fire-and-forget: a host-side delivery failure leaves
-  the request claimed and surfaces through liveness rather than an error
-  reply.
-- **Opt-out.** Set `PI_PEER_DISABLED=1` for sessions that must not appear as
-  peers or receive requests.
+## Guarantees
+
+- **Liveness decides.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your call immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
+- **Requests never vanish silently.** Invalid or malformed requests get an `ok=false` reply so the caller stops waiting; aborting withdraws a queued request; a request already being processed is not interrupted.
+- **Fair, serial delivery.** One request at a time per receiver, oldest first, delivered only while the receiver is idle. Request cycles (A → B → A) are rejected before delivery.
+- **Exactly one answer.** An in-deadline reply consumes the pending waiter, so a late `<peer_pong>` wake never duplicates it.
+- **Ambiguity fails closed.** Two peers sharing a public id resolve to an error, never to a guess.
+
+For the full flow, invariants, and cleanup rules, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Storage
 
-Peer artifacts live under `<agent-dir>/pi-peer/talk/<workspace-id>/`, where
-`<agent-dir>` is `PI_CODING_AGENT_DIR` or `~/.pi/agent`:
+Artifacts live under `<agent-dir>/pi-peer/talk/<workspace-id>/`:
 
 | Path | Contents |
 | --- | --- |
-| `sessions/` | Peer registration records (one JSON file per session). |
-| `latest/` | Latest published history per peer (one JSON file per session). |
+| `sessions/` | Peer registrations, refreshed by heartbeat. |
 | `inbox/` | Queued requests per target session. |
-| `replies/<caller-session-id>/` | Responses written by the answering peer, one file per request id. |
-| `waiters/<caller-session-id>/` | Caller-owned pending wake trackers, one file per request id (written for every `talk_to`; consumed on direct reply, abort, or after a `<peer_pong>` wake). |
+| `replies/<caller-session-id>/` | Answers written by the responding peer. |
+| `waiters/<caller-session-id>/` | Pending-wake trackers owned by the caller. |
+| `latest/` | Each peer's published history. |
 
-Writes are atomic (temp file + rename); the mailbox directory is created with
-`0700` permissions. The namespace is a clean break from the legacy
-`pi-roo/talk` — see [Migrating from the pi-roo extension](#migrating-from-the-pi-roo-extension).
+Writes are atomic (temp file plus rename) and the mailbox directory is created with `0700` permissions. Orphaned artifacts are swept on idle; artifacts of dead sessions are collected after a 24 h TTL.
 
 ## Development
 
 ```sh
 npm install
-npm test              # 31 tests (3 suites)
-npm run test:focused  # 24 tests, no integration
-npm run test:integration  # 6 mocked two-peer lifecycle tests
-npm run typecheck     # tsc --noEmit
+npm test                  # 43 tests (3 suites)
+npm run test:focused      # 36 unit tests
+npm run test:integration  # 7 mocked two-peer lifecycle tests
+npm run typecheck         # tsc --noEmit
 ```
 
-Layout:
+- `pi-extension/pi-peer/` — shipped runtime: `index.ts` (entrypoint), `service.ts` (tool registration), `schemas.ts`, `herdr.ts` (workspace identity), `history.ts`, `protocol.ts` (request/reply envelopes), `storage.ts` (atomic persistence).
+- `test/peer/` — unit tests. `test/integration/` — mocked two-peer lifecycle.
+- `docs/` — architecture and decisions; see `docs/decisions/0011-standalone-pi-peer-extension.md` for the packaging decision.
 
-- `pi-extension/pi-peer/` — the shipped runtime (`index.ts` entrypoint,
-  `service.ts` registration, `schemas.ts`, `herdr.ts` workspace identity,
-  `history.ts` bounded history, `protocol.ts` request/reply envelopes,
-  `storage.ts` atomic persistence).
-- `test/peer/` — unit tests (entrypoint, protocol, history, storage).
-- `test/integration/` — mocked two-peer lifecycle (request/reply, busy
-  queueing, history).
+Distribution is GitHub-only; the package is `private: true` and is not published to npm.
 
-Documentation lives in `docs/` (see `docs/README.md`); decisions are recorded
-in `docs/decisions/` (see `0011-standalone-pi-peer-extension.md` for the
-packaging decision).
+## Related Work
 
-## Package metadata note
-
-`name` is `pi-peer`, `version` is `1.0.0`, and `author` is `sting8k`. The
-package targets the public repository `github.com/sting8k/pi-peer`
-(`repository`/`homepage`/`bugs` set accordingly) and is `private: true`:
-distribution is GitHub-only, with npm publishing out of scope.
+- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) — the host whose extension API this builds on.
+- HerdR — the pane/workspace environment that provides session identity and peer discovery.
 
 ## License
 

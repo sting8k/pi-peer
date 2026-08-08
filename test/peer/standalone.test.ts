@@ -306,7 +306,7 @@ describe("pi-peer standalone runtime", () => {
     };
   }
 
-  it("session_start sets the footer status to 'peer-<last3>' and shutdown clears it", async () => {
+  it("session_start sets the footer status to '<Name> · peer-<last3>' and shutdown clears it", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
     const statusCalls: Array<[string, string | undefined]> = [];
@@ -338,13 +338,56 @@ describe("pi-peer standalone runtime", () => {
     try {
       for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
       await waitUntil(() => existsSync(join(root, "sessions", "session-status.json")), "session registration to appear");
-      assert.deepEqual(statusCalls, [["pi-peer", publicPeerId("session-status")]]);
+      const record = JSON.parse(readFileSync(recordPath(root, "session-status"), "utf8"));
+      assert.deepEqual(statusCalls, [["pi-peer", `${record.name} · ${publicPeerId("session-status")}`]]);
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       assert.deepEqual(statusCalls, [
-        ["pi-peer", publicPeerId("session-status")],
+        ["pi-peer", `${record.name} · ${publicPeerId("session-status")}`],
         ["pi-peer", undefined],
       ]);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("session_start reuses a persisted friendly name for the same session", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-reuse";
+    const ctx: any = {
+      cwd: "/work/reloaded",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-reuse", terminalId: "terminal-reuse", tabId: "tab-reuse",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "sessions"), { recursive: true });
+      writeFileSync(recordPath(root, sessionId), JSON.stringify({
+        schemaVersion: 1, sessionId, name: "Mochi", cwd: "/work/old",
+        workspaceId: "workspace-1", paneId: "pane-old", terminalId: "terminal-old",
+        tabId: "tab-old", registrationId: "old-registration", createdAt: nowIso(),
+      }));
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "reloaded session registration to appear");
+      assert.equal(JSON.parse(readFileSync(recordPath(root, sessionId), "utf8")).name, "Mochi");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -12,6 +12,8 @@ import {
   isPeerRecord,
   newRequestId,
   nowIso,
+  PEER_NAME_POOL,
+  pickPeerName,
   publicPeerId,
   recordPath,
   removeOwnedRecord,
@@ -138,6 +140,42 @@ describe("peer session talk", () => {
     assert.equal(publicPeerId("a"), "peer-a");
     // empty input fails closed rather than producing an invalid `peer-`
     assert.throws(() => publicPeerId(""), /non-empty session id/);
+  });
+
+  it("picks a deterministic name for the same session and taken set", () => {
+    const taken = new Set<string>(["Milo", "Luna"]);
+    const first = pickPeerName("session-friendly", taken);
+    assert.equal(pickPeerName("session-friendly", taken), first);
+  });
+
+  it("uses the next name in rotation when the first name is taken", () => {
+    const sessionId = "session-next";
+    const first = pickPeerName(sessionId, new Set());
+    const firstIndex = PEER_NAME_POOL.indexOf(first as (typeof PEER_NAME_POOL)[number]);
+    const next = PEER_NAME_POOL[(firstIndex + 1) % PEER_NAME_POOL.length];
+    assert.equal(pickPeerName(sessionId, new Set([first])), next);
+  });
+
+  it("wraps around the end of the name pool", () => {
+    let sessionId = "session-wrap";
+    while (PEER_NAME_POOL.indexOf(pickPeerName(sessionId, new Set()) as (typeof PEER_NAME_POOL)[number]) === 0) {
+      sessionId += "-x";
+    }
+    const first = pickPeerName(sessionId, new Set());
+    const startIndex = PEER_NAME_POOL.indexOf(first as (typeof PEER_NAME_POOL)[number]);
+    const taken = new Set<string>(PEER_NAME_POOL.slice(startIndex));
+    assert.ok(startIndex > 0);
+    assert.equal(pickPeerName(sessionId, taken), PEER_NAME_POOL[0]);
+  });
+
+  it("adds a numeric suffix after all pool names are taken", () => {
+    const sessionId = "session-suffix";
+    const first = pickPeerName(sessionId, new Set());
+    const startIndex = PEER_NAME_POOL.indexOf(first as (typeof PEER_NAME_POOL)[number]);
+    assert.equal(
+      pickPeerName(sessionId, new Set<string>(PEER_NAME_POOL)),
+      `${PEER_NAME_POOL[startIndex]}-2`,
+    );
   });
 
   it("rejects records with an empty session id", () => {

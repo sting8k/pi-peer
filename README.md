@@ -59,9 +59,9 @@ Find out who is around, then ask one of them for a second opinion:
 ```text
 tool: talk_sessions
 
-peer-a1b  alpha   idle  (current)
-peer-c3d  beta    working  (2 queued)
-peer-e5f  gamma   idle
+peer-a1b  Milo   idle  (current)
+peer-c3d  Coco   working  (2 queued)
+peer-e5f  Luna   idle
 ```
 
 ```text
@@ -77,6 +77,8 @@ The request is queued immediately and delivered when `peer-c3d` goes idle, as a 
 Lists live peers, one per line: `<public-id>  <name>  <status>`. The current session is marked `(current)`, and a peer with pending inbound requests shows `(N queued)`. Status is one of `idle | working | blocked | done | unknown`. Stale panes are excluded. No parameters.
 
 A public id is `peer-` plus the last three characters of the session id; the full session id stays internal.
+
+Each session receives a stable friendly name from a preset pet-name pool, unique within the workspace. Reloading keeps the same name. The footer shows `<Name> · <peer-id>`; peer-to-peer tools continue to target the public peer id.
 
 ### `talk_to`
 

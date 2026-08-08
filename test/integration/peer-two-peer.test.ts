@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { join } from "node:path";
 
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
-import { inboxDir, repliesDir, waitersDir } from "../../pi-extension/pi-peer/protocol.ts";
+import { inboxDir, recordPath, repliesDir, waitersDir } from "../../pi-extension/pi-peer/protocol.ts";
 import { createTestDir } from "../peer/helpers.ts";
 
 function waitUntil(predicate: () => boolean, message: string, timeoutMs = 3_000): Promise<void> {
@@ -83,6 +83,8 @@ describe("peer two-peer lifecycle", () => {
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
+      const senderName = JSON.parse(readFileSync(recordPath(root, "session-alpha"), "utf8")).name;
+      const receiverName = JSON.parse(readFileSync(recordPath(root, "session-beta"), "utf8")).name;
       const resumedLatest = await sender.tools.get("talk_latest").execute(
         "latest-resumed", { target: "peer-eta" }, undefined, undefined, sender.ctx,
       );
@@ -91,8 +93,8 @@ describe("peer two-peer lifecycle", () => {
       assert.equal(resumedLatest.details.currentTurnInProgress, false);
       const listResult = await sender.tools.get("talk_sessions").execute("list-1", {}, undefined, undefined, sender.ctx);
       assert.match(listResult.content[0].text, /peer-/);
-      assert.match(listResult.content[0].text, /peer-pha  alpha  idle  \(current\)/);
-      assert.match(listResult.content[0].text, /peer-eta  beta  idle/);
+      assert.match(listResult.content[0].text, new RegExp(`peer-pha\\s+${senderName}\\s+idle\\s+\\(current\\)`));
+      assert.match(listResult.content[0].text, new RegExp(`peer-eta\\s+${receiverName}\\s+idle`));
 
       // Queue depth: peer-eta has 1 queued + 1 in-flight (.json.processing); current session has none.
       const etaInbox = inboxDir(root, "session-beta");
@@ -105,9 +107,9 @@ describe("peer two-peer lifecycle", () => {
       }
       renameSync(join(etaInbox, "req_q_1.json"), join(etaInbox, "req_q_1.json.processing"));
       const queuedList = await sender.tools.get("talk_sessions").execute("list-queued", {}, undefined, undefined, sender.ctx);
-      assert.match(queuedList.content[0].text, /peer-eta  beta  idle  \(2 queued\)/);
-      assert.match(queuedList.content[0].text, /peer-pha  alpha  idle  \(current\)/);
-      assert.doesNotMatch(queuedList.content[0].text, /peer-pha  alpha  idle  \(current\)  \(\d+ queued\)/);
+      assert.match(queuedList.content[0].text, new RegExp(`peer-eta\\s+${receiverName}\\s+idle\\s+\\(2 queued\\)`));
+      assert.match(queuedList.content[0].text, new RegExp(`peer-pha\\s+${senderName}\\s+idle\\s+\\(current\\)`));
+      assert.doesNotMatch(queuedList.content[0].text, new RegExp(`peer-pha\\s+${senderName}\\s+idle\\s+\\(current\\)\\s+\\(\\d+ queued\\)`));
 
       const senderRecordPath = join(root, "sessions", "session-alpha.json");
       rmSync(senderRecordPath, { force: true });
@@ -115,7 +117,7 @@ describe("peer two-peer lifecycle", () => {
       await new Promise((resolve) => setTimeout(resolve, 350));
       assert.ok(existsSync(senderRecordPath), "poll loop should restore the missing registration without a tool call");
       const healedList = await sender.tools.get("talk_sessions").execute("list-heal", {}, undefined, undefined, sender.ctx);
-      assert.match(healedList.content[0].text, /alpha\s+idle\s+\(current\)/);
+      assert.match(healedList.content[0].text, new RegExp(`${senderName}\\s+idle\\s+\\(current\\)`));
 
       peerStatuses.set("pane-beta", "working");
       const abortController = new AbortController();
@@ -131,7 +133,7 @@ describe("peer two-peer lifecycle", () => {
       abortController.abort();
       await assert.rejects(aborted, /Aborted/);
       assert.deepEqual(abortUpdates.map((update) => update.details.state), ["queued"]);
-      assert.match(abortUpdates[0].content[0].text, /Queued for beta \(peer-eta\); target status: working/);
+      assert.match(abortUpdates[0].content[0].text, new RegExp(`Queued for ${receiverName} \\(peer-eta\\); target status: working`));
       receiverBusy = false;
       peerStatuses.set("pane-beta", "idle");
       await new Promise((resolve) => setTimeout(resolve, 350));
@@ -157,7 +159,7 @@ describe("peer two-peer lifecycle", () => {
       assert.equal(result.details.target, "peer-eta");
       assert.equal(result.details.state, "completed");
       assert.deepEqual(progressUpdates.map((update) => update.details.state), ["queued", "processing"]);
-      assert.match(progressUpdates[1].content[0].text, /beta \(peer-eta\) accepted the request and is processing it/);
+      assert.match(progressUpdates[1].content[0].text, new RegExp(`${receiverName} \\(peer-eta\\) accepted the request and is processing it`));
 
       // Entries are persisted before agent_end; append the turn then fire the event.
       writeFileSync(receiver.ctx.sessionManager.getSessionFile(), JSON.stringify({

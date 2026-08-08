@@ -1,6 +1,6 @@
 {
   "name": "pi-peer",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Standalone peer-to-peer Pi communication over the HerdR workspace - talk_to, talk_sessions, and talk_latest tools with a resilient local mailbox.",
   "keywords": [

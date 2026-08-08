@@ -31,10 +31,12 @@ import {
   isRegisteredLive,
   isTalkRequest,
   isTalkResponse,
+  isPeerRecord,
   liveRecords,
   loadRecords,
   newRequestId,
   nowIso,
+  pickPeerName,
   publicPeerId,
 
   POLL_MS,
@@ -518,10 +520,17 @@ export function registerTalkTools(
     }
     const peer = await getCurrentPeer(signal);
     const root = rootDir(peer.workspaceId);
+    const existing = readJson(recordPath(root, sessionId));
+    const name = isPeerRecord(existing) && existing.sessionId === sessionId
+      ? existing.name
+      : pickPeerName(
+        sessionId,
+        new Set(loadRecords(root).filter((record) => record.sessionId !== sessionId).map((record) => record.name)),
+      );
     const record: PeerRecord = {
       schemaVersion: 1,
       sessionId,
-      name: basename(ctx.cwd) || publicPeerId(sessionId),
+      name,
       cwd: ctx.cwd,
       workspaceId: peer.workspaceId,
       paneId: peer.paneId,
@@ -635,7 +644,7 @@ export function registerTalkTools(
     selfBusy = false;
     void ensureRuntime(ctx)
       .then((current) => {
-        ctx.ui?.setStatus("pi-peer", publicPeerId(current.record.sessionId));
+        ctx.ui?.setStatus("pi-peer", `${current.record.name} · ${publicPeerId(current.record.sessionId)}`);
         publishHistoryFromOwnSession(current, ctx);
       })
       .catch(() => {});

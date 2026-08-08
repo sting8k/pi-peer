@@ -102,6 +102,33 @@ export const DEAD_SESSION_TTL_MS = 24 * 60 * 60_000;
 export const DEAD_SESSION_SWEEP_MS = 5 * 60_000;
 export const DEFAULT_TIMEOUT_MS = 600_000;
 
+export const PEER_NAME_POOL = [
+  "Milo", "Coco", "Luna", "Rex", "Buddy", "Bella", "Ziggy", "Peanut", "Mochi", "Biscuit",
+  "Nala", "Simba", "Toby", "Daisy", "Rocky", "Momo", "Pip", "Gizmo", "Waffle", "Boba",
+] as const;
+
+function peerNameHash(sessionId: string): number {
+  let hash = 5381;
+  for (let index = 0; index < sessionId.length; index++) {
+    hash = (((hash << 5) + hash) ^ sessionId.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+export function pickPeerName(sessionId: string, taken: Set<string>): string {
+  const start = peerNameHash(sessionId) % PEER_NAME_POOL.length;
+  for (let offset = 0; offset < PEER_NAME_POOL.length; offset++) {
+    const name = PEER_NAME_POOL[(start + offset) % PEER_NAME_POOL.length];
+    if (!taken.has(name)) return name;
+  }
+  for (let suffix = 2; ; suffix++) {
+    for (let offset = 0; offset < PEER_NAME_POOL.length; offset++) {
+      const name = `${PEER_NAME_POOL[(start + offset) % PEER_NAME_POOL.length]}-${suffix}`;
+      if (!taken.has(name)) return name;
+    }
+  }
+}
+
 /**
  * Derive the public peer id from a full session id: `peer-<last 3 chars>`.
  *

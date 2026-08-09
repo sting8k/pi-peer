@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 
 import { readJson, safeKey, writeAtomic } from "./storage.ts";
@@ -529,10 +529,21 @@ export async function waitForResponseOrPending(
   } catch (error) {
     if (signal?.aborted) {
       // Abort withdraws a queued request only; an already-processing request
-      // (.processing) is not interrupted. The waiter is removed so no wake
-      // fires later for a caller that is no longer listening.
-      rmSync(pendingPath, { force: true });
-      rmSync(waiterPath, { force: true });
+      // (.processing) is not interrupted. Withdrawal must be atomic: unlink
+      // success proves the request was still queued, so no reply can ever
+      // arrive and the waiter is removed. When the peer already claimed the
+      // request (unlink misses), its reply WILL arrive: keep the waiter and
+      // mark it timed-out so the wake scanner (wakePendingPongs) delivers the
+      // late reply as <peer_pong>, same as a wait that ran out its deadline.
+      let withdrawn = false;
+      try {
+        unlinkSync(pendingPath);
+        withdrawn = true;
+      } catch {
+        // ENOENT: the peer claimed (.processing) or already replied.
+      }
+      if (withdrawn) rmSync(waiterPath, { force: true });
+      else markTimedOut(waiterPath);
     }
     throw error;
   }

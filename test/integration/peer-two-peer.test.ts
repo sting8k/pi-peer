@@ -497,7 +497,7 @@ describe("peer two-peer lifecycle", () => {
   it("abort removes waiter + queued request and never wakes later", async () => {
     const root = createTestDir();
     const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
-    const createPeer = (sessionId: string, paneId: string) => {
+    const createPeer = (sessionId: string, paneId: string, busy: () => boolean = () => false) => {
       const tools = new Map<string, any>();
       const sentMessages: any[] = [];
       const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -520,13 +520,15 @@ describe("peer two-peer lifecycle", () => {
         }),
         getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
         rootDir: () => root,
-        isBusy: () => false,
+        isBusy: busy,
       });
       return { api, ctx, tools, handlers, sentMessages };
     };
 
     const sender = createPeer("session-alpha", "pane-alpha");
-    const receiver = createPeer("session-beta", "pane-beta");
+    // Busy receiver: the request must stay queued (never claimed) so the abort
+    // deterministically exercises the withdrawal path.
+    const receiver = createPeer("session-beta", "pane-beta", () => true);
     try {
       for (const peer of [sender, receiver]) {
         for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
@@ -571,6 +573,96 @@ describe("peer two-peer lifecycle", () => {
     }
   });
 
+
+  it("abort after the peer claimed the request keeps the waiter and wakes later with <peer_pong>", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, paneId: string, busy: () => boolean = () => false) => {
+      const tools = new Map<string, any>();
+      const sentMessages: any[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) {
+          sentMessages.push(content);
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: busy,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    // Busy receiver: its drain never claims automatically, so the manual
+    // rename below is the only thing that moves the request to .processing,
+    // making this test deterministically exercise the claimed-abort path.
+    const receiver = createPeer("session-beta", "pane-beta", () => true);
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const receiverName = JSON.parse(readFileSync(recordPath(root, "session-beta"), "utf8")).name;
+      const abortController = new AbortController();
+      const promise = sender.tools.get("talk_to").execute(
+        "talk-claimed-abort", { target: receiverName, message: "Cancel a claimed request.", timeoutMs: 5000 },
+        abortController.signal, undefined, sender.ctx,
+      );
+      // Wait for the queued request, then simulate the peer claiming it by
+      // renaming it to .processing (the peer's own drain would do this).
+      const inbox = inboxDir(root, "session-beta");
+      await waitUntil(() => existsSync(inbox) && readdirSync(inbox).some((f: string) => f.endsWith(".json")), "queued request to appear");
+      const reqId = readdirSync(inbox).find((f: string) => f.endsWith(".json"))!.replace(/\.json$/, "");
+      renameSync(join(inbox, `${reqId}.json`), join(inbox, `${reqId}.json.processing`));
+
+      abortController.abort();
+      await assert.rejects(promise, /Aborted/);
+
+      // The claim means the reply WILL arrive, so the waiter must be kept
+      // (and marked timed-out) instead of being removed like the queued case.
+      const waiterDir = waitersDir(root, "session-alpha");
+      const waiterFile = join(waiterDir, `${reqId}.json`);
+      assert.equal(existsSync(waiterFile), true, "waiter kept when the peer already claimed the request");
+      const waiter = JSON.parse(readFileSync(waiterFile, "utf8"));
+      assert.equal(typeof waiter.timedOutAt, "string", "waiter marked timed-out on claimed abort");
+      assert.ok(waiter.timedOutAt.length > 0, "timedOutAt is truthy");
+
+      // The peer later finishes; its reply lands after the abort. The wake
+      // scanner (wakePendingPongs) must deliver it as a <peer_pong>.
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${reqId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: reqId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Late reply after abort", createdAt: new Date().toISOString(),
+      }));
+      await waitUntil(() => sender.sentMessages.some((m: string) => m.startsWith("<peer_pong")), "sender wake pong", 3000);
+      const pongs = sender.sentMessages.filter((m: string) => m.startsWith("<peer_pong"));
+      assert.equal(pongs.length, 1, "exactly one wake pong");
+      assert.match(pongs[0], /Late reply after abort/);
+      await waitUntil(() => !existsSync(waiterFile) && !existsSync(join(replyDir, `${reqId}.json`)), "waiter and reply cleaned after wake", 3000);
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after wake");
+      assert.equal(existsSync(join(replyDir, `${reqId}.json`)), false, "reply cleaned after wake");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("session_shutdown answers an in-flight request with an error reply and drops the .processing claim", async () => {
     const root = createTestDir();
     const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();

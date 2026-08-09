@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   correlatePeerRequestTurn,
+  DEFAULT_TIMEOUT_MS,
   extractAssistantText,
   inboxDir,
   isTalkRequest,
@@ -18,6 +19,7 @@ import {
   recordPath,
   removeOwnedRecord,
   requestMessage,
+  steerMessage,
   requeueProcessing,
   resolveTarget,
   routeForRequest,
@@ -99,13 +101,24 @@ describe("peer session talk", () => {
     }, "alpha");
     assert.equal(correlatePeerRequestTurn([{
       role: "user", content: [{ type: "text", text: peerPrompt }],
-    }], "req-1"), true);
+    }], ["req-1"]), true);
     assert.equal(correlatePeerRequestTurn([{
       role: "user", content: [{ type: "text", text: "A normal user turn" }],
-    }], "req-1"), false);
+    }], ["req-1"]), false);
     assert.equal(correlatePeerRequestTurn([{
       role: "assistant", content: [{ type: "text", text: "Only assistant output" }],
-    }], "req-1"), undefined);
+    }], ["req-1"]), undefined);
+    // A batch matches any of its request ids (root + steered update).
+    const steerPrompt = steerMessage({
+      version: 1, type: "request", id: "req-2", from: "session-a", to: "session-b",
+      message: "Revise", route: ["session-a"], createdAt: "now",
+    }, "req-1", "alpha");
+    assert.match(steerPrompt, /request_id="req-2"/);
+    assert.match(steerPrompt, /amends="req-1"/);
+    assert.match(steerPrompt, /do not restart from scratch/);
+    assert.equal(correlatePeerRequestTurn([{
+      role: "user", content: [{ type: "text", text: steerPrompt }],
+    }], ["req-1", "req-2"]), true);
   });
 
   it("rejects envelopes with empty identities", () => {
@@ -217,8 +230,8 @@ describe("peer session talk", () => {
   it("keeps full session ids as internal identity in routes, artifacts, and envelopes", () => {
     const runtime = {
       record: { sessionId: "session-b" },
-      activeRequest: { route: ["session-a"] },
-    } as unknown as { record: PeerRecord; activeRequest: TalkRequest | null };
+      activeRequests: [{ route: ["session-a"] }],
+    } as unknown as { record: PeerRecord; activeRequests: TalkRequest[] };
     assert.deepEqual(routeForRequest(runtime), ["session-a", "session-b"], "routes use full session ids");
     assert.equal(recordPath("/root", "session-a"), join("/root", "sessions", "session-a.json"), "artifact paths use full session ids");
     const prompt = requestMessage({
@@ -235,8 +248,8 @@ describe("peer session talk", () => {
     try {
       const runtime = {
         record: { sessionId: "session-b" },
-        activeRequest: { route: ["session-a"] },
-      } as unknown as { record: PeerRecord; activeRequest: TalkRequest | null };
+        activeRequests: [{ route: ["session-a"] }],
+      } as unknown as { record: PeerRecord; activeRequests: TalkRequest[] };
       assert.deepEqual(routeForRequest(runtime), ["session-a", "session-b"]);
       const inbox = join(root, "inbox", "session-b");
       mkdirSync(inbox, { recursive: true });
@@ -556,7 +569,7 @@ describe("peer session talk", () => {
     }
   });
 
-  it("honors a short timeoutMs as the exact wait deadline (no 10-min floor)", async () => {
+  it("honors a short timeoutMs as the exact wait deadline (no 1-min floor)", async () => {
     const root = createTestDir();
     try {
       const request: TalkRequest = {
@@ -588,7 +601,7 @@ describe("peer session talk", () => {
         terminalId: "term-b",
         createdAt: nowIso(),
       }));
-      // A 400 ms timeout must not balloon to the 10 min default; a stale
+      // A 400 ms timeout must not balloon to the 1 min default; a stale
       // registration would then fail the same shape instead of returning pending.
       const started = Date.now();
       const result = await waitForResponseOrPending(root, request, 400);
@@ -599,6 +612,10 @@ describe("peer session talk", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("default wait deadline is 60 000 ms (60 s)", () => {
+    assert.equal(DEFAULT_TIMEOUT_MS, 60_000, "DEFAULT_TIMEOUT_MS is 60 s");
   });
 
 });

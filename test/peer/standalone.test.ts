@@ -434,7 +434,7 @@ describe("pi-peer standalone runtime", () => {
     const root = createTestDir();
     const sent: string[] = [];
     const pi = { sendUserMessage: async (content: any) => { sent.push(content); } } as any;
-    const runtime = { root, record: { sessionId: "session-a" }, activeRequest: null } as any;
+    const runtime = { root, record: { sessionId: "session-a" }, activeRequests: [] } as any;
     const now = nowIso();
     const recordFor = (sessionId: string, name: string) => JSON.stringify({
       schemaVersion: 1, sessionId, name, cwd: `/work/${name}`, workspaceId: "w",
@@ -504,7 +504,7 @@ describe("pi-peer standalone runtime", () => {
     const root = createTestDir();
     const sent: string[] = [];
     const pi = { sendUserMessage: async (content: any) => { sent.push(content); } } as any;
-    const runtime = { root, record: { sessionId: "session-a" }, activeRequest: null } as any;
+    const runtime = { root, record: { sessionId: "session-a" }, activeRequests: [] } as any;
     const now = nowIso();
     try {
       mkdirSync(sessionDir(root), { recursive: true });

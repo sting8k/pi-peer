@@ -8,7 +8,7 @@ export const TalkToParams = Type.Object({
     description: "Message to send to the peer session.",
   }),
   timeoutMs: Type.Optional(Type.Number({
-    description: "Optional wait in milliseconds before returning a non-error pending result. Effective deadline is the exact timeoutMs (default 10 min, clamped 1 000–3 600 000 ms); when it passes with the target still alive, the call returns a non-error pending result and this session is woken later with the reply. Liveness is verified periodically; a confirmed-dead target fails the call.",
+    description: "How long THIS session blocks waiting, in milliseconds (default 60 000; clamped 1 000–3 600 000). This is not a time budget for the peer: it keeps working past this and its reply is never lost. When the wait elapses the call returns a non-error pending result and the reply is delivered to you later as a <peer_pong>. You only need the send to succeed. Prefer the default and get on with other work; raise it only when you need the answer inline in this same turn. Liveness is verified periodically; a confirmed-dead target fails the call.",
   })),
 });
 

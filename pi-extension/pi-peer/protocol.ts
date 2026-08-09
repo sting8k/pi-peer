@@ -100,7 +100,7 @@ export const WAITER_TTL_MS = 90 * 60_000;
 export const DEAD_SESSION_TTL_MS = 24 * 60 * 60_000;
 /** Cadence for the cross-session dead-session sweep on the idle poll. */
 export const DEAD_SESSION_SWEEP_MS = 5 * 60_000;
-export const DEFAULT_TIMEOUT_MS = 600_000;
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export const PEER_NAME_POOL = [
   "Milo", "Coco", "Luna", "Rex", "Buddy", "Bella", "Ziggy", "Peanut", "Mochi", "Biscuit",
@@ -360,8 +360,9 @@ export function loadRecords(root: string): PeerRecord[] {
  * triggered its turn. `undefined` preserves compatibility with hosts that
  * report only assistant/error messages at agent_end.
  */
-export function correlatePeerRequestTurn(messages: any[] | undefined, requestId: string): boolean | undefined {
+export function correlatePeerRequestTurn(messages: any[] | undefined, requestIds: string[]): boolean | undefined {
   if (!Array.isArray(messages)) return undefined;
+  const idSet = new Set(requestIds);
   let sawUserMessage = false;
   for (const message of messages) {
     if (message?.role !== "user") continue;
@@ -374,7 +375,7 @@ export function correlatePeerRequestTurn(messages: any[] | undefined, requestId:
       .map((block: any) => block.text)
       .join("\n");
     const match = text.match(/<peer_message\b[^>]*\brequest_id="([^"]+)"/);
-    if (match?.[1] === requestId) return true;
+    if (match?.[1] && idSet.has(match[1])) return true;
   }
   return sawUserMessage ? false : undefined;
 }
@@ -405,9 +406,10 @@ export function resolveTarget(records: PeerRecord[], target: string): PeerRecord
   throw new Error(`Peer session not found: ${target}`);
 }
 
-export function routeForRequest(runtime: { activeRequest: TalkRequest | null; record: PeerRecord }): string[] {
-  return runtime.activeRequest
-    ? [...runtime.activeRequest.route, runtime.record.sessionId]
+export function routeForRequest(runtime: { activeRequests: TalkRequest[]; record: PeerRecord }): string[] {
+  const root = runtime.activeRequests[0];
+  return root
+    ? [...root.route, runtime.record.sessionId]
     : [runtime.record.sessionId];
 }
 
@@ -593,6 +595,26 @@ export function requestMessage(request: TalkRequest, fromName: string): string {
     `<peer_message request_id="${escapeAttribute(request.id)}" from="${escapeAttribute(fromName)}" from_session="${escapeAttribute(request.from)}" peer_id="${escapeAttribute(publicPeerId(request.from))}">`,
     "Another Pi session is asking for your independent response.",
     "Respond normally. Your final assistant response will be returned to the sender automatically.",
+    "",
+    request.message,
+    "</peer_message>",
+  ].join("\n");
+}
+
+/**
+ * Steered variant of {@link requestMessage} for a same-caller update while the
+ * receiving peer is mid-turn on a prior request from the same session. Keeps the
+ * `<peer_message request_id=...>` tag shape (correlation depends on it), adds an
+ * `amends="<rootRequestId>"` attribute linking this update to the request that
+ * started the turn, and reframes the body as an in-flight revision rather than a
+ * new independent request.
+ */
+export function steerMessage(request: TalkRequest, rootRequestId: string, fromName: string): string {
+  return [
+    `<peer_message request_id="${escapeAttribute(request.id)}" from="${escapeAttribute(fromName)}" from_session="${escapeAttribute(request.from)}" peer_id="${escapeAttribute(publicPeerId(request.from))}" amends="${escapeAttribute(rootRequestId)}">`,
+    "This is an update from the same session for the request you are currently working on.",
+    "Adjust your current work; do not restart from scratch.",
+    "Your final response is returned for all of these requests automatically.",
     "",
     request.message,
     "</peer_message>",

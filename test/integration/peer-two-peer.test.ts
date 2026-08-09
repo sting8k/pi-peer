@@ -734,4 +734,361 @@ describe("peer two-peer lifecycle", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("same-caller request steers mid-turn and one agent_end answers the whole batch", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const receiverBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean; activeRequestWatchdogTicks?: number } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+        ...(opts.activeRequestWatchdogTicks !== undefined ? { activeRequestWatchdogTicks: opts.activeRequestWatchdogTicks } : {}),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+    const request = (id: string, from: string) => ({
+      version: 1, type: "request", id, from, to: "session-beta",
+      message: `message-${id}`, route: [from], createdAt: new Date().toISOString(),
+    });
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "pane-beta", { busy: () => receiverBusy.value });
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const inbox = inboxDir(root, "session-beta");
+      mkdirSync(inbox, { recursive: true });
+      // Root request from the same caller starts the batch.
+      writeFileSync(join(inbox, "req1.json"), JSON.stringify(request("req1", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 1, "root request delivered");
+      receiverBusy.value = true;
+      // Revised spec from the SAME caller while the peer is mid-turn: must steer.
+      writeFileSync(join(inbox, "req2.json"), JSON.stringify(request("req2", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 2, "same-caller request steered");
+
+      const [m1, m2] = receiver.sentMessages;
+      assert.match(m1.content, /request_id="req1"/);
+      assert.equal(m1.options, undefined, "root delivered as a plain user message (no steer)");
+      assert.match(m2.content, /request_id="req2"/);
+      assert.match(m2.content, /amends="req1"/);
+      assert.match(m2.content, /adjust your current work/i);
+      assert.deepEqual(m2.options, { deliverAs: "steer" }, "revision delivered as a steer");
+      assert.equal(existsSync(join(inbox, "req1.json.processing")), true, "req1 claimed");
+      assert.equal(existsSync(join(inbox, "req2.json.processing")), true, "req2 claimed");
+
+      // One agent_end (the single turn) answers BOTH requests with the same message.
+      for (const handler of receiver.handlers.get("agent_end") ?? []) {
+        handler({ messages: [
+          { role: "user", content: [{ type: "text", text: m1.content }] },
+          { role: "user", content: [{ type: "text", text: m2.content }] },
+          { role: "assistant", content: [{ type: "text", text: "Final combined answer" }] },
+        ] }, receiver.ctx);
+      }
+      const replyDir = repliesDir(root, "session-alpha");
+      await waitUntil(
+        () => existsSync(join(replyDir, "req1.json")) && existsSync(join(replyDir, "req2.json")),
+        "both batch replies written",
+      );
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req1.json"), "utf8")).message, "Final combined answer");
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req2.json"), "utf8")).message, "Final combined answer");
+      assert.equal(existsSync(join(inbox, "req1.json.processing")), false, "req1 claim released");
+      assert.equal(existsSync(join(inbox, "req2.json.processing")), false, "req2 claim released");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("different-caller request stays queued until the running batch completes", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const receiverBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+    const request = (id: string, from: string) => ({
+      version: 1, type: "request", id, from, to: "session-beta",
+      message: `message-${id}`, route: [from], createdAt: new Date().toISOString(),
+    });
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "pane-beta", { busy: () => receiverBusy.value });
+    const third = createPeer("session-gamma", "pane-gamma");
+    try {
+      for (const peer of [sender, receiver, third]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const inbox = inboxDir(root, "session-beta");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "req1.json"), JSON.stringify(request("req1", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 1, "root request delivered");
+      receiverBusy.value = true;
+
+      // A DIFFERENT caller's request must NOT steer into the running batch.
+      writeFileSync(join(inbox, "req3.json"), JSON.stringify(request("req3", "session-gamma")));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(receiver.sentMessages.length, 1, "different caller never steers into the batch");
+      assert.equal(existsSync(join(inbox, "req3.json")), true, "different-caller request stays queued");
+
+      // Complete the batch: the root turn answers req1.
+      for (const handler of receiver.handlers.get("agent_end") ?? []) {
+        handler({ messages: [
+          { role: "user", content: [{ type: "text", text: receiver.sentMessages[0].content }] },
+          { role: "assistant", content: [{ type: "text", text: "Done" }] },
+        ] }, receiver.ctx);
+      }
+      const replyDir = repliesDir(root, "session-alpha");
+      await waitUntil(() => existsSync(join(replyDir, "req1.json")), "root request answered");
+
+      // Now idle, the queued different-caller request is delivered normally.
+      receiverBusy.value = false;
+      await waitUntil(() => receiver.sentMessages.length === 2, "queued request delivered after batch completes");
+      const m3 = receiver.sentMessages[1];
+      assert.match(m3.content, /request_id="req3"/);
+      assert.equal(m3.options, undefined, "queued request delivered as a plain user message, not a steer");
+      assert.equal(existsSync(join(inbox, "req3.json")), false, "different-caller request claimed after batch");
+    } finally {
+      for (const peer of [sender, receiver, third]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("busy peer with no active request does not drain an inbound request mid-turn", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, paneId: string, busy: () => boolean = () => false) => {
+      const sentMessages: string[] = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool() {},
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any) { sentMessages.push(content); },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: busy,
+      });
+      return { api, ctx, tools: new Map(), handlers, sentMessages };
+    };
+
+    const receiver = createPeer("session-beta", "pane-beta", () => true);
+    try {
+      for (const handler of receiver.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, receiver.ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const inbox = inboxDir(root, "session-beta");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "req-busy-own.json"), JSON.stringify({
+        version: 1, type: "request", id: "req-busy-own", from: "session-alpha", to: "session-beta",
+        message: "Should stay queued", route: ["session-alpha"], createdAt: new Date().toISOString(),
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(receiver.sentMessages.length, 0, "nothing is delivered during the peer's own human turn");
+      assert.equal(existsSync(join(inbox, "req-busy-own.json")), true, "request stays queued until idle");
+    } finally {
+      for (const handler of receiver.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, receiver.ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("session_shutdown answers every entry in the active batch with an error reply", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const receiverBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+    const request = (id: string, from: string) => ({
+      version: 1, type: "request", id, from, to: "session-beta",
+      message: `message-${id}`, route: [from], createdAt: new Date().toISOString(),
+    });
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "pane-beta", { busy: () => receiverBusy.value });
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const inbox = inboxDir(root, "session-beta");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "req1.json"), JSON.stringify(request("req1", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 1, "root request delivered");
+      receiverBusy.value = true;
+      writeFileSync(join(inbox, "req2.json"), JSON.stringify(request("req2", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 2, "revision steered into the batch");
+
+      // Shut down with a 2-entry batch: every entry must get a terminal error reply.
+      for (const handler of receiver.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, receiver.ctx);
+      const replyDir = repliesDir(root, "session-alpha");
+      await waitUntil(
+        () => existsSync(join(replyDir, "req1.json")) && existsSync(join(replyDir, "req2.json")),
+        "both batch entries answered on shutdown",
+      );
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req1.json"), "utf8")).ok, false);
+      assert.match(JSON.parse(readFileSync(join(replyDir, "req1.json"), "utf8")).error, /shut down before finishing/);
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req2.json"), "utf8")).ok, false);
+      assert.match(JSON.parse(readFileSync(join(replyDir, "req2.json"), "utf8")).error, /shut down before finishing/);
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stuck-request watchdog fails every entry in the active batch", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const receiverBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean; activeRequestWatchdogTicks?: number } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+        ...(opts.activeRequestWatchdogTicks !== undefined ? { activeRequestWatchdogTicks: opts.activeRequestWatchdogTicks } : {}),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+    const request = (id: string, from: string) => ({
+      version: 1, type: "request", id, from, to: "session-beta",
+      message: `message-${id}`, route: [from], createdAt: new Date().toISOString(),
+    });
+
+    const receiver = createPeer("session-beta", "pane-beta", { busy: () => receiverBusy.value, activeRequestWatchdogTicks: 2 });
+    try {
+      for (const handler of receiver.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, receiver.ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const inbox = inboxDir(root, "session-beta");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "req1.json"), JSON.stringify(request("req1", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 1, "root request delivered");
+      // Hold the batch busy so the watchdog does not trip before req2 arrives.
+      receiverBusy.value = true;
+      writeFileSync(join(inbox, "req2.json"), JSON.stringify(request("req2", "session-alpha")));
+      await waitUntil(() => receiver.sentMessages.length === 2, "revision steered into the batch");
+      // Go idle: the watchdog now trips and must fail BOTH entries.
+      receiverBusy.value = false;
+      const replyDir = repliesDir(root, "session-alpha");
+      await waitUntil(
+        () => existsSync(join(replyDir, "req1.json")) && existsSync(join(replyDir, "req2.json")),
+        "watchdog fails both batch entries",
+      );
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req1.json"), "utf8")).ok, false);
+      assert.match(JSON.parse(readFileSync(join(replyDir, "req1.json"), "utf8")).error, /did not start a turn/);
+      assert.equal(JSON.parse(readFileSync(join(replyDir, "req2.json"), "utf8")).ok, false);
+      assert.match(JSON.parse(readFileSync(join(replyDir, "req2.json"), "utf8")).error, /did not start a turn/);
+    } finally {
+      for (const handler of receiver.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, receiver.ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

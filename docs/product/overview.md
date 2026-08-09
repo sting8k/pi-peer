@@ -28,7 +28,7 @@ no slash commands, no widgets. The product contract is defined here, in
 | --- | --- | --- |
 | `talk_sessions` | List live peers in the current HerdR workspace. | none |
 | `talk_latest` | Read the N most recent **completed** events a peer published. | `target` (required), `count` (1–10, default 1) |
-| `talk_to` | Send a blocking request to a peer and return its final response. | `target` (required), `message` (required), `timeoutMs` (optional) |
+| `talk_to` | Send a request to a peer; return its final response, or a `pending` result whose reply arrives later via wake. | `target` (required), `message` (required), `timeoutMs` (optional) |
 
 Resolution: public peer id (`peer-xxx`, from `talk_sessions`) or unique
 display name; raw full session ids and id prefixes are not targets. Two live
@@ -45,7 +45,7 @@ the public id is a presentation-only alias derived by one central formatter.
   (`queued`/`processing`) are streamed.
 - **Abort & timeout.** Abort withdraws a queued request only
   (already-processing work is not interrupted). The wait ends after the exact
-  `timeoutMs` (default 10 min, clamped 1 000–3 600 000 ms); a live target that
+  `timeoutMs` (default 1 min, clamped 1 000–3 600 000 ms); a live target that
   has not replied by then yields a non-error `pending` result and the reply
   arrives later via wake.
 - **History.** Bounded (max 10 events) per-peer history of **completed**

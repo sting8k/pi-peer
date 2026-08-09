@@ -1,6 +1,6 @@
 # pi-peer
 
-Peer-to-peer communication between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other blocking requests.
+Peer-to-peer communication between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other requests.
 
 It is not a subagent framework: no delegation, no agent roles, no loop workflows, no advisor surface. Three tools, nothing else.
 
@@ -82,13 +82,13 @@ Each session receives a stable friendly name from a preset pet-name pool, unique
 
 ### `talk_to`
 
-Sends a blocking request to another live session and returns its final response.
+Sends a request to another live session. Returns the peer's final response if it arrives within the wait; otherwise returns a non-error `pending` result and the reply arrives later as a `<peer_pong>`.
 
 | Name | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `target` | string | yes | Public peer id (`peer-xxx`) or unique display name. |
 | `message` | string | yes | Non-empty request message. |
-| `timeoutMs` | number | no | Wait deadline, clamped to 1 000–3 600 000 ms. Default 600 000 ms (10 min). |
+| `timeoutMs` | number | no | How long THIS session blocks waiting, clamped to 1 000–3 600 000 ms. Default 60 000 ms (1 min). Not a time budget for the peer: it keeps working past this and the reply is never lost. |
 
 When `timeoutMs` passes while the target is still working, the call returns a non-error `pending` result telling you not to resend. The reply arrives later as a `<peer_pong>` user message that wakes your session.
 

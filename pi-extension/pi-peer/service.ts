@@ -46,6 +46,7 @@ import {
   repliesDir,
   requeueProcessing,
   requestMessage,
+  steerMessage,
   resolveTarget,
   routeForRequest,
   sessionDir,
@@ -84,31 +85,34 @@ type Runtime = {
   peer: HerdrPeerContext;
   record: PeerRecord;
   root: string;
-  activeRequest: TalkRequest | null;
+  /** Active request batch; the first entry is the batch ROOT (started the turn). */
+  activeRequests: TalkRequest[];
   activeIdleTicks: number;
 };
 
 const DEFAULT_ACTIVE_REQUEST_WATCHDOG_TICKS = Math.ceil(30_000 / POLL_MS); // ~30s of consecutive idle ticks
 function failStuckActiveRequest(runtime: Runtime): void {
-  const request = runtime.activeRequest;
-  if (!request) return;
-  const response: TalkResponse = {
-    version: 1,
-    type: "response",
-    requestId: request.id,
-    from: runtime.record.sessionId,
-    to: request.from,
-    ok: false,
-    error: "Peer did not start a turn for the request",
-    createdAt: nowIso(),
-  };
-  try {
-    writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
-  } catch {
-    return;
+  const batch = runtime.activeRequests;
+  if (batch.length === 0) return;
+  for (const request of batch) {
+    const response: TalkResponse = {
+      version: 1,
+      type: "response",
+      requestId: request.id,
+      from: runtime.record.sessionId,
+      to: request.from,
+      ok: false,
+      error: "Peer did not start a turn for the request",
+      createdAt: nowIso(),
+    };
+    try {
+      writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
+    } catch {
+      continue;
+    }
+    rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
   }
-  rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
-  runtime.activeRequest = null;
+  runtime.activeRequests = [];
   runtime.activeIdleTicks = 0;
 }
 
@@ -162,7 +166,10 @@ function rejectInvalidRequest(root: string, responderSessionId: string, path: st
 }
 
 async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
-  if (runtime.activeRequest || isBusy()) return;
+  // An empty batch must not drain while the peer is busy with its own turn; a
+  // non-empty batch (peer mid-turn on a peer request) may still receive a
+  // same-caller steer even while busy.
+  if (runtime.activeRequests.length === 0 && isBusy()) return;
   const dir = inboxDir(runtime.root, runtime.record.sessionId);
   if (!existsSync(dir)) return;
   const pending = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
@@ -177,22 +184,35 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
       rmSync(path, { force: true });
       continue;
     }
+    // While a batch is active, only a request from the SAME caller as the batch
+    // root may bypass the busy gate (a mid-turn revision/steer). Any other
+    // caller keeps queueing until the batch completes, so a stranger can never
+    // derail a running turn.
+    if (runtime.activeRequests.length > 0 && request.from !== runtime.activeRequests[0].from) {
+      continue;
+    }
     const processing = `${path}.processing`;
     try {
       renameSync(path, processing);
     } catch {
       continue;
     }
-    runtime.activeRequest = request;
+    const isSteer = runtime.activeRequests.length > 0;
+    runtime.activeRequests.push(request);
     runtime.activeIdleTicks = 0;
     try {
       const sender = loadRecords(runtime.root).find((record) => record.sessionId === request.from);
-      // Deliver as a real user message so the request is treated exactly like a
-      // user turn on the receiving peer (appears as typed by the user, always
-      // triggers a turn). Drain only runs while idle, so no delivery mode is
-      // needed; the peer's own history surface already renders it as a user msg.
-      await pi.sendUserMessage(requestMessage(request, sender?.name ?? publicPeerId(request.from)));
+      const fromName = sender?.name ?? publicPeerId(request.from);
+      if (isSteer) {
+        // Mid-turn revision: delivered as a steer so it lands after the current
+        // tool calls finish and before the next LLM call, within the SAME turn.
+        await pi.sendUserMessage(steerMessage(request, runtime.activeRequests[0].id, fromName), { deliverAs: "steer" });
+      } else {
+        // The batch root starts a fresh turn; deliver as a real user message.
+        await pi.sendUserMessage(requestMessage(request, fromName));
+      }
     } catch (error) {
+      // Roll back only this entry; the rest of the batch is untouched.
       writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), {
         version: 1,
         type: "response",
@@ -204,10 +224,10 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
         createdAt: nowIso(),
       } satisfies TalkResponse);
       rmSync(processing, { force: true });
-      runtime.activeRequest = null;
+      runtime.activeRequests = runtime.activeRequests.filter((entry) => entry.id !== request.id);
       runtime.activeIdleTicks = 0;
     }
-    return;
+    return; // one send per tick, like wakePendingPongs
   }
 }
 
@@ -219,7 +239,7 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
  * after the send succeeded so a failed send retries on the next tick.
  */
 async function wakePendingPongs(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
-  if (runtime.activeRequest || isBusy()) return;
+  if (runtime.activeRequests.length > 0 || isBusy()) return;
   const dir = waitersDir(runtime.root, runtime.record.sessionId);
   if (!existsSync(dir)) return;
   const names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
@@ -262,7 +282,7 @@ export async function sweepStaleArtifacts(
   isBusy: () => boolean,
   staleSince: Map<string, number> = new Map(),
 ): Promise<void> {
-  if (runtime.activeRequest || isBusy()) return;
+  if (runtime.activeRequests.length > 0 || isBusy()) return;
   const { root, record } = runtime;
   const sessionId = record.sessionId;
   // Waiters owned by this session:
@@ -550,7 +570,7 @@ export function registerTalkTools(
       // are not lifecycle-owned and are left in place.
       removeOwnedRecord(current.root, current.record);
     }
-    runtime = { peer, record, root, activeRequest: null, activeIdleTicks: 0 };
+    runtime = { peer, record, root, activeRequests: [], activeIdleTicks: 0 };
     if (!interval) {
       interval = setInterval(() => {
         if (!runtime) return;
@@ -559,7 +579,7 @@ export function registerTalkTools(
         // must not depend on sendUserMessage semantics (fire-and-forget in
         // the host today, declared Promise<void>) or on the drain chain.
         ensureRecord(currentRuntime.root, currentRuntime.record);
-        if (currentRuntime.activeRequest) {
+        if (currentRuntime.activeRequests.length > 0) {
           if (isBusy()) {
             currentRuntime.activeIdleTicks = 0;
           } else if (++currentRuntime.activeIdleTicks >= activeRequestWatchdogTicks) {
@@ -622,7 +642,7 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_to",
     label: "Talk To",
-    description: "Send a blocking request to another live Pi session in the current HerdR workspace and return its final response.",
+    description: "Send a request to another live Pi session in the current HerdR workspace. Returns the peer's response if it arrives within the wait; otherwise returns a non-error pending result and the reply arrives later as a <peer_pong>.",
     promptSnippet: "Use `talk_to` to ask another Pi session for an independent response; call `talk_sessions` first when the target is unknown.",
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -651,7 +671,7 @@ export function registerTalkTools(
   });
   pi.on("agent_start", () => {
     if (!hasBusyOverride) selfBusy = true;
-    if (runtime?.activeRequest) runtime.activeIdleTicks = 0;
+    if (runtime?.activeRequests.length) runtime.activeIdleTicks = 0;
   });
   pi.on("agent_end", (event, ctx) => {
     if (!hasBusyOverride) selfBusy = false;
@@ -660,62 +680,74 @@ export function registerTalkTools(
     // current lineage so ids are stable and no duplicate risk exists.
     publishHistoryFromOwnSession(runtime, ctx);
     const message = extractAssistantText((event as any).messages);
-    if (!runtime.activeRequest) return;
-    const request = runtime.activeRequest;
+    if (runtime.activeRequests.length === 0) return;
+    const ids = runtime.activeRequests.map((entry) => entry.id);
     // A normal user turn can finish while a queued peer request is still
-    // marked active. If the host exposes the user prompt, only the exact
-    // `<peer_message request_id="...">` turn may consume the request;
-    // hosts that expose no user message keep the legacy fallback.
-    if (correlatePeerRequestTurn((event as any).messages, request.id) === false) return;
-    runtime.activeRequest = null;
+    // marked active. If the host exposes the user prompt, only a turn whose
+    // user messages carry one of this batch's `<peer_message request_id=...>`
+    // ids may consume the batch; hosts that expose no user message keep the
+    // legacy fallback.
+    if (correlatePeerRequestTurn((event as any).messages, ids) === false) return;
+    const batch = runtime.activeRequests;
+    runtime.activeRequests = [];
     runtime.activeIdleTicks = 0;
-    const response: TalkResponse = {
-      version: 1,
-      type: "response",
-      requestId: request.id,
-      from: runtime.record.sessionId,
-      to: request.from,
-      ok: !!message,
-      ...(message ? { message } : { error: "Peer did not produce a final assistant response" }),
-      createdAt: nowIso(),
-    };
-    writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
-    rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
+    // Reply ONCE, with the same final assistant message, for every request in
+    // the batch (one reply file per request id preserves the 1:1 invariant),
+    // and release every .processing claim.
+    for (const request of batch) {
+      const response: TalkResponse = {
+        version: 1,
+        type: "response",
+        requestId: request.id,
+        from: runtime.record.sessionId,
+        to: request.from,
+        ok: !!message,
+        ...(message ? { message } : { error: "Peer did not produce a final assistant response" }),
+        createdAt: nowIso(),
+      };
+      writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), response);
+      rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
+    }
   });
   pi.on("session_shutdown", (_event, ctx) => {
     ctx.ui?.setStatus("pi-peer", undefined);
     if (runtime) {
-      const active = runtime.activeRequest;
+      const batch = runtime.activeRequests;
       try {
-        if (active) {
-          // The caller may still be waiting (direct wait) or may already have
-          // timed out (pending wake). Either way it must not hang or be promised
-          // a wake that can never arrive: answer with a terminal error reply so
-          // the caller fails instead of waiting out the deadline.
-          writeAtomic(join(repliesDir(runtime.root, active.from), `${active.id}.json`), {
-            version: 1,
-            type: "response",
-            requestId: active.id,
-            from: runtime.record.sessionId,
-            to: active.from,
-            ok: false,
-            error: "Peer session shut down before finishing the request",
-            createdAt: nowIso(),
-          } satisfies TalkResponse);
+        // The callers may still be waiting (direct wait) or may already have
+        // timed out (pending wake). Either way each must not hang or be promised
+        // a wake that can never arrive: answer EVERY entry in the batch with a
+        // terminal error reply so the callers fail instead of waiting out the
+        // deadline.
+        for (const request of batch) {
+          try {
+            writeAtomic(join(repliesDir(runtime.root, request.from), `${request.id}.json`), {
+              version: 1,
+              type: "response",
+              requestId: request.id,
+              from: runtime.record.sessionId,
+              to: request.from,
+              ok: false,
+              error: "Peer session shut down before finishing the request",
+              createdAt: nowIso(),
+            } satisfies TalkResponse);
+          } catch {
+            // Continue answering the rest; the finally still releases claims.
+          }
         }
       } finally {
-        // The .processing claim and the registration removal must not be
-        // skipped if the error reply write fails: leaking the claim would let
+        // The .processing claims and the registration removal must not be
+        // skipped if an error reply write fails: leaking a claim would let
         // a same-id restart re-deliver the request, and leaking the
         // registration (the authoritative liveness signal) would make every
         // future caller believe a dead session is alive.
-        if (active) {
-          rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${active.id}.json.processing`), { force: true });
+        for (const request of batch) {
+          rmSync(join(inboxDir(runtime.root, runtime.record.sessionId), `${request.id}.json.processing`), { force: true });
         }
         removeOwnedRecord(runtime.root, runtime.record);
         // This session can no longer be woken or wake itself: drop its own
-        // waiters and replies (the error reply for the active request lives in
-        // the CALLER's replies dir and stays for the caller to consume).
+        // waiters and replies (the error replies for the active requests live in
+        // the CALLER's replies dir and stay for the callers to consume).
         rmSync(waitersDir(runtime.root, runtime.record.sessionId), { recursive: true, force: true });
         rmSync(repliesDir(runtime.root, runtime.record.sessionId), { recursive: true, force: true });
       }

@@ -529,6 +529,52 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("sweepStaleArtifacts failure pong steers when busy-own-work but withholds during a peer batch", async () => {
+    const now = nowIso();
+    const setup = (activeRequests: any[]) => {
+      const root = createTestDir();
+      const sent: Array<{ content: string; options?: any }> = [];
+      const pi = { sendUserMessage: async (content: any, options?: any) => { sent.push({ content, options }); } } as any;
+      const runtime = { root, record: { sessionId: "session-a" }, activeRequests } as any;
+      mkdirSync(sessionDir(root), { recursive: true });
+      mkdirSync(waitersDir(root, "session-a"), { recursive: true });
+      const w = "req_dead_busy";
+      writeFileSync(join(waitersDir(root, "session-a"), `${w}.json`), JSON.stringify({
+        version: 1, type: "waiter", requestId: w, from: "session-a", to: "session-b",
+        targetName: "beta", createdAt: now, timedOutAt: now,
+      }));
+      writeFileSync(recordPath(root, "session-b"), JSON.stringify({
+        schemaVersion: 1, sessionId: "session-b", name: "beta", cwd: "/work/beta",
+        workspaceId: "w", paneId: "pane-beta", terminalId: "term-beta", createdAt: now,
+      }));
+      // Dead target: staleness already past the grace window so the failure pong fires.
+      utimesSync(recordPath(root, "session-b"), new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+      const staleSince = new Map<string, number>([[w, Date.now() - 120_000]]);
+      return { root, sent, pi, runtime, staleSince, w };
+    };
+
+    // Busy with the session's OWN work (no active batch) -> failure pong steered mid-turn.
+    const busyCase = setup([]);
+    try {
+      await sweepStaleArtifacts(busyCase.pi, busyCase.runtime, () => true, busyCase.staleSince);
+      assert.equal(busyCase.sent.length, 1, "failure pong sent while busy-own-work");
+      assert.match(busyCase.sent[0].content, /<peer_pong request_id="req_dead_busy"/);
+      assert.deepEqual(busyCase.sent[0].options, { deliverAs: "steer" }, "busy-own-work failure pong steered");
+    } finally {
+      rmSync(busyCase.root, { recursive: true, force: true });
+    }
+
+    // Active peer-request batch -> the failure pong must keep waiting.
+    const batchCase = setup([{ id: "req-batch", from: "session-gamma" } as any]);
+    try {
+      await sweepStaleArtifacts(batchCase.pi, batchCase.runtime, () => true, batchCase.staleSince);
+      assert.equal(batchCase.sent.length, 0, "failure pong withheld while a peer batch is active");
+      assert.equal(existsSync(join(waitersDir(batchCase.root, "session-a"), `${batchCase.w}.json`)), true, "waiter kept while batch active");
+    } finally {
+      rmSync(batchCase.root, { recursive: true, force: true });
+    }
+  });
+
   it("sweepDeadSessions removes artifacts of dead sessions and keeps live ones", async () => {
     const root = createTestDir();
     const now = nowIso();

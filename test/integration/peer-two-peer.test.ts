@@ -494,6 +494,354 @@ describe("peer two-peer lifecycle", () => {
     }
   });
 
+  it("wakePendingPongs steers a pending reply into the caller's own busy turn (no active batch)", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const senderBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "pane-alpha", { busy: () => senderBusy.value });
+    const receiver = createPeer("session-beta", "pane-beta");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // A pending talk_to: the target is alive but slow, so the wait times out -> pending.
+      peerStatuses.set("pane-beta", "working");
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-busy-own", { target: "peer-eta", message: "Slow reply", timeoutMs: 50 },
+        undefined, undefined, sender.ctx,
+      );
+      assert.equal(result.details.state, "pending");
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${result.details.requestId}.json`);
+      const waiter = JSON.parse(readFileSync(waiterFile, "utf8"));
+      assert.ok(waiter.timedOutAt, "pending waiter marked timed-out");
+
+      // The caller is now busy with its OWN work (no active peer-request batch).
+      senderBusy.value = true;
+
+      // The target finally replies: a reply lands in the caller's replies dir.
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${result.details.requestId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: result.details.requestId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Slow success", createdAt: new Date().toISOString(),
+      }));
+
+      // The wake scanner delivers the pong mid-turn as a steer.
+      await waitUntil(
+        () => sender.sentMessages.some((m) => m.content.startsWith("<peer_pong")),
+        "busy-own-work wake pong delivered as a steer",
+      );
+      const pongs = sender.sentMessages.filter((m) => m.content.startsWith("<peer_pong"));
+      assert.equal(pongs.length, 1, "exactly one wake pong");
+      assert.deepEqual(pongs[0].options, { deliverAs: "steer" }, "busy own-work pong steered mid-turn");
+      assert.match(pongs[0].content, /Slow success/);
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after successful wake");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), false, "reply cleaned after successful wake");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("wakePendingPongs delivers an idle pending reply as a fresh user turn (no steer)", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const createPeer = (sessionId: string, paneId: string) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: () => false,
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "pane-alpha");
+    const receiver = createPeer("session-beta", "pane-beta");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      peerStatuses.set("pane-beta", "working");
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-idle", { target: "peer-eta", message: "Slow reply", timeoutMs: 50 },
+        undefined, undefined, sender.ctx,
+      );
+      assert.equal(result.details.state, "pending");
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${result.details.requestId}.json`);
+      assert.ok(JSON.parse(readFileSync(waiterFile, "utf8")).timedOutAt, "pending waiter timed-out");
+
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${result.details.requestId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: result.details.requestId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Idle success", createdAt: new Date().toISOString(),
+      }));
+
+      await waitUntil(
+        () => sender.sentMessages.some((m) => m.content.startsWith("<peer_pong")),
+        "idle wake pong delivered",
+      );
+      const pong = sender.sentMessages.find((m) => m.content.startsWith("<peer_pong"))!;
+      assert.match(pong.content, /Idle success/);
+      assert.equal(pong.options, undefined, "idle pong delivered without deliverAs (fresh user turn)");
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after successful wake");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), false, "reply cleaned after successful wake");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("wakePendingPongs withholds a pending reply while a peer-request batch is active, then delivers after it completes", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const senderBusy = { value: false };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          sentMessages.push({ content, options });
+          assert.equal(typeof content, "string");
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+    const request = (id: string, from: string, to: string) => ({
+      version: 1, type: "request", id, from, to,
+      message: `message-${id}`, route: [from], createdAt: new Date().toISOString(),
+    });
+
+    const sender = createPeer("session-alpha", "pane-alpha", { busy: () => senderBusy.value });
+    const receiver = createPeer("session-beta", "pane-beta");
+    const caller = createPeer("session-gamma", "pane-gamma");
+    try {
+      for (const peer of [sender, receiver, caller]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Create a pending wake for the sender: talk_to to a slow target times out.
+      peerStatuses.set("pane-beta", "working");
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-batch-hold", { target: "peer-eta", message: "Slow task", timeoutMs: 50 },
+        undefined, undefined, sender.ctx,
+      );
+      assert.equal(result.details.state, "pending");
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${result.details.requestId}.json`);
+      assert.ok(JSON.parse(readFileSync(waiterFile, "utf8")).timedOutAt, "pending waiter timed-out");
+
+      // Now an inbound peer-request batch becomes active on the sender.
+      const inbox = inboxDir(root, "session-alpha");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "reqbatch.json"), JSON.stringify(request("reqbatch", "session-gamma", "session-alpha")));
+      await waitUntil(() => sender.sentMessages.length === 1, "batch request delivered to sender");
+      assert.match(sender.sentMessages[0].content, /request_id="reqbatch"/);
+      senderBusy.value = true;
+
+      // A reply lands for the pending wake while the batch is active.
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${result.details.requestId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: result.details.requestId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Held success", createdAt: new Date().toISOString(),
+      }));
+
+      // Give the poll loop several ticks: the pong MUST NOT be delivered mid-batch.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(
+        sender.sentMessages.filter((m) => m.content.startsWith("<peer_pong")).length,
+        0,
+        "pong withheld while a peer-request batch is active",
+      );
+      assert.equal(existsSync(waiterFile), true, "waiter kept while batch active");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), true, "reply kept while batch active");
+
+      // Complete the batch: agent_end clears activeRequests.
+      for (const handler of sender.handlers.get("agent_end") ?? []) {
+        handler({ messages: [
+          { role: "user", content: [{ type: "text", text: sender.sentMessages[0].content }] },
+          { role: "assistant", content: [{ type: "text", text: "Batch done" }] },
+        ] }, sender.ctx);
+      }
+
+      // Once the batch completes, the pending wake is delivered (still busy -> steer).
+      await waitUntil(
+        () => sender.sentMessages.filter((m) => m.content.startsWith("<peer_pong")).length === 1,
+        "pending wake delivered after batch completes",
+      );
+      const pong = sender.sentMessages.find((m) => m.content.startsWith("<peer_pong"))!;
+      assert.match(pong.content, /Held success/);
+      assert.deepEqual(pong.options, { deliverAs: "steer" }, "post-batch pong steered while still busy");
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after successful wake");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), false, "reply cleaned after successful wake");
+    } finally {
+      for (const peer of [sender, receiver, caller]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("wakePendingPongs retries a failed busy send, keeping reply and waiter", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();
+    const senderBusy = { value: false };
+    const pongState = { attempts: 0, failures: 0, successes: 0 };
+    const createPeer = (sessionId: string, paneId: string, opts: { busy?: () => boolean } = {}) => {
+      const tools = new Map<string, any>();
+      const sentMessages: Array<{ content: string; options?: any }> = [];
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+      const ctx = { cwd: `/work/${paneId}`, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+      const api: any = {
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage(content: any, options?: any) {
+          assert.equal(typeof content, "string");
+          if (content.startsWith("<peer_pong")) {
+            pongState.attempts++;
+            if (pongState.attempts === 1) {
+              pongState.failures++;
+              throw new Error("simulated send failure");
+            }
+            pongState.successes++;
+          }
+          sentMessages.push({ content, options });
+        },
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => ({
+          paneId, terminalId: `terminal-${paneId}`, tabId: `tab-${paneId}`,
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        }),
+        getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
+        rootDir: () => root,
+        isBusy: opts.busy ?? (() => false),
+      });
+      return { api, ctx, tools, handlers, sentMessages };
+    };
+
+    const sender = createPeer("session-alpha", "pane-alpha", { busy: () => senderBusy.value });
+    const receiver = createPeer("session-beta", "pane-beta");
+    try {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      peerStatuses.set("pane-beta", "working");
+      const result = await sender.tools.get("talk_to").execute(
+        "talk-fail-send", { target: "peer-eta", message: "Slow task", timeoutMs: 50 },
+        undefined, undefined, sender.ctx,
+      );
+      assert.equal(result.details.state, "pending");
+      const waiterFile = join(waitersDir(root, "session-alpha"), `${result.details.requestId}.json`);
+      assert.ok(JSON.parse(readFileSync(waiterFile, "utf8")).timedOutAt, "pending waiter timed-out");
+
+      senderBusy.value = true;
+      const replyDir = repliesDir(root, "session-alpha");
+      mkdirSync(replyDir, { recursive: true });
+      writeFileSync(join(replyDir, `${result.details.requestId}.json`), JSON.stringify({
+        version: 1, type: "response", requestId: result.details.requestId,
+        from: "session-beta", to: "session-alpha", ok: true, message: "Retry success", createdAt: new Date().toISOString(),
+      }));
+
+      // The first send attempt fails: reply and waiter must both survive.
+      await waitUntil(() => pongState.attempts >= 1, "first pong send attempted (and failed)");
+      assert.equal(pongState.failures, 1, "first busy send failed");
+      assert.equal(pongState.successes, 0, "no pong delivered yet");
+      assert.equal(existsSync(waiterFile), true, "waiter kept after failed send");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), true, "reply kept after failed send");
+
+      // A later tick retries and succeeds.
+      await waitUntil(() => pongState.successes === 1, "failed pong retried and delivered");
+      const pong = sender.sentMessages.find((m) => m.content.startsWith("<peer_pong"))!;
+      assert.match(pong.content, /Retry success/);
+      assert.deepEqual(pong.options, { deliverAs: "steer" }, "retried busy pong steered");
+      assert.equal(existsSync(waiterFile), false, "waiter cleaned after successful retry");
+      assert.equal(existsSync(join(replyDir, `${result.details.requestId}.json`)), false, "reply cleaned after successful retry");
+    } finally {
+      for (const peer of [sender, receiver]) {
+        for (const handler of peer.handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, peer.ctx);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("abort removes waiter + queued request and never wakes later", async () => {
     const root = createTestDir();
     const peerStatuses = new Map<string, "idle" | "working" | "blocked" | "done" | "unknown">();

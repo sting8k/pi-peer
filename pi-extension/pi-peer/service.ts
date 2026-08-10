@@ -232,14 +232,19 @@ async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => bool
 }
 
 /**
- * Wake scanner: when this peer is idle and a reply has landed for a request it
- * timed out on (tracked by a waiter), deliver the reply as a <peer_pong> user
- * message so the caller's session resumes as a real user turn. Runs after the
- * inbox drain inside the single poll interval; consumes reply + waiter only
- * after the send succeeded so a failed send retries on the next tick.
+ * Wake scanner: when a reply has landed for a request this peer timed out on
+ * (tracked by a waiter), deliver the reply as a <peer_pong> user message so the
+ * caller's session resumes. Runs after the inbox drain inside the single poll
+ * interval. A pong may be delivered while this session is busy with its OWN
+ * work (steered into the running turn), but MUST keep waiting while a
+ * peer-request batch is active: with activeRequests non-empty this session's
+ * final assistant message becomes the reply written to the requesting peer at
+ * agent_end, and injecting a pong into that turn would corrupt the protocol.
+ * Consumes reply + waiter only after the send succeeded so a failed send
+ * retries on the next tick.
  */
 async function wakePendingPongs(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
-  if (runtime.activeRequests.length > 0 || isBusy()) return;
+  if (runtime.activeRequests.length > 0) return;
   const dir = waitersDir(runtime.root, runtime.record.sessionId);
   if (!existsSync(dir)) return;
   const names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
@@ -265,7 +270,7 @@ async function wakePendingPongs(pi: ExtensionAPI, runtime: Runtime, isBusy: () =
       continue;
     }
     try {
-      await pi.sendUserMessage(peerPongMessage(waiter, reply, waiter.targetName));
+      await pi.sendUserMessage(peerPongMessage(waiter, reply, waiter.targetName), isBusy() ? { deliverAs: "steer" } : undefined);
     } catch {
       // Leave waiter + reply in place; retry on a later idle tick.
       return;
@@ -282,7 +287,7 @@ export async function sweepStaleArtifacts(
   isBusy: () => boolean,
   staleSince: Map<string, number> = new Map(),
 ): Promise<void> {
-  if (runtime.activeRequests.length > 0 || isBusy()) return;
+  if (runtime.activeRequests.length > 0) return;
   const { root, record } = runtime;
   const sessionId = record.sessionId;
   // Waiters owned by this session:
@@ -326,7 +331,7 @@ export async function sweepStaleArtifacts(
               ok: false,
               error: "Peer session is no longer live and never replied",
               createdAt: nowIso(),
-            } satisfies TalkResponse, waiter.targetName));
+            } satisfies TalkResponse, waiter.targetName), isBusy() ? { deliverAs: "steer" } : undefined);
             rmSync(waiterPath, { force: true });
             return; // one user-message send per tick, like drainInbox/wakePendingPongs
           } catch {

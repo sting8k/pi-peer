@@ -11,6 +11,7 @@ It is not a subagent framework: no delegation, no agent roles, no loop workflows
 - **`talk_latest`** — read a peer's most recent completed conversation events.
 - **No daemon.** Peers coordinate through an atomic file mailbox in the agent directory.
 - **No blind waits.** A dead peer fails a call immediately; a slow peer returns a `pending` result and wakes you later.
+- **No stale work.** Changed your mind? Send the revision while the peer is still executing the old spec and it steers into the running turn instead of queueing behind it — and its answer reaches you while you are still busy too.
 - **Private by default.** Thinking is never published, and no session ever reads another session's transcript.
 
 ## How it works
@@ -22,19 +23,21 @@ It is not a subagent framework: no delegation, no agent roles, no loop workflows
     │    peer-a1b    │                    │    peer-c3d    │
     └───────┬────────┘                    └───────▲────────┘
             │                                     │
-            │ 1. talk_to(target="peer-c3d")       │ 2. arrives as
-            ▼                                     │    a user message
+            │ 1. talk_to(target="peer-c3d")       │ 2. arrives as a user
+            ▼                                     │    message, even mid-turn
     ┌───────────────────────────────────────────────────────┐
     │    <agent-dir>/pi-peer/talk/<workspace-id>/           │
     │    sessions/   inbox/   replies/   waiters/   latest/ │
     └───────────────────────────────────────────────────────┘
             ▲                                     │
             │ 4. reply, or a <peer_pong> wake     │ 3. B answers
-            │    when the deadline passed         ▼
+            │    — also lands mid-turn            ▼
             └─────────────────────────────────────┘
 ```
 
 Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run.
+
+Neither direction waits for a turn boundary. A revised request from the same caller is steered into the very turn it revises, so the peer stops working from a spec that is already obsolete. A reply reaches the caller while the caller is busy with its own work. The one turn that is never interrupted is a turn that already owes a reply to another peer, because that turn's final message *is* the reply.
 
 ## Requirements
 
@@ -74,7 +77,7 @@ peer-e5f  Luna   idle
 tool: talk_to target="peer-c3d" message="Review my auth refactor: does the session fixation fix hold?"
 ```
 
-The request is queued immediately and delivered when `peer-c3d` goes idle, as a real user message in its session. Its answer comes back as the tool result.
+The request is queued immediately and delivered as a real user message in `peer-c3d`'s session: when it goes idle, or straight into its running turn if that turn is already working on an earlier request of yours. Its answer comes back as the tool result.
 
 ## Tools
 
@@ -117,7 +120,7 @@ Each peer publishes its own bounded history (max 10 events: user, assistant text
 
 - **Liveness decides.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your call immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
 - **Requests never vanish silently.** Invalid or malformed requests get an `ok=false` reply so the caller stops waiting; aborting withdraws a queued request; a request already being processed is not interrupted.
-- **Fair, serial delivery.** One request at a time per receiver, oldest first, delivered only while the receiver is idle. Request cycles (A → B → A) are rejected before delivery.
+- **Fair, serial delivery.** One request at a time per receiver, oldest first, delivered while the receiver is idle — with one exception: a revision from the caller whose request is already running joins that same turn. Any other caller keeps queueing, so a stranger can never derail a turn in progress. Request cycles (A → B → A) are rejected before delivery.
 - **Exactly one answer.** An in-deadline reply consumes the pending waiter, so a late `<peer_pong>` wake never duplicates it.
 - **Ambiguity fails closed.** Two peers sharing a public id resolve to an error, never to a guess.
 
@@ -135,7 +138,7 @@ Artifacts live under `<agent-dir>/pi-peer/talk/<workspace-id>/`:
 | `waiters/<caller-session-id>/` | Pending-wake trackers owned by the caller. |
 | `latest/` | Each peer's published history. |
 
-Writes are atomic (temp file plus rename) and the mailbox directory is created with `0700` permissions. Orphaned artifacts are swept on idle; artifacts of dead sessions are collected after a 24 h TTL.
+Writes are atomic (temp file plus rename) and the mailbox directory is created with `0700` permissions. Orphaned artifacts are swept whenever no peer request is in flight; artifacts of dead sessions are collected after a 24 h TTL.
 
 ## Development
 

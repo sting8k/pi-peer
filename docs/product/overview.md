@@ -41,8 +41,10 @@ the public id is a presentation-only alias derived by one central formatter.
 
 - **Queueing.** A request is queued in the target's inbox immediately and is
   delivered when the receiver is idle (its own `agent_start`/`agent_end` busy
-  state); the target's HerdR status is shown for context. Progress updates
-  (`queued`/`processing`) are streamed.
+  state), with one exception: a request from the caller whose request is
+  already running is steered into that same turn instead of queueing behind
+  it. Any other caller keeps queueing. The target's HerdR status is shown for
+  context. Progress updates (`queued`/`processing`) are streamed.
 - **Abort & timeout.** Abort withdraws a queued request only
   (already-processing work is not interrupted). The wait ends after the exact
   `timeoutMs` (default 1 min, clamped 1 000–3 600 000 ms); a live target that

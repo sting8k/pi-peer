@@ -1,7 +1,6 @@
 {
-  "name": "pi-peer",
+  "name": "@sting8k/pi-peer",
   "version": "1.4.0",
-  "private": true,
   "description": "Standalone peer-to-peer Pi communication over the HerdR workspace - talk_to, talk_sessions, and talk_latest tools with a resilient local mailbox.",
   "keywords": [
     "pi-package",
@@ -37,6 +36,9 @@
     "extensions": [
       "./pi-extension/pi-peer/index.ts"
     ]
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",

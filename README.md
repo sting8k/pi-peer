@@ -45,6 +45,12 @@ Each session registers itself, heartbeats every 10 s, and polls its own mailbox.
 ## Install
 
 ```sh
+pi install npm:@sting8k/pi-peer
+```
+
+Or from GitHub:
+
+```sh
 pi install git:github.com/sting8k/pi-peer
 ```
 

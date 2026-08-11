@@ -1,17 +1,17 @@
 # pi-peer
 
-Peer-to-peer communication between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other requests.
+Peer-to-peer chat between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
 
-It is not a subagent framework: no delegation, no agent roles, no loop workflows, no advisor surface. Three tools, nothing else.
+It is symmetric, natural chat between equal agents — not RPC or task delegation to a subagent. There is no request/response correlation, no `timeoutMs`, no waiting, and no `<peer_pong>`. Three tools, nothing else.
 
 ## Features
 
-- **`talk_to`** — send a request to another live session and get its answer back.
-- **`talk_sessions`** — list live peers, their status, and how many requests are queued for them.
+- **`talk_to`** — send a message to another live session. Returns **delivery confirmation only**; a reply, if any, simply arrives later as a new `<peer_message>`.
+- **`talk_sessions`** — list live peers, their status, and how many messages are queued for them.
 - **`talk_latest`** — read a peer's most recent completed conversation events.
 - **No daemon.** Peers coordinate through an atomic file mailbox in the agent directory.
-- **No blind waits.** A dead peer fails a call immediately; a slow peer returns a `pending` result and wakes you later.
-- **No stale work.** Changed your mind? Send the revision while the peer is still executing the old spec and it steers into the running turn instead of queueing behind it — and its answer reaches you while you are still busy too.
+- **Send-only semantics.** `talk_to` never blocks waiting for a response; the language of the conversation is handled by the agents replying with another `talk_to` in the opposite direction.
+- **Never misses a message.** A busy receiver is steered mid-turn; an idle receiver is triggered with a fresh turn. A message that fails to inject is requeued, and orphaned claims are reclaimed on startup.
 - **Private by default.** Thinking is never published, and no session ever reads another session's transcript.
 
 ## How it works
@@ -23,21 +23,23 @@ It is not a subagent framework: no delegation, no agent roles, no loop workflows
     │    peer-a1b    │                    │    peer-c3d    │
     └───────┬────────┘                    └───────▲────────┘
             │                                     │
-            │ 1. talk_to(target="peer-c3d")       │ 2. arrives as a user
-            ▼                                     │    message, even mid-turn
+            │ talk_to(target="peer-c3d")          │ arrives as a <peer_message>
+            │   = enqueue + confirm               │   user message (idle trigger)
+            ▼                                     │   or steer (busy)
     ┌───────────────────────────────────────────────────────┐
     │    <agent-dir>/pi-peer/talk/<workspace-id>/           │
-    │    sessions/   inbox/   replies/   waiters/   latest/ │
+    │    sessions/   inbox/                          latest/ │
     └───────────────────────────────────────────────────────┘
             ▲                                     │
-            │ 4. reply, or a <peer_pong> wake     │ 3. B answers
-            │    — also lands mid-turn            ▼
-            └─────────────────────────────────────┘
+            │  B replies with talk_to to          │  B's reply is a new
+            │  peer-a1b — also idle-triggered     │  <peer_message>
+            │  or steered                          ▼
+            └────────────────────────────────────────────────
 ```
 
 Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run.
 
-Neither direction waits for a turn boundary. A revised request from the same caller is steered into the very turn it revises, so the peer stops working from a spec that is already obsolete. A reply reaches the caller while the caller is busy with its own work. The one turn that is never interrupted is a turn that already owes a reply to another peer, because that turn's final message *is* the reply.
+A message is delivered to an **idle** receiver as a normal user message (trigger behavior) and to a **busy** receiver as a steer (`deliverAs: "steer"`) straight into its running turn — regardless of who sent it. A reply is simply another `talk_to` in the opposite direction, so whichever side is idle gets triggered and whichever is busy gets steered. Nothing ever waits for a turn boundary to *lose* a message.
 
 ## Requirements
 
@@ -63,7 +65,7 @@ Migrating from the pi-roo extension, which used to bundle these tools: set `feat
 
 ## Usage
 
-Find out who is around, then ask one of them for a second opinion:
+Find out who is around, then send one of them a message:
 
 ```text
 tool: talk_sessions
@@ -77,13 +79,13 @@ peer-e5f  Luna   idle
 tool: talk_to target="peer-c3d" message="Review my auth refactor: does the session fixation fix hold?"
 ```
 
-The request is queued immediately and delivered as a real user message in `peer-c3d`'s session: when it goes idle, or straight into its running turn if that turn is already working on an earlier request of yours. Its answer comes back as the tool result.
+`talk_to` returns a delivery confirmation immediately — the message is queued atomically and delivered as a `<peer_message>` in `peer-c3d`'s session: it triggers a fresh turn when the peer is idle, or steers into its running turn when it is busy. `peer-c3d` can reply with `talk_to(target="peer-a1b", "...")`, which wakes or steers you back the same way.
 
 ## Tools
 
 ### `talk_sessions`
 
-Lists live peers, one per line: `<public-id>  <name>  <status>`. The current session is marked `(current)`, and a peer with pending inbound requests shows `(N queued)`. Status is one of `idle | working | blocked | done | unknown`. Stale panes are excluded. No parameters.
+Lists live peers, one per line: `<public-id>  <name>  <status>`. The current session is marked `(current)`, and a peer with pending inbound messages shows `(N queued)`. Status is one of `idle | working | blocked | done | unknown`. Stale panes are excluded. No parameters.
 
 A public id is `peer-` plus the last three characters of the session id; the full session id stays internal.
 
@@ -91,15 +93,14 @@ Each session receives a stable friendly name from a preset pet-name pool, unique
 
 ### `talk_to`
 
-Sends a request to another live session. Returns the peer's final response if it arrives within the wait; otherwise returns a non-error `pending` result and the reply arrives later as a `<peer_pong>`.
+Sends a message to another live session and returns **delivery confirmation only**. A peer's later reply arrives as a new `<peer_message>` user message that wakes (idle) or steers (busy) you. Do not reply merely to acknowledge unless useful.
 
 | Name | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `target` | string | yes | Public peer id (`peer-xxx`) or unique display name. |
-| `message` | string | yes | Non-empty request message. |
-| `timeoutMs` | number | no | How long THIS session blocks waiting, clamped to 1 000–3 600 000 ms. Default 60 000 ms (1 min). Not a time budget for the peer: it keeps working past this and the reply is never lost. |
+| `message` | string | yes | Non-empty message text. |
 
-When `timeoutMs` passes while the target is still working, the call returns a non-error `pending` result telling you not to resend. The reply arrives later as a `<peer_pong>` user message that wakes your session.
+There is no `timeoutMs` and no waiting: the call returns as soon as the message is durably enqueued. Because a reply is just another `talk_to` in the opposite direction, there is no `talk_reply`, no `replyTo`, no conversation id, and no request/response correlation — the agents' own turns give the conversation its structure.
 
 ### `talk_latest`
 
@@ -114,14 +115,14 @@ Fetches the N most recent **completed** conversation events published by a peer,
 tool: talk_latest target="peer-c3d" count=3
 ```
 
-Each peer publishes its own bounded history (max 10 events: user, assistant text, tool calls, tool results). `talk_latest` reads only that published artifact — it never touches another session's transcript, and thinking is never published. In-progress turns are excluded and flagged in the output.
+Each peer publishes its own bounded history (max 10 events: user, assistant text, tool calls, tool results). Inbound `<peer_message>`s appear as `user` events and `talk_to` send confirmations as `toolResult` events, so an exchange reads coherently on both sides. `talk_latest` reads only that published artifact — it never touches another session's transcript, and thinking is never published. In-progress turns are excluded and flagged in the output.
 
 ## Guarantees
 
-- **Liveness decides.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your call immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
-- **Requests never vanish silently.** Invalid or malformed requests get an `ok=false` reply so the caller stops waiting; aborting withdraws a queued request; a request already being processed is not interrupted.
-- **Fair, serial delivery.** One request at a time per receiver, oldest first, delivered while the receiver is idle — with one exception: a revision from the caller whose request is already running joins that same turn. Any other caller keeps queueing, so a stranger can never derail a turn in progress. Request cycles (A → B → A) are rejected before delivery.
-- **Exactly one answer.** An in-deadline reply consumes the pending waiter, so a late `<peer_pong>` wake never duplicates it.
+- **Liveness decides delivery.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your `talk_to` immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
+- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. A failed injection is requeued, and orphaned `.processing` claims are reclaimed at startup — a message is never silently lost.
+- **Fair, serial delivery.** One message per poll tick, oldest first, delivered to an idle receiver as a fresh user turn and to a busy receiver as a steer — regardless of sender. No same-caller restriction, no batch, no route/cycle machinery.
+- **A reply is another `talk_to`.** No `agent_end` auto-reply, no `<peer_pong>`, no waiter, no response file. The conversation is carried by plain `<peer_message>` inbound messages.
 - **Ambiguity fails closed.** Two peers sharing a public id resolve to an error, never to a guess.
 
 For the full flow, invariants, and cleanup rules, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -133,24 +134,22 @@ Artifacts live under `<agent-dir>/pi-peer/talk/<workspace-id>/`:
 | Path | Contents |
 | --- | --- |
 | `sessions/` | Peer registrations, refreshed by heartbeat. |
-| `inbox/` | Queued requests per target session. |
-| `replies/<caller-session-id>/` | Answers written by the responding peer. |
-| `waiters/<caller-session-id>/` | Pending-wake trackers owned by the caller. |
+| `inbox/` | Queued chat messages per target session. |
 | `latest/` | Each peer's published history. |
 
-Writes are atomic (temp file plus rename) and the mailbox directory is created with `0700` permissions. Orphaned artifacts are swept whenever no peer request is in flight; artifacts of dead sessions are collected after a 24 h TTL.
+Writes are atomic (temp file plus rename) and the mailbox directory is created with `0700` permissions. Artifacts of dead sessions are collected after a 24 h TTL.
 
 ## Development
 
 ```sh
 npm install
-npm test                  # 43 tests (3 suites)
-npm run test:focused      # 36 unit tests
-npm run test:integration  # 7 mocked two-peer lifecycle tests
+npm test                  # 45 tests (3 suites)
+npm run test:focused      # 39 unit tests
+npm run test:integration  # 6 mocked two-peer lifecycle tests
 npm run typecheck         # tsc --noEmit
 ```
 
-- `pi-extension/pi-peer/` — shipped runtime: `index.ts` (entrypoint), `service.ts` (tool registration), `schemas.ts`, `herdr.ts` (workspace identity), `history.ts`, `protocol.ts` (request/reply envelopes), `storage.ts` (atomic persistence).
+- `pi-extension/pi-peer/` — shipped runtime: `index.ts` (entrypoint), `service.ts` (tool registration), `schemas.ts`, `herdr.ts` (workspace identity), `history.ts`, `protocol.ts` (chat envelopes), `storage.ts` (atomic persistence).
 - `test/peer/` — unit tests. `test/integration/` — mocked two-peer lifecycle.
 - `docs/` — architecture and decisions; see `docs/decisions/0011-standalone-pi-peer-extension.md` for the packaging decision.
 

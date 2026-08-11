@@ -6,6 +6,13 @@ Date: 2026-07-23
 
 Accepted
 
+> **Superseded (async-chat redesign).** The request/response protocol contract
+> below was replaced by symmetric, send-only chat: `talk_to` now enqueues one
+> durable message and returns delivery confirmation only; a reply is simply
+> another `talk_to` in the opposite direction delivered as a new
+> `<peer_message>`. Request/response correlation, waiters, `replies/`, timeout/
+> pending wake behavior, `<peer_pong>`, and route/cycle machinery were removed.
+
 ## Context
 
 The main-owned persistent advisor only connects one main Pi session to a special child it creates. The accepted product direction is broader and simpler: independently running Pi sessions in one HerdR workspace should communicate as peers, including nested consultation across several sessions.

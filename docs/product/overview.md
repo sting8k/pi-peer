@@ -1,8 +1,9 @@
 # Product Overview — pi-peer
 
 **pi-peer** is a standalone Pi coding-agent extension that enables peer-to-peer
-communication between independently running Pi sessions inside a HerdR
-workspace.
+chat between independently running Pi sessions inside a HerdR workspace. It is
+symmetric, natural chat between equal agents — not RPC or task delegation to a
+subagent.
 
 It ships exactly three tools — `talk_sessions`, `talk_latest`, and `talk_to` —
 and nothing else: no delegation, no agent roles, no loop workflows, no advisor,
@@ -28,37 +29,43 @@ no slash commands, no widgets. The product contract is defined here, in
 | --- | --- | --- |
 | `talk_sessions` | List live peers in the current HerdR workspace. | none |
 | `talk_latest` | Read the N most recent **completed** events a peer published. | `target` (required), `count` (1–10, default 1) |
-| `talk_to` | Send a request to a peer; return its final response, or a `pending` result whose reply arrives later via wake. | `target` (required), `message` (required), `timeoutMs` (optional) |
+| `talk_to` | Send a chat message to a peer; returns **delivery confirmation only**. | `target` (required), `message` (required) |
 
 Resolution: public peer id (`peer-xxx`, from `talk_sessions`) or unique
 display name; raw full session ids and id prefixes are not targets. Two live
 records with the same public id fail closed as ambiguous. Talking to the
 current session is rejected. The full session id stays the internal identity
-for artifact paths, routes, inbox/reply addressing, and history correlation;
-the public id is a presentation-only alias derived by one central formatter.
+for artifact paths, inbox addressing, and history correlation; the public id
+is a presentation-only alias derived by one central formatter.
 
 ## Semantics
 
-- **Queueing.** A request is queued in the target's inbox immediately and is
-  delivered when the receiver is idle (its own `agent_start`/`agent_end` busy
-  state), with one exception: a request from the caller whose request is
-  already running is steered into that same turn instead of queueing behind
-  it. Any other caller keeps queueing. The target's HerdR status is shown for
-  context. Progress updates (`queued`/`processing`) are streamed.
-- **Abort & timeout.** Abort withdraws a queued request only
-  (already-processing work is not interrupted). The wait ends after the exact
-  `timeoutMs` (default 1 min, clamped 1 000–3 600 000 ms); a live target that
-  has not replied by then yields a non-error `pending` result and the reply
-  arrives later via wake.
+- **Send-only `talk_to`.** A message is durably enqueued in the target's inbox
+  and `talk_to` returns delivery confirmation immediately. It never waits for a
+  response. There is no `timeoutMs`, no `talk_reply`, no `replyTo`, no
+  conversation id, and no request/response correlation.
+- **Inbound delivery.** A message arrives as a `<peer_message>` user message. An
+  **idle** receiver is triggered with a fresh turn; a **busy** receiver is
+  steered into its running turn (`deliverAs: "steer"`) — regardless of who sent
+  it (no same-caller restriction). One message is delivered per poll tick, in
+  FIFO order.
+- **Reply.** A reply is simply another `talk_to` in the opposite direction,
+  which wakes (idle) or steers (busy) the original sender the same way. Nothing
+  waits for a turn boundary, and no message is ever silently lost: a failed
+  injection is requeued and orphaned claims are reclaimed at startup.
+- **No RPC state machine.** There is no automatic `agent_end` reply, no waiter,
+  no response file, and no `<peer_pong>`. The conversation is carried by plain
+  inbound messages; the agents' own turns give it structure.
 - **History.** Bounded (max 10 events) per-peer history of **completed**
   events: user, assistant text, tool call, tool result. Thinking is never
   published; each peer rebuilds history from its own current-lineage session
   (fail-closed: no linkable entry means nothing is published — stale history is
-  replaced with empty), and no session reads another peer's transcript.
-- **Route protection.** Requests carry a route of visited sessions; cycles are
-  rejected before delivery.
+  replaced with empty), and no session reads another peer's transcript. Inbound
+  `<peer_message>`s appear as `user` events and `talk_to` confirmations as
+  `toolResult` events, so an exchange reads coherently on both sides.
 - **Liveness.** Registration records are removed at `session_shutdown`; dead
-  panes are excluded and delivery failures surface as errors.
+  panes are excluded, and a `talk_to` to a missing/dead/ambiguous target fails
+  loudly before any enqueue.
 - **Opt-out.** `PI_PEER_DISABLED=1` prevents registration entirely.
 
 ## Runtime Requirements
@@ -72,15 +79,7 @@ the public id is a presentation-only alias derived by one central formatter.
 
 ## Validation
 
-See `docs/TEST_MATRIX.md` for the matrix. Current executable proof:
-
-- `npm test` — 22 tests, 3 suites (unit + lifecycle).
-- `npm run test:focused` — 19 unit tests.
-- `npm run test:integration` — 3 mocked two-peer lifecycle tests.
-- `npm run typecheck` — clean.
-
-Live new-namespace HerdR cutover passed (story `US-010`): two live Pi panes in
-one workspace discovered each other and exchanged a `talk_to` request/reply
-(marker `PI_PEER_3WAY_OK`), with reverse discovery/read passes and history
-artifacts (version 2, thinking never published). Package metadata
-(author/repository) is unchanged until release (documented debt).
+The executable proof is `npm test` (45 tests, 3 suites), `npm run test:focused`
+(39 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
+and `npm run typecheck` (clean). See `docs/TEST_MATRIX.md` for the acceptance
+matrix.

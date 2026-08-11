@@ -120,8 +120,8 @@ Each peer publishes its own bounded history (max 10 events: user, assistant text
 ## Guarantees
 
 - **Liveness decides delivery.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your `talk_to` immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
-- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. A failed injection is requeued, and orphaned `.processing` claims are reclaimed at startup — a message is never silently lost.
-- **Fair, serial delivery.** One message per poll tick, oldest first, delivered to an idle receiver as a fresh user turn and to a busy receiver as a steer — regardless of sender. No same-caller restriction, no batch, no route/cycle machinery.
+- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. The claim is held through the turn (consumed at `agent_end`), not just until the host accepts the injection. A failed injection is requeued, and orphaned `.processing` claims are reclaimed on reload/rebind and at startup — a message is never silently lost. This is a host-lifecycle guarantee, not proof of model consumption.
+- **Fair, serial delivery.** One message per poll tick, oldest first. An idle receiver gets a fresh user turn; until `agent_start` engages it, no further plain turn is opened (an idle-burst latch), so a burst steers into the engaged turn rather than overlapping. A busy receiver is steered — regardless of sender. No same-caller restriction, no batch, no route/cycle machinery.
 - **A reply is another `talk_to`.** No `agent_end` auto-reply, no `<peer_pong>`, no waiter, no response file. The conversation is carried by plain `<peer_message>` inbound messages.
 - **Ambiguity fails closed.** Two peers sharing a public id resolve to an error, never to a guess.
 

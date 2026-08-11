@@ -33,6 +33,7 @@ import {
   publicPeerId,
   recordPath,
   removeOwnedRecord,
+  requeueClaimedMessage,
   requeueProcessing,
   resolveTarget,
   sessionDir,
@@ -59,9 +60,9 @@ type Runtime = {
 
 /**
  * Send-only `talk_to`: resolve a currently-live target, atomically enqueue one
- * durable message, and return delivery confirmation immediately. A reply is
- * simply another `talk_to` in the opposite direction — there is no waiting for
- * a response and no request/response correlation.
+ * durable message, and return a confirmation that it was sent (durably queued)
+ * immediately. A reply is simply another `talk_to` in the opposite direction —
+ * there is no waiting for a response and no request/response correlation.
  */
 async function executeTalkTo(
   params: TalkTo,
@@ -90,9 +91,9 @@ async function executeTalkTo(
   return {
     content: [{
       type: "text",
-      text: `Message delivered to ${targetRecord.name} (${publicPeerId(targetRecord.sessionId)}). A reply, if any, arrives later as a new <peer_message>.`,
+      text: `Message sent to ${targetRecord.name} (${publicPeerId(targetRecord.sessionId)}). A reply, if any, arrives later as a new <peer_message>.`,
     }],
-    details: { source: "talk_to", target: publicPeerId(targetRecord.sessionId), state: "delivered" },
+    details: { source: "talk_to", target: publicPeerId(targetRecord.sessionId), state: "sent" },
   };
 }
 
@@ -145,50 +146,9 @@ async function executeTalkLatest(
   };
 }
 
-/**
- * Deliver at most one inbox message per poll tick, in FIFO (filename) order.
- * An idle receiver gets a normal user message (trigger behavior); a busy one
- * gets the message steered into its running turn via `deliverAs: "steer"`,
- * regardless of who sent it. If injection fails, the claimed `.processing`
- * message is requeued so it is never silently lost.
- */
-async function drainInbox(pi: ExtensionAPI, runtime: Runtime, isBusy: () => boolean): Promise<void> {
-  const dir = inboxDir(runtime.root, runtime.record.sessionId);
-  if (!existsSync(dir)) return;
-  const pending = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
-  for (const name of pending) {
-    const path = join(dir, name);
-    const message = readJson(path);
-    if (!isPeerMessage(message) || message.to !== runtime.record.sessionId) {
-      // Malformed or misaddressed: cannot be delivered. There is no reply
-      // surface anymore, so drop it rather than block a valid sibling.
-      rmSync(path, { force: true });
-      continue;
-    }
-    const processing = `${path}.processing`;
-    try {
-      renameSync(path, processing);
-    } catch {
-      continue; // claimed by a concurrent drain this tick
-    }
-    try {
-      await pi.sendUserMessage(
-        peerMessageTag(message),
-        isBusy() ? { deliverAs: "steer" } : undefined,
-      );
-    } catch {
-      // Injection failed: requeue the claim; never silently lose the message.
-      requeueProcessing(runtime.root, runtime.record.sessionId);
-      return;
-    }
-    rmSync(processing, { force: true });
-    return; // one message per tick
-  }
-}
-
 /** Queue depth of a peer: count of `.json` message files still present in its
- * inbox dir (queued or currently claimed as `.processing`). A missing inbox dir
- * means zero, never an error.
+ * inbox dir (queued or in-flight as `.processing`). A missing inbox dir means
+ * zero, never an error.
  */
 function inboxCount(root: string, sessionId: string): number {
   const dir = inboxDir(root, sessionId);
@@ -210,6 +170,15 @@ export function registerTalkTools(
   // caller injects an explicit busy function (test/runtime override).
   let selfBusy = false;
   const isBusy = hasBusyOverride ? deps.isBusy! : () => selfBusy;
+  // F1: a non-steer (fresh-trigger) injection is in flight waiting for
+  // agent_start to engage a turn. While set, no further message is drained, so
+  // a burst of overlapping plain user turns cannot open in the gap between the
+  // first idle injection and the host's agent_start.
+  let turnStartPending = false;
+  // F2: `.processing` claims already injected into the current turn. They stay
+  // claimed (at-least-once) until the turn completes at agent_end, so the claim
+  // covers the turn rather than just the host's sendUserMessage acceptance.
+  const inFlightClaims = new Set<string>();
   const rootDir = deps.rootDir ?? getTalkRootDir;
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
@@ -218,6 +187,64 @@ export function registerTalkTools(
   // refresh its registration before its artifacts can be removed.
   const deadSince = new Map<string, number>();
   let lastDeadSweepAt = 0;
+
+  /**
+   * Deliver at most one inbox message per poll tick, in FIFO (filename) order.
+   * An idle receiver gets a normal user message (trigger behavior); a busy one
+   * gets the message steered into its running turn via `deliverAs: "steer"`,
+   * regardless of who sent it.
+   *
+   * F1 idle-burst latch: a non-steer (fresh-trigger) injection sets
+   * `turnStartPending` BEFORE the injection, so no further message is drained
+   * until `agent_start` confirms a turn engaged (after which the receiver is
+   * busy and later messages steer). This prevents a burst of overlapping plain
+   * user turns in the gap between the first idle injection and agent_start.
+   *
+   * F2 claim lifetime: a successfully injected `.processing` claim is NOT
+   * deleted here — it is tracked in `inFlightClaims` and consumed at
+   * `agent_end`, so the claim covers the turn rather than only the host's
+   * sendUserMessage acceptance. A failed injection requeues only its own claim.
+   */
+  const drainInbox = async (pi: ExtensionAPI, runtime: Runtime): Promise<void> => {
+    if (turnStartPending) return;
+    const dir = inboxDir(runtime.root, runtime.record.sessionId);
+    if (!existsSync(dir)) return;
+    const pending = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+    for (const name of pending) {
+      const path = join(dir, name);
+      const message = readJson(path);
+      if (!isPeerMessage(message) || message.to !== runtime.record.sessionId) {
+        // Malformed or misaddressed: cannot be delivered. There is no reply
+        // surface anymore, so drop it rather than block a valid sibling.
+        rmSync(path, { force: true });
+        continue;
+      }
+      const processing = `${path}.processing`;
+      try {
+        renameSync(path, processing);
+      } catch {
+        continue; // claimed by a concurrent drain this tick
+      }
+      const steer = isBusy();
+      // F1: latch BEFORE the non-steer injection so a tick cannot open a second
+      // overlapping plain turn while this async injection is in flight.
+      if (!steer) turnStartPending = true;
+      try {
+        await pi.sendUserMessage(
+          peerMessageTag(message),
+          steer ? { deliverAs: "steer" } : undefined,
+        );
+      } catch {
+        // Injection failed: unlatch and requeue only this claim; never lose it.
+        turnStartPending = false;
+        requeueClaimedMessage(processing);
+        return;
+      }
+      // F2: keep the claim in-flight until the turn completes at agent_end.
+      inFlightClaims.add(processing);
+      return; // one message per tick
+    }
+  };
 
   const ensureRuntime = async (ctx: any, signal?: AbortSignal): Promise<Runtime> => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -270,7 +297,7 @@ export function registerTalkTools(
         // the host today, declared Promise<void>) or on the drain chain.
         ensureRecord(currentRuntime.root, currentRuntime.record);
         if (drainInFlight) return;
-        drainInFlight = drainInbox(pi, currentRuntime, isBusy)
+        drainInFlight = drainInbox(pi, currentRuntime)
           .then(() => {
             // Cross-session GC on a slow cadence: dead sessions' artifacts
             // (registration, latest, inbox) are removed by whichever live
@@ -323,7 +350,7 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_to",
     label: "Talk To",
-    description: "Send a message to another live Pi session in the current HerdR workspace. Returns delivery confirmation only; the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
+    description: "Send a message to another live Pi session in the current HerdR workspace. Returns confirmation that the message was sent (durably queued in the peer's mailbox); the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
     promptSnippet: "Use `talk_to` to send a chat message to another Pi session; call `talk_sessions` first when the target is unknown.",
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -333,20 +360,33 @@ export function registerTalkTools(
   });
 
   pi.on("session_start", (_event, ctx) => {
-    // A reload/resume may miss the prior agent_end; never carry stale busy state across a session bind.
+    // A reload/resume may miss the prior agent_end; never carry stale busy,
+    // turn-start, or in-flight claim state across a session bind.
     selfBusy = false;
+    turnStartPending = false;
+    inFlightClaims.clear();
     void ensureRuntime(ctx)
       .then((current) => {
+        // A rebind may have missed agent_end; requeue any orphaned in-flight
+        // claims so they retry (at-least-once) rather than being lost.
+        requeueProcessing(current.root, current.record.sessionId);
         ctx.ui?.setStatus("pi-peer", `${current.record.name} · ${publicPeerId(current.record.sessionId)}`);
         publishHistoryFromOwnSession(current, ctx);
       })
       .catch(() => {});
   });
   pi.on("agent_start", () => {
+    // F1: a triggered turn has engaged; clear the pending latch and mark busy.
+    turnStartPending = false;
     if (!hasBusyOverride) selfBusy = true;
   });
   pi.on("agent_end", (event, ctx) => {
     if (!hasBusyOverride) selfBusy = false;
+    turnStartPending = false;
+    // F2: the turn completed; consume every claim injected into it. The claim
+    // covered the turn (host lifecycle), not proof of model consumption.
+    for (const processing of inFlightClaims) rmSync(processing, { force: true });
+    inFlightClaims.clear();
     if (!runtime) return;
     // Session entries are persisted before the end event; rebuild from the
     // current lineage so ids are stable and no duplicate risk exists. No
@@ -356,6 +396,10 @@ export function registerTalkTools(
   });
   pi.on("session_shutdown", (_event, ctx) => {
     ctx.ui?.setStatus("pi-peer", undefined);
+    // Clear local F1/F2 state. Unconsumed `.processing` claims are left on disk
+    // (recoverable via the next startup requeue) so nothing is lost on shutdown.
+    turnStartPending = false;
+    inFlightClaims.clear();
     if (runtime) {
       // Remove the owned registration (the authoritative liveness signal);
       // inbox/latest artifacts are not lifecycle-owned and are left for the

@@ -152,6 +152,20 @@ export function isPeerMessage(value: any): value is PeerMessage {
     && typeof value.createdAt === "string";
 }
 
+/**
+ * Requeue a single claimed `.processing` message back to its queued `.json`
+ * form so a message that was not fully injected is never lost. Only this one
+ * claim is touched — unlike {@link requeueProcessing} (startup orphan
+ * recovery, which requeues every claim), this never releases another runtime's
+ * in-flight claim. A pre-existing `.json` (an id collision) wins and the
+ * `.processing` claim is dropped.
+ */
+export function requeueClaimedMessage(processingPath: string): void {
+  const pending = processingPath.slice(0, -".processing".length);
+  if (existsSync(pending)) rmSync(processingPath, { force: true });
+  else renameSync(processingPath, pending);
+}
+
 export function ensureRecord(root: string, record: PeerRecord): void {
   const path = recordPath(root, record.sessionId);
   // Heartbeat: a live session refreshes its registration on a schedule so
@@ -349,21 +363,39 @@ function escapeAttribute(value: string): string {
  * Render an inbound chat message for the receiving agent as a simple
  * `<peer_message>` tag. The sender is identified by its stable display name and
  * public peer id only — the full session id and the internal message id are
- * never exposed. The instruction tells the agent how to reply (a reverse
- * `talk_to`) and that `talk_to` only confirms delivery.
+ * never exposed. The instruction is one concise line telling the agent how to
+ * reply with a reverse `talk_to`; the tool description carries the async
+ * semantics, so they are not repeated here.
  */
 export function peerMessageTag(message: PeerMessage): string {
   const peerId = publicPeerId(message.from);
   return [
     `<peer_message from="${escapeAttribute(message.fromName)}" peer_id="${escapeAttribute(peerId)}">`,
-    `Another Pi session sent you a message. Reply with \`talk_to("${peerId}", "...")\` if a response is useful; \`talk_to\` only returns delivery confirmation, and the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.`,
+    `Reply if useful with talk_to({ target: "${peerId}", message: "..." }).`,
     "",
     message.message,
     "</peer_message>",
   ].join("\n");
 }
 
-/** Build a message id whose base36 timestamp prefix keeps inbox filename sort chronological. */
+/**
+ * Build a message id whose components keep inbox filename sort chronological.
+ *
+ * The id is `msg_<ts36>_<seq6>_<uuid>`: the base36 `Date.now()` timestamp is
+ * the primary sort key and a per-runtime monotonic sequence (6 base36 digits)
+ * is the tie-breaker, so messages generated sequentially by one runtime sort
+ * in creation order even when `Date.now()` is equal or moves backward. The
+ * UUID suffix keeps ids collision-free across runtimes. FIFO is guaranteed
+ * per sender/runtime; total FIFO across processes at the same millisecond is
+ * not attempted.
+ */
+let lastMessageMs = 0;
+let lastMessageSeq = 0;
 export function newMessageId(): string {
-  return `msg_${Date.now().toString(36)}_${randomUUID()}`;
+  const now = Date.now();
+  const ts = Math.max(now, lastMessageMs);
+  const seq = ts === lastMessageMs ? lastMessageSeq + 1 : 1;
+  lastMessageMs = ts;
+  lastMessageSeq = seq;
+  return `msg_${ts.toString(36)}_${seq.toString(36).padStart(6, "0")}_${randomUUID()}`;
 }

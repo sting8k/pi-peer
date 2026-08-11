@@ -18,6 +18,7 @@ import {
   publicPeerId,
   recordPath,
   removeOwnedRecord,
+  requeueClaimedMessage,
   requeueProcessing,
   resolveTarget,
   sessionDir,
@@ -58,7 +59,8 @@ describe("peer talk protocol", () => {
       message: "Review the auth refactor.", createdAt: nowIso(),
     });
     assert.match(tag, /<peer_message from="Mochi" peer_id="peer-123">/);
-    assert.match(tag, /talk_to\("peer-123", "\.\.\."\)/, "reply instruction uses the public peer id");
+    assert.match(tag, /talk_to\(\{ target: "peer-123", message: "\.\.\." \}\)/, "reply instruction is a single object-shaped talk_to line");
+    assert.doesNotMatch(tag, /delivery confirmation|arrives as a new <peer_message>|Do not reply merely/, "no protocol prose repeated in every message");
     assert.match(tag, /Review the auth refactor\./);
     assert.doesNotMatch(tag, /session-alpha-123/, "full session id is never exposed");
     assert.doesNotMatch(tag, /msg-internal-1/, "internal message id is never exposed");
@@ -77,7 +79,7 @@ describe("peer talk protocol", () => {
     assert.match(tag, /from="api&amp;review"/);
   });
 
-  it("prefixes message ids so filename sort follows enqueue time", () => {
+  it("message ids sort in creation order: timestamp prefix plus per-runtime monotonic sequence", () => {
     const originalNow = Date.now;
     let currentTime = 1_700_000_000_000;
     try {
@@ -87,8 +89,8 @@ describe("peer talk protocol", () => {
       const second = newMessageId();
       const firstTimestamp = first.split("_")[1];
       const secondTimestamp = second.split("_")[1];
-      assert.match(first, /^msg_[0-9a-z]+_[0-9a-f-]{36}$/);
-      assert.match(second, /^msg_[0-9a-z]+_[0-9a-f-]{36}$/);
+      assert.match(first, /^msg_[0-9a-z]+_[0-9a-z]{6}_[0-9a-f-]{36}$/);
+      assert.match(second, /^msg_[0-9a-z]+_[0-9a-z]{6}_[0-9a-f-]{36}$/);
       assert.equal(firstTimestamp.length, secondTimestamp.length, "timestamp prefixes retain a sortable width");
       assert.deepEqual([second, first].sort(), [first, second], "filename order keeps older messages first");
     } finally {
@@ -96,6 +98,22 @@ describe("peer talk protocol", () => {
     }
   });
 
+  it("newMessageId stays monotonic when Date.now is fixed or moves backward", () => {
+    const originalNow = Date.now;
+    try {
+      Date.now = () => 1_700_000_000_000;
+      const ids = Array.from({ length: 20 }, () => newMessageId());
+      // Same-ms UUID tie-breaking would scramble order; the monotonic sequence must not.
+      assert.deepEqual([...ids].sort(), ids, "same-ms sequential ids sort in creation order");
+      assert.equal(new Set(ids).size, 20, "ids remain unique within a runtime");
+      // Clock moving backward: the next id must still sort after all prior ids.
+      Date.now = () => 1_690_000_000_000;
+      const back = newMessageId();
+      assert.ok(back > ids[ids.length - 1], "backward clock must not reorder the sequence");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
   it("derives public peer ids and defines behavior for short ids", () => {
     assert.equal(publicPeerId("session-alpha"), "peer-pha");
     assert.equal(publicPeerId("session-beta"), "peer-eta");
@@ -203,6 +221,24 @@ describe("peer talk protocol", () => {
       requeueProcessing(root, "session-b");
       assert.ok(existsSync(join(inbox, "msg-1.json")));
       assert.equal(existsSync(join(inbox, "msg-1.json.processing")), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requeueClaimedMessage touches only its own claim, leaving other .processing files", () => {
+    const root = createTestDir();
+    try {
+      const inbox = join(root, "inbox", "session-b");
+      mkdirSync(inbox, { recursive: true });
+      // Two distinct claims; only the first is requeued by the isolated helper.
+      writeFileSync(join(inbox, "msg-mine.json.processing"), "{}");
+      writeFileSync(join(inbox, "msg-other.json.processing"), "{}");
+      requeueClaimedMessage(join(inbox, "msg-mine.json.processing"));
+      assert.ok(existsSync(join(inbox, "msg-mine.json")), "own claim requeued");
+      assert.equal(existsSync(join(inbox, "msg-mine.json.processing")), false, "own claim released");
+      assert.equal(existsSync(join(inbox, "msg-other.json.processing")), true, "another runtime's live claim untouched");
+      assert.equal(existsSync(join(inbox, "msg-other.json")), false, "other claim not converted");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

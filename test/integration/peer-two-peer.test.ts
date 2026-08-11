@@ -61,7 +61,7 @@ function createPeer(
     }),
     getPeerStatus: async (peer) => peerStatuses.get(peer.paneId) ?? "idle",
     rootDir: () => root,
-    isBusy: opts.busy ?? (() => false),
+    isBusy: opts.busy,
   });
   return { ctx, tools, handlers, sentMessages };
 }
@@ -95,8 +95,8 @@ describe("peer two-peer lifecycle (async chat)", () => {
       );
       const elapsed = Date.now() - started;
       assert.ok(elapsed < 1_000, `talk_to must return promptly (took ${elapsed}ms)`);
-      assert.match(result.content[0].text, /Message delivered to .*\(peer-eta\)/);
-      assert.equal(result.details.state, "delivered");
+      assert.match(result.content[0].text, /Message sent to .*\(peer-eta\)/);
+      assert.equal(result.details.state, "sent");
       // The message is durably delivered to the receiver (at-least-once mailbox).
       await waitUntil(() => receiver.sentMessages.length === 1, "receiver got the message");
       assert.match(receiver.sentMessages[0].content, /Hello B/);
@@ -128,6 +128,8 @@ describe("peer two-peer lifecycle (async chat)", () => {
       await waitUntil(() => receiver.sentMessages.length === 1, "idle delivery");
       assert.match(receiver.sentMessages[0].content, /idle msg/);
       assert.equal(receiver.sentMessages[0].options, undefined, "idle receiver is triggered");
+      // Engage the turn so later messages steer instead of opening overlapping plain turns.
+      for (const handler of receiver.handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, receiver.ctx);
 
       // Busy receiver: same sender steered.
       receiverBusy.value = true;
@@ -167,6 +169,8 @@ describe("peer two-peer lifecycle (async chat)", () => {
       // FIFO order, one consumed per poll tick.
       await waitUntil(() => receiver.sentMessages.length === 1, "first delivered");
       assert.equal(readdirSync(inbox).filter((f) => f.endsWith(".json")).length, 2, "exactly one consumed per tick");
+      // F1: engage the turn so the remaining messages steer rather than opening overlapping plain turns.
+      for (const handler of receiver.handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, receiver.ctx);
       await waitUntil(() => receiver.sentMessages.length === 2, "second delivered");
       assert.equal(readdirSync(inbox).filter((f) => f.endsWith(".json")).length, 1, "exactly one consumed per tick");
       await waitUntil(() => receiver.sentMessages.length === 3, "third delivered");
@@ -200,6 +204,8 @@ describe("peer two-peer lifecycle (async chat)", () => {
       await waitUntil(() => sender.sentMessages.length === 1, "A received B's reply (idle)");
       assert.match(sender.sentMessages[0].content, /hello A/);
       assert.equal(sender.sentMessages[0].options, undefined, "idle A triggered by reverse talk_to");
+      // Engage A's turn so the next message steers instead of opening another plain turn.
+      for (const handler of sender.handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, sender.ctx);
 
       // B replies again while A is busy -> A is steered.
       senderBusy.value = true;

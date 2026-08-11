@@ -135,11 +135,14 @@ describe("pi-peer standalone runtime", () => {
       assert.match(sentMessages[0].content, /peer_id=/, "sends a public peer id");
       assert.deepEqual(sentMessages[0].options, { deliverAs: "steer" }, "busy message steered mid-turn");
       assert.equal(existsSync(join(inbox, "msg-busy.json")), false, "message claimed after delivery");
-      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), false, "claim released after delivery");
+      // F2: the claim is kept in-flight (at-least-once) until the turn completes.
+      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), true, "claim kept until agent_end (F2)");
 
       // Peer goes idle: agent_end fires; a later message is a fresh user turn.
       for (const handler of handlers.get("agent_end") ?? []) handler({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] }, ctx);
       await new Promise((resolve) => setTimeout(resolve, 20));
+      // F2: agent_end consumes the in-flight claim for the steered message.
+      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), false, "claim consumed at agent_end");
       writeFileSync(join(inbox, "msg-idle.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Idle me.")));
       await waitUntil(() => sentMessages.length === 2, "idle inbound delivered");
       assert.match(sentMessages[1].content, /Idle me\./);
@@ -419,7 +422,10 @@ describe("pi-peer standalone runtime", () => {
       await waitUntil(() => sentMessages.length === 1, "orphaned claim reclaimed and delivered");
       assert.match(sentMessages[0], /Reclaim me\./);
       assert.equal(existsSync(join(inbox, "msg-orphan.json")), false, "no residual queued file");
-      assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), false, "claim consumed");
+      // F2: the reclaimed claim is kept in-flight until the turn completes.
+      assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), true, "reclaimed claim kept in-flight (F2)");
+      for (const handler of handlers.get("agent_end") ?? []) handler({ type: "agent_end" }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), false, "claim consumed at agent_end");
     } finally {
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });
@@ -599,6 +605,125 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(root, "replies")), false, "no replies dir");
       assert.equal(sentMessages.some((m) => m.startsWith("<peer_pong")), false, "no fabricated reply on shutdown");
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("holds a second message queued until agent_start engages the turn, then steers it (F1)", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-f1";
+    const ctx = { cwd: "/work/f1", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`) } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-f1", terminalId: "terminal-f", tabId: "tab-f", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      // Two plain messages queued while idle; agent_start has NOT fired yet.
+      writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "First.")));
+      writeFileSync(join(inbox, "m2.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "Second.")));
+      await waitUntil(() => sentMessages.length === 1, "first message drains as a fresh trigger turn");
+      assert.equal(sentMessages[0].options, undefined, "first message is a fresh user turn");
+      // F1: the triggered turn is pending (agent_start not yet seen); m2 must NOT drain.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(sentMessages.length, 1, "no second message drained while turnStartPending");
+      assert.equal(existsSync(join(inbox, "m2.json")), true, "m2 stays queued");
+      // agent_start engages the turn; the next tick steers m2 rather than opening a second plain turn.
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctx);
+      await waitUntil(() => sentMessages.length === 2, "second message drains after agent_start");
+      assert.deepEqual(sentMessages[1].options, { deliverAs: "steer" }, "m2 is steered, not a second plain turn");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a fresh-trigger claim in-flight until agent_start/agent_end (F2)", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-f2a";
+    const ctx = { cwd: "/work/f2a", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`) } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-f2a", terminalId: "terminal-2", tabId: "tab-2", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    let claim = "";
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "Trigger.")));
+      await waitUntil(() => sentMessages.length === 1, "message drains as a fresh trigger turn");
+      claim = join(inbox, "m1.json.processing");
+      assert.equal(existsSync(claim), true, "claim kept while the turn is pending (F2)");
+      // No agent_start: the claim must persist across several poll ticks.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(existsSync(claim), true, "claim still in-flight with a delayed agent_start");
+    } finally {
+      // Shutdown without agent_end leaves the unconsumed claim recoverable on disk.
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      assert.equal(existsSync(claim), true, "unconsumed claim left on disk after shutdown");
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requeues an orphaned claim on session rebind when agent_end was missed (F2)", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-f2d";
+    const ctx = { cwd: "/work/f2d", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`) } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-f2d", terminalId: "terminal-3", tabId: "tab-3", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "Rebind.")));
+      await waitUntil(() => sentMessages.length === 1, "message drains and is claimed");
+      assert.equal(existsSync(join(inbox, "m1.json.processing")), true, "claim in-flight");
+      // Miss agent_end: session shuts down and rebinds.
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "reload" }, ctx);
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Rebind requeues the orphaned claim so it retries (at-least-once).
+      assert.equal(existsSync(join(inbox, "m1.json.processing")), false, "orphaned claim reclaimed");
+      assert.equal(existsSync(join(inbox, "m1.json")), true, "message requeued to the inbox");
+      await waitUntil(() => sentMessages.length === 2, "requeued message redelivered");
+      assert.equal(sentMessages[1].options, undefined, "redelivered as a fresh user turn");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });
     }
   });

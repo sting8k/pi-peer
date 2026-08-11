@@ -146,14 +146,16 @@ async function executeTalkLatest(
   };
 }
 
-/** Queue depth of a peer: count of `.json` message files still present in its
- * inbox dir (queued or in-flight as `.processing`). A missing inbox dir means
- * zero, never an error.
+/** Queue depth of a peer: count of still-queued `.json` message files in its
+ * inbox dir. In-flight `.processing` claims are already injected and are not
+ * counted. A missing inbox dir means zero, never an error.
  */
 function inboxCount(root: string, sessionId: string): number {
   const dir = inboxDir(root, sessionId);
   if (!existsSync(dir)) return 0;
-  return readdirSync(dir).filter((name) => name.endsWith(".json") || name.endsWith(".json.processing")).length;
+  // Count only still-queued `.json` messages. In-flight `.processing` claims
+  // are already injected into the current turn, so they are not "queued".
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).length;
 }
 
 export function registerTalkTools(
@@ -361,7 +363,10 @@ export function registerTalkTools(
 
   pi.on("session_start", (_event, ctx) => {
     // A reload/resume may miss the prior agent_end; never carry stale busy,
-    // turn-start, or in-flight claim state across a session bind.
+    // turn-start, or in-flight claim state across a session bind. Requeue any
+    // claims tracked for the previous runtime before switching so they are not
+    // stranded as `.processing` until a future restart.
+    for (const processing of inFlightClaims) requeueClaimedMessage(processing);
     selfBusy = false;
     turnStartPending = false;
     inFlightClaims.clear();

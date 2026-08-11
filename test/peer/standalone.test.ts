@@ -137,6 +137,9 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(inbox, "msg-busy.json")), false, "message claimed after delivery");
       // F2: the claim is kept in-flight (at-least-once) until the turn completes.
       assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), true, "claim kept until agent_end (F2)");
+      // QUEUE UX: an in-flight `.processing` claim is not counted as queued.
+      const sessionsInFlight = await tools.get("talk_sessions").execute("s", {}, undefined, undefined, ctx);
+      assert.doesNotMatch(sessionsInFlight.content[0].text, /\([0-9]+ queued\)/, "in-flight claim is not counted as queued");
 
       // Peer goes idle: agent_end fires; a later message is a fresh user turn.
       for (const handler of handlers.get("agent_end") ?? []) handler({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] }, ctx);
@@ -144,6 +147,9 @@ describe("pi-peer standalone runtime", () => {
       // F2: agent_end consumes the in-flight claim for the steered message.
       assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), false, "claim consumed at agent_end");
       writeFileSync(join(inbox, "msg-idle.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Idle me.")));
+      // QUEUE UX: only a still-queued `.json` message shows as `(1 queued)`.
+      const sessionsQueued = await tools.get("talk_sessions").execute("s", {}, undefined, undefined, ctx);
+      assert.match(sessionsQueued.content[0].text, /\(1 queued\)/, "queued .json message shows as (1 queued)");
       await waitUntil(() => sentMessages.length === 2, "idle inbound delivered");
       assert.match(sentMessages[1].content, /Idle me\./);
       assert.equal(sentMessages[1].options, undefined, "idle message delivered as a fresh user turn (trigger)");
@@ -724,6 +730,44 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(sentMessages[1].options, undefined, "redelivered as a fresh user turn");
     } finally {
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("session switch requeues the previous runtime's in-flight claim (F2)", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-sw2", terminalId: "terminal-sw", tabId: "tab-sw", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    const ctxA = { cwd: "/work/a", sessionManager: { getSessionId: () => "session-SW-A", getSessionFile: () => join(root, "transcripts", "session-SW-A.jsonl") } };
+    const ctxB = { cwd: "/work/b", sessionManager: { getSessionId: () => "session-SW-B", getSessionFile: () => join(root, "transcripts", "session-SW-B.jsonl") } };
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctxA);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const inboxA = join(root, "inbox", "session-SW-A");
+      mkdirSync(inboxA, { recursive: true });
+      writeFileSync(join(inboxA, "m1.json"), JSON.stringify(peerMessage("s1", "sender", "session-SW-A", "Hello A.")));
+      await waitUntil(() => sentMessages.length === 1, "A message drains and is claimed");
+      assert.equal(existsSync(join(inboxA, "m1.json.processing")), true, "A claim in-flight");
+      // Switch to B without an agent_end or shutdown for A.
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctxB);
+      // The claim tracked for A is requeued synchronously at session start, not stranded.
+      assert.equal(existsSync(join(inboxA, "m1.json.processing")), false, "A claim not stranded as .processing");
+      assert.equal(existsSync(join(inboxA, "m1.json")), true, "A message requeued to A's inbox");
+      // B registration ownership transfer still works.
+      await waitUntil(() => existsSync(join(root, "sessions", "session-SW-B.json")), "B registration to appear");
+      assert.equal(existsSync(join(root, "sessions", "session-SW-A.json")), false, "A owned registration removed after switch");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctxB);
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -75,9 +75,12 @@ no reply file, no `<peer_pong>`.
   the current session). There is no route/cycle machinery because there is no
   request/response propagation.
 - Every message is written **durably** via `writeAtomic` (temp file + rename)
-  and claimed by an atomic `.processing` rename before injection. If injection
-  fails the claim is requeued; orphaned `.processing` files are reclaimed at
-  startup. A message is never silently lost.
+  and claimed by an atomic `.processing` rename before injection. The claim is
+  held through the host turn (consumed at `agent_end`). If injection fails the
+  claim is requeued; orphaned `.processing` files are reclaimed on reload/rebind
+  and at startup, so a host-accepted-but-unconsumed message is recoverable
+  (at-least-once). This is a host-lifecycle guarantee, not proof the model
+  consumed the message.
 - `agent_end` produces **no automatic reply** — a reply is a separate `talk_to`
   the agent chooses to send. No `<peer_pong>`, no response generation.
 - History is **bounded** (10 events) and **thinking-free**; it is rebuilt from

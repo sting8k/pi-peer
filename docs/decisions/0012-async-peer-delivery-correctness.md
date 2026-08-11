@@ -85,9 +85,10 @@ Positive:
 
 Tradeoffs:
 
-- The guarantee is at-least-once, not exactly-once: a crash after `agent_end`
-  consumed a claim but before the model finished could in principle re-deliver.
-  This is bounded by the host lifecycle and is acceptable for symmetric peer chat.
+- The guarantee is at-least-once, not exactly-once: a crash or rebind after the
+  host accepted/injected a message but before `agent_end` consumed the claim
+  opens a window in which the message could be re-delivered on recovery. The
+  window is bounded to the host turn, not to model processing.
 - A peer that is perpetually idle after a non-steer injection holds the latch until
   `agent_start`; injection failures clear the latch so a poison message cannot
   wedge the mailbox forever.

@@ -79,7 +79,7 @@ is a presentation-only alias derived by one central formatter.
 
 ## Validation
 
-The executable proof is `npm test` (45 tests, 3 suites), `npm run test:focused`
-(39 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
+The executable proof is `npm test` (51 tests, 3 suites), `npm run test:focused`
+(45 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
 and `npm run typecheck` (clean). See `docs/TEST_MATRIX.md` for the acceptance
 matrix.

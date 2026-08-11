@@ -143,8 +143,8 @@ Writes are atomic (temp file plus rename) and the mailbox directory is created w
 
 ```sh
 npm install
-npm test                  # 51 tests (3 suites)
-npm run test:focused      # 45 unit tests
+npm test                  # 52 tests (3 suites)
+npm run test:focused      # 46 unit tests
 npm run test:integration  # 6 mocked two-peer lifecycle tests
 npm run typecheck         # tsc --noEmit
 ```

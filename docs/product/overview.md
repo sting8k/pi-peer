@@ -47,12 +47,17 @@ is a presentation-only alias derived by one central formatter.
 - **Inbound delivery.** A message arrives as a `<peer_message>` user message. An
   **idle** receiver is triggered with a fresh turn; a **busy** receiver is
   steered into its running turn (`deliverAs: "steer"`) — regardless of who sent
-  it (no same-caller restriction). One message is delivered per poll tick, in
-  FIFO order.
+  it (no same-caller restriction). One message is delivered per poll tick.
+  Delivery is sequential: within a runtime, messages are injected in their
+  per-runtime creation (filename) order, oldest first. Across processes,
+  messages sharing a creation timestamp have a deterministic filename order,
+  but no global enqueue order is claimed.
 - **Reply.** A reply is simply another `talk_to` in the opposite direction,
   which wakes (idle) or steers (busy) the original sender the same way. Nothing
-  waits for a turn boundary, and no message is ever silently lost: a failed
-  injection is requeued and orphaned claims are reclaimed at startup.
+  waits for a turn boundary. Durability is recoverable at-least-once: a failed
+  injection is requeued, and orphaned `.processing` claims are reclaimed on
+  reload/rebind and at startup, so a host-accepted-but-unconsumed message is
+  recoverable through the host turn — not proof the model consumed it.
 - **No RPC state machine.** There is no automatic `agent_end` reply, no waiter,
   no response file, and no `<peer_pong>`. The conversation is carried by plain
   inbound messages; the agents' own turns give it structure.
@@ -79,7 +84,7 @@ is a presentation-only alias derived by one central formatter.
 
 ## Validation
 
-The executable proof is `npm test` (51 tests, 3 suites), `npm run test:focused`
-(45 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
+The executable proof is `npm test` (52 tests, 3 suites), `npm run test:focused`
+(46 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
 and `npm run typecheck` (clean). See `docs/TEST_MATRIX.md` for the acceptance
 matrix.

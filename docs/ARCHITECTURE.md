@@ -62,9 +62,11 @@ no reply file, no `<peer_pong>`.
 
 ### Invariants
 
-- A session may inject **one** inbox message per poll tick, in filename order
-  (FIFO). Message ids carry a base36 creation timestamp prefix so this order
-  follows enqueue time.
+- A session may inject **one** inbox message per poll tick. Within a runtime,
+  messages are injected in per-runtime creation (filename) order. Message ids
+  carry a base36 creation timestamp prefix; across processes, messages sharing
+  a timestamp have deterministic filename order but no claimed global enqueue
+  order.
 - `selfBusy` resets synchronously at `session_start`, so a missed `agent_end`
   cannot permanently block inbox delivery.
 - An **idle** receiver gets the message as a normal user message (trigger

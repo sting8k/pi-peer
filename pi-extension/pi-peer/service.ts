@@ -181,6 +181,11 @@ export function registerTalkTools(
   // claimed (at-least-once) until the turn completes at agent_end, so the claim
   // covers the turn rather than just the host's sendUserMessage acceptance.
   const inFlightClaims = new Set<string>();
+  // Session-bind latch: while a session_start bind is in flight (requeueing the
+  // previous runtime's claims and resolving the new runtime asynchronously), the
+  // poll interval must not drain the still-current old runtime's inbox and
+  // redeliver a just-requeued message. Cleared once the bind completes or fails.
+  let bindInProgress = false;
   const rootDir = deps.rootDir ?? getTalkRootDir;
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
@@ -209,6 +214,7 @@ export function registerTalkTools(
    */
   const drainInbox = async (pi: ExtensionAPI, runtime: Runtime): Promise<void> => {
     if (turnStartPending) return;
+    if (bindInProgress) return; // a session bind is in flight; do not drain the old inbox
     const dir = inboxDir(runtime.root, runtime.record.sessionId);
     if (!existsSync(dir)) return;
     const pending = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
@@ -366,6 +372,9 @@ export function registerTalkTools(
     // turn-start, or in-flight claim state across a session bind. Requeue any
     // claims tracked for the previous runtime before switching so they are not
     // stranded as `.processing` until a future restart.
+    // Bind latch: hold the poll interval off the old runtime's inbox while the
+    // async bind resolves, so a just-requeued message is not drained again.
+    bindInProgress = true;
     for (const processing of inFlightClaims) requeueClaimedMessage(processing);
     selfBusy = false;
     turnStartPending = false;
@@ -378,7 +387,11 @@ export function registerTalkTools(
         ctx.ui?.setStatus("pi-peer", `${current.record.name} · ${publicPeerId(current.record.sessionId)}`);
         publishHistoryFromOwnSession(current, ctx);
       })
-      .catch(() => {});
+      .catch((err) => {
+        // Bind failed: release the latch so the previous runtime is not wedged.
+        console.error("pi-peer session bind failed", err);
+      })
+      .finally(() => { bindInProgress = false; });
   });
   pi.on("agent_start", () => {
     // F1: a triggered turn has engaged; clear the pending latch and mark busy.

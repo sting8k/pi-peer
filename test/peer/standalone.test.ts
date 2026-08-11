@@ -771,4 +771,55 @@ describe("pi-peer standalone runtime", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+  it("slow session bind does not redeliver a just-requeued message (bring latch)", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    let getPeerCalls = 0;
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      // First bind is immediate; the second (A->B) is deliberately slower than
+      // one poll tick (POLL_MS = 250ms).
+      async getCurrentPeer() {
+        getPeerCalls++;
+        if (getPeerCalls >= 2) await new Promise((resolve) => setTimeout(resolve, 320));
+        return { paneId: "pane-bind", terminalId: "terminal-b", tabId: "tab-b", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+      },
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    const ctxA = { cwd: "/work/a", sessionManager: { getSessionId: () => "session-BIND-A", getSessionFile: () => join(root, "transcripts", "session-BIND-A.jsonl") } };
+    const ctxB = { cwd: "/work/b", sessionManager: { getSessionId: () => "session-BIND-B", getSessionFile: () => join(root, "transcripts", "session-BIND-B.jsonl") } };
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const h of handlers.get("session_start") ?? []) h({ type: "session_start", reason: "startup" }, ctxA);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const inboxA = join(root, "inbox", "session-BIND-A");
+      mkdirSync(inboxA, { recursive: true });
+      writeFileSync(join(inboxA, "m1.json"), JSON.stringify(peerMessage("s1", "sender", "session-BIND-A", "Hello A.")));
+      await waitUntil(() => sentMessages.length === 1, "A message drains and is claimed");
+      assert.equal(existsSync(join(inboxA, "m1.json.processing")), true, "A claim in-flight");
+      // Start the slow A->B bind. The claim is requeued synchronously, then
+      // ensureRuntime blocks on getCurrentPeer (> one poll tick).
+      for (const h of handlers.get("session_start") ?? []) h({ type: "session_start", reason: "reload" }, ctxB);
+      assert.equal(existsSync(join(inboxA, "m1.json.processing")), false, "A claim requeued at bind start");
+      assert.equal(existsSync(join(inboxA, "m1.json")), true, "A message queued");
+      // Wait longer than one poll tick while the bind is still in flight: the
+      // just-requeued message must NOT be redelivered into the old runtime.
+      const before = sentMessages.length;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal(sentMessages.length, before, "no redelivery while bind in progress");
+      assert.equal(existsSync(join(inboxA, "m1.json")), true, "A message still queued during bind");
+      // Bind completes; ownership transfers to B.
+      await waitUntil(() => existsSync(join(root, "sessions", "session-BIND-B.json")), "B registration to appear");
+      assert.equal(existsSync(join(root, "sessions", "session-BIND-A.json")), false, "A owned registration removed");
+    } finally {
+      for (const h of handlers.get("session_shutdown") ?? []) h({ type: "session_shutdown", reason: "quit" }, ctxB);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

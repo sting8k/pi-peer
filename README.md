@@ -45,7 +45,7 @@ A message is delivered to an **idle** receiver as a normal user message (trigger
 
 - [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) running inside a HerdR pane.
 - `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket.
-- Node 18+ for development.
+- Node 22.19+ for development (required by the Pi coding-agent SDK).
 
 ## Install
 
@@ -160,7 +160,7 @@ npm run typecheck         # tsc --noEmit
 - `test/peer/` — unit tests. `test/integration/` — mocked two-peer lifecycle.
 - `docs/` — architecture and decisions; see `docs/decisions/0011-standalone-pi-peer-extension.md` for the packaging decision.
 
-Distribution is GitHub-only; the package is `private: true` and is not published to npm.
+Distribution is available from both npm and GitHub. The npm package is published publicly as [`@sting8k/pi-peer`](https://www.npmjs.com/package/@sting8k/pi-peer).
 
 ## Related Work
 

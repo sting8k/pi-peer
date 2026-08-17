@@ -67,8 +67,8 @@ export const DEAD_SESSION_TTL_MS = 24 * 60 * 60_000;
 export const DEAD_SESSION_SWEEP_MS = 5 * 60_000;
 
 export const PEER_NAME_POOL = [
-  "Milo", "Coco", "Luna", "Rex", "Buddy", "Bella", "Ziggy", "Peanut", "Mochi", "Biscuit",
-  "Nala", "Simba", "Toby", "Daisy", "Rocky", "Momo", "Pip", "Gizmo", "Waffle", "Boba",
+  "Mark", "Coco", "Dario", "Rex", "Tibo", "Bella", "Xi", "Peanut", "Pooh", "Biscuit",
+  "Mario", "Simba", "Elon", "Daisy", "Dax", "Momo", "Sam", "Gizmo", "Sundar", "Zhang",
 ] as const;
 
 function peerNameHash(sessionId: string): number {

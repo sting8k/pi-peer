@@ -125,8 +125,15 @@ describe("peer talk protocol", () => {
     assert.throws(() => publicPeerId(""), /non-empty session id/);
   });
 
+  it("keeps a 20-name unique pool with the current peer names", () => {
+    const currentNames = ["Mark", "Dario", "Tibo", "Xi", "Pooh", "Mario", "Elon", "Dax", "Sam", "Sundar", "Zhang"];
+    assert.equal(PEER_NAME_POOL.length, 20);
+    assert.equal(new Set(PEER_NAME_POOL).size, 20);
+    for (const name of currentNames) assert.ok(PEER_NAME_POOL.includes(name as (typeof PEER_NAME_POOL)[number]));
+  });
+
   it("picks a deterministic name for the same session and taken set", () => {
-    const taken = new Set<string>(["Milo", "Luna"]);
+    const taken = new Set<string>(["Coco", "Daisy"]);
     const first = pickPeerName("session-friendly", taken);
     assert.equal(pickPeerName("session-friendly", taken), first);
   });

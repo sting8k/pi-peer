@@ -275,6 +275,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
       const latest = await sender.tools.get("talk_latest").execute("l", { target: "peer-eta", count: 5 }, undefined, undefined, sender.ctx);
       assert.match(latest.content[0].text, /Question Q/);
       assert.match(latest.content[0].text, /B's answer/);
+      assert.match(latest.content[0].text, /\[assistant @ 2024-01-01T00:00:02\.000Z\] B's answer/, "talk_latest event lines carry createdAt timestamps");
       assert.equal(latest.details.target, "peer-eta");
       // No RPC artifacts anywhere after the conversation.
       assert.equal(existsSync(join(root, "waiters")), false, "no waiters directory after conversation");

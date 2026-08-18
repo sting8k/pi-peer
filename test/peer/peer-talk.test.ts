@@ -52,13 +52,15 @@ describe("peer talk protocol", () => {
     assert.equal(isPeerMessage({ ...base, fromName: "" }), false, "empty display name rejected");
   });
 
-  it("renders an inbound <peer_message> with name and public peer id only", () => {
+  it("renders an inbound <peer_message> with name, public peer id, and sent_at timestamp", () => {
+    const createdAt = nowIso();
     const tag = peerMessageTag({
       version: 1, type: "peer_message", id: "msg-internal-1",
       from: "session-alpha-123", fromName: "Mochi", to: "session-beta-456",
-      message: "Review the auth refactor.", createdAt: nowIso(),
+      message: "Review the auth refactor.", createdAt,
     });
-    assert.match(tag, /<peer_message from="Mochi" peer_id="peer-123">/);
+    assert.match(tag, /<peer_message from="Mochi" peer_id="peer-123" sent_at="[^"]+">/);
+    assert.ok(tag.includes(`sent_at="${createdAt}"`), "sent_at equals the message createdAt");
     assert.match(tag, /talk_to\(\{ target: "peer-123", message: "\.\.\." \}\)/, "reply instruction is a single object-shaped talk_to line");
     assert.doesNotMatch(tag, /delivery confirmation|arrives as a new <peer_message>|Do not reply merely/, "no protocol prose repeated in every message");
     assert.match(tag, /Review the auth refactor\./);

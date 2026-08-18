@@ -127,7 +127,7 @@ async function executeTalkLatest(
     `Peer status: ${peerStatus}`,
     snapshotNote,
     `Latest completed events (${events.length}):`,
-    ...events.map((event) => `[${event.type}] ${event.message}`),
+    ...events.map((event) => `[${event.type} @ ${event.createdAt}] ${event.message}`),
   ].filter(Boolean).join("\n");
   return {
     content: [{

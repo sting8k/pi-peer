@@ -370,7 +370,7 @@ function escapeAttribute(value: string): string {
 export function peerMessageTag(message: PeerMessage): string {
   const peerId = publicPeerId(message.from);
   return [
-    `<peer_message from="${escapeAttribute(message.fromName)}" peer_id="${escapeAttribute(peerId)}">`,
+    `<peer_message from="${escapeAttribute(message.fromName)}" peer_id="${escapeAttribute(peerId)}" sent_at="${escapeAttribute(message.createdAt)}">`,
     `Reply if useful with talk_to({ target: "${peerId}", message: "..." }).`,
     "",
     message.message,

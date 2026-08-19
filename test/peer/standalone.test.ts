@@ -448,6 +448,62 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("syncs Herdr visible identity at startup and on each prompt", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const syncCalls: Array<{ peer: any; name: string }> = [];
+    let releaseFirstSync: (() => void) | undefined;
+    const ctx: any = {
+      cwd: "/work/panel-name",
+      sessionManager: {
+        getSessionId: () => "session-panel-name",
+        getSessionFile: () => join(root, "transcripts", "session-panel-name.jsonl"),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-panel-name", terminalId: "term-panel-name", tabId: "tab-panel-name",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+      syncVisibleIdentity: async (peer, name) => {
+        syncCalls.push({ peer, name });
+        if (syncCalls.length === 1) {
+          await new Promise<void>((resolve) => { releaseFirstSync = resolve; });
+        }
+      },
+    });
+    try {
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => syncCalls.length === 1, "Herdr visible identity sync");
+      const record = JSON.parse(readFileSync(recordPath(root, "session-panel-name"), "utf8"));
+      assert.deepEqual(syncCalls, [{
+        peer: {
+          paneId: "pane-panel-name", terminalId: "term-panel-name", tabId: "tab-panel-name",
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        },
+        name: record.name,
+      }]);
+
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctx);
+      assert.equal(syncCalls.length, 1, "the in-flight startup sync is not duplicated");
+      releaseFirstSync?.();
+      await waitUntil(() => syncCalls.length === 2, "Herdr visible identity refresh");
+      assert.deepEqual(syncCalls[1], syncCalls[0], "a prompt during startup refreshes the same friendly name");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("coalesces a session_start bind with an early tool call", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();

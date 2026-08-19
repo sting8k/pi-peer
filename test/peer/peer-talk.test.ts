@@ -1,10 +1,19 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { Value } from "typebox/value";
 
+import {
+  getAgentConfigDir,
+  getHerdrBinaryPath,
+  herdrAgentNameFromPeerName,
+  herdrPeerIdentityMatches,
+  shouldMirrorPeerNameToSinglePaneTab,
+} from "../../pi-extension/pi-peer/herdr.ts";
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "../../pi-extension/pi-peer/schemas.ts";
 import {
   isPeerMessage,
@@ -32,7 +41,7 @@ import {
   publishHistoryFromOwnSession,
   readHistory,
 } from "../../pi-extension/pi-peer/history.ts";
-import { createTestDir } from "./helpers.ts";
+import { createTestDir, restoreEnvVar } from "./helpers.ts";
 
 describe("peer talk protocol", () => {
   it("validates the peer-message envelope and rejects empty identities", () => {
@@ -143,6 +152,63 @@ describe("peer talk protocol", () => {
     assert.equal(PEER_NAME_POOL.length, 20);
     assert.equal(new Set(PEER_NAME_POOL).size, 20);
     for (const name of currentNames) assert.ok(PEER_NAME_POOL.includes(name as (typeof PEER_NAME_POOL)[number]));
+  });
+
+  it("normalizes peer names for Herdr agent-panel naming", () => {
+    assert.equal(herdrAgentNameFromPeerName("Mark"), "mark");
+    assert.equal(herdrAgentNameFromPeerName("Peanut-2"), "peanut-2");
+    assert.equal(herdrAgentNameFromPeerName("  123 !!!  "), "pi");
+    assert.ok(herdrAgentNameFromPeerName("A".repeat(40)).length <= 32);
+  });
+
+  it("follows Pi and Herdr runtime path overrides", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousHerdrBinary = process.env.HERDR_BIN_PATH;
+    try {
+      process.env.PI_CODING_AGENT_DIR = "~/custom-agent";
+      assert.equal(getAgentConfigDir(), join(homedir(), "custom-agent"));
+      process.env.PI_CODING_AGENT_DIR = pathToFileURL(join(homedir(), "file-agent")).href;
+      assert.equal(getAgentConfigDir(), join(homedir(), "file-agent"));
+      process.env.HERDR_BIN_PATH = "C:\\tools\\herdr.exe";
+      assert.equal(getHerdrBinaryPath(), "C:\\tools\\herdr.exe");
+      delete process.env.HERDR_BIN_PATH;
+      assert.equal(getHerdrBinaryPath(), "herdr");
+    } finally {
+      restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      restoreEnvVar("HERDR_BIN_PATH", previousHerdrBinary);
+    }
+  });
+
+  it("keeps a pane live when it moves tabs but rejects workspace or terminal changes", () => {
+    const peer = { workspaceId: "workspace-1", terminalId: "terminal-1" };
+    assert.equal(herdrPeerIdentityMatches(peer, { workspace_id: "workspace-1", terminal_id: "terminal-1", tab_id: "tab-old" }), true);
+    assert.equal(herdrPeerIdentityMatches(peer, { workspace_id: "workspace-1", terminal_id: "terminal-1", tab_id: "tab-new" }), true, "tab is intentionally not part of liveness identity");
+    assert.equal(herdrPeerIdentityMatches(peer, { workspace_id: "workspace-2", terminal_id: "terminal-1" }), false);
+    assert.equal(herdrPeerIdentityMatches(peer, { workspace_id: "workspace-1", terminal_id: "terminal-2" }), false);
+  });
+
+  it("mirrors only automatic labels for single-pane tabs", () => {
+    assert.equal(
+      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3" }),
+      true,
+    );
+    assert.equal(
+      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 2, label: "3" }),
+      false,
+    );
+    assert.equal(
+      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "editor" }),
+      false,
+    );
+    assert.equal(
+      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3", customName: "3" }),
+      false,
+      "an explicit custom label wins when Herdr exposes the metadata",
+    );
+    assert.equal(
+      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3", customName: null }),
+      true,
+    );
   });
 
   it("picks a deterministic name for the same session and taken set", () => {

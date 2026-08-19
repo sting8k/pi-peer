@@ -48,6 +48,11 @@ type TalkLatest = Static<typeof TalkLatestParams>;
 export type TalkDeps = {
   getCurrentPeer?: typeof getCurrentHerdrPeerContextAsync;
   getPeerStatus?: typeof getHerdrPeerStatusAsync;
+  syncVisibleIdentity?: (
+    peer: HerdrPeerContext,
+    name: string,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
   /** Test seam for the host message-start acknowledgement deadline. */
@@ -75,6 +80,7 @@ type PendingDelivery = {
 // engage a turn before releasing the latch. It is not a delivery deadline;
 // see trackPendingDelivery.
 const TURN_START_TIMEOUT_MS = 10_000;
+const IDENTITY_SYNC_RETRY_DELAY_MS = 1_000;
 const RUNTIME_BIND_SUPERSEDED_MESSAGE = "Peer runtime bind was superseded by a session lifecycle change";
 
 function isExpectedLifecycleCancellation(error: unknown): boolean {
@@ -205,11 +211,12 @@ export function registerTalkTools(
   pi: ExtensionAPI,
   deps: TalkDeps = {},
 ): void {
-  // isBusy/getCurrentPeer/getPeerStatus/rootDir are injectable test/runtime
-  // overrides for deterministic tests; the host feature gate lives only in the
-  // standalone entrypoint (index.ts) via PI_PEER_DISABLED.
+  // isBusy/getCurrentPeer/getPeerStatus/syncVisibleIdentity/rootDir are injectable
+  // test/runtime overrides for deterministic tests; the host feature gate lives
+  // only in the standalone entrypoint (index.ts) via PI_PEER_DISABLED.
   const getCurrentPeer = deps.getCurrentPeer ?? getCurrentHerdrPeerContextAsync;
   const getStatus = deps.getPeerStatus ?? getHerdrPeerStatusAsync;
+  const syncIdentity = deps.syncVisibleIdentity;
   const hasBusyOverride = typeof deps.isBusy === "function";
   // Standalone runtime self-tracks busy through agent_start/agent_settled unless
   // a caller injects an explicit busy function (test/runtime override).
@@ -232,8 +239,8 @@ export function registerTalkTools(
     ? configuredDeliveryAckTimeoutMs
     : TURN_START_TIMEOUT_MS;
   // Session binds are serialized so session_start and an early tool call cannot
-  // race to replace runtime ownership. A generation invalidates stale binds
-  // when the host switches sessions or shuts down.
+  // race to replace runtime ownership. A generation invalidates stale binds and
+  // identity updates when the host switches sessions or shuts down.
   let pendingBinds = 0;
   let bindQueue: Promise<void> = Promise.resolve();
   let lifecycleGeneration = 0;
@@ -245,6 +252,10 @@ export function registerTalkTools(
   // refresh its registration before its artifacts can be removed.
   const deadSince = new Map<string, number>();
   let lastDeadSweepAt = 0;
+  let identitySyncInFlight: Promise<void> | null = null;
+  let identitySyncAbortController: AbortController | null = null;
+  let identitySyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let identitySyncRefreshPending = false;
 
   const contextSessionId = (ctx: any): string | undefined => {
     const sessionId = ctx?.sessionManager?.getSessionId?.();
@@ -354,6 +365,64 @@ export function registerTalkTools(
     bindQueue = result.then(() => undefined, () => undefined);
     void result.then(releaseBind, releaseBind);
     return result;
+  };
+
+  const cancelIdentitySync = (): void => {
+    identitySyncAbortController?.abort();
+    identitySyncAbortController = null;
+    identitySyncInFlight = null;
+    identitySyncRefreshPending = false;
+    if (identitySyncRetryTimer) {
+      clearTimeout(identitySyncRetryTimer);
+      identitySyncRetryTimer = null;
+    }
+  };
+
+  /**
+   * Keep Herdr's visible identity aligned with the stable peer name. This is
+   * attempted at session_start and on every agent_start because Herdr clears
+   * agent names when the foreground process is replaced. Sync failures are
+   * cosmetic and retried once after a short delay.
+   */
+  const syncVisibleIdentity = (current: Runtime, isRetry = false): void => {
+    if (!syncIdentity || !isCurrentRuntime(current)) return;
+    if (identitySyncRetryTimer) {
+      clearTimeout(identitySyncRetryTimer);
+      identitySyncRetryTimer = null;
+    }
+    if (identitySyncInFlight) {
+      identitySyncRefreshPending = true;
+      return;
+    }
+
+    const controller = new AbortController();
+    identitySyncAbortController = controller;
+    const syncRun = Promise.resolve()
+      .then(() => {
+        if (!isCurrentRuntime(current)) return;
+        return syncIdentity(current.peer, current.record.name, controller.signal);
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        console.error("pi-peer Herdr identity sync failed", error);
+        if (isCurrentRuntime(current) && !isRetry && !identitySyncRetryTimer) {
+          identitySyncRetryTimer = setTimeout(() => {
+            identitySyncRetryTimer = null;
+            if (runtime) syncVisibleIdentity(runtime, true);
+          }, IDENTITY_SYNC_RETRY_DELAY_MS);
+          identitySyncRetryTimer.unref?.();
+        }
+      })
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        if (identitySyncAbortController === controller) identitySyncAbortController = null;
+        if (identitySyncInFlight === syncRun) identitySyncInFlight = null;
+        if (identitySyncRefreshPending) {
+          identitySyncRefreshPending = false;
+          if (runtime) syncVisibleIdentity(runtime);
+        }
+      });
+    identitySyncInFlight = syncRun;
   };
 
   /**
@@ -598,12 +667,14 @@ export function registerTalkTools(
     selfBusy = false;
     turnStartPending = false;
     inFlightClaims.clear();
+    cancelIdentitySync();
     void ensureRuntime(ctx, undefined, true)
       .then((current) => {
         if (!isCurrentRuntime(current)) return;
         // Orphaned claims were already reclaimed inside bindRuntime, before this
         // runtime went live. Sweeping again here would release a claim the newly
         // bound host may already hold, redelivering it (see ADR 0013).
+        syncVisibleIdentity(current);
         ctx.ui?.setStatus("pi-peer", `${current.record.name} · ${publicPeerId(current.record.sessionId)}`);
         publishHistoryFromOwnSession(current, ctx);
       })
@@ -620,6 +691,8 @@ export function registerTalkTools(
     // The turn carries whatever non-steer injection triggered it.
     commitTriggeredDeliveries();
     if (!hasBusyOverride) selfBusy = true;
+    // Refresh the visible identity after Herdr observes Pi as foreground.
+    if (runtime && isCurrentRuntime(runtime)) syncVisibleIdentity(runtime);
   });
   pi.on("message_start", (event, ctx) => {
     if (!eventBelongsToLifecycle(ctx)) return;
@@ -659,6 +732,7 @@ export function registerTalkTools(
     for (const pending of pendingDeliveries.values()) clearTimeout(pending.timer);
     pendingDeliveries.clear();
     inFlightClaims.clear();
+    cancelIdentitySync();
     if (runtime) {
       // Remove the owned registration (the authoritative liveness signal);
       // inbox/latest artifacts are not lifecycle-owned and are left for the

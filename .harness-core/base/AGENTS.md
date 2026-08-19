@@ -1,7 +1,5 @@
 # Agent Instructions
 
-Add project-specific agent instructions here.
-
 <!-- HARNESS:BEGIN -->
 ## Harness
 

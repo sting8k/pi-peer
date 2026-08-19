@@ -229,7 +229,19 @@ export function getCurrentLineageEntries<T extends SessionEntry>(entries: T[]): 
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+  const entries: SessionEntry[] = [];
+  for (const line of lines.slice(afterLine)) {
+    // A session file is appended to while it is read, so the trailing line can be
+    // a partial write, and an editor can leave a BOM on the first line. Skipping
+    // the unusable line keeps the rest of the transcript publishable; failing the
+    // whole read makes talk_latest silently empty.
+    try {
+      entries.push(JSON.parse(line.trim()) as SessionEntry);
+    } catch {
+      continue;
+    }
+  }
+  return entries;
 }
 
 export function readHistory(root: string, sessionId: string): LatestPeerHistory {

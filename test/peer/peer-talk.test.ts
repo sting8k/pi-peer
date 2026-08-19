@@ -35,6 +35,7 @@ import {
   entriesToTalkEvents,
   extractEventsFromMessage,
   getCurrentLineageEntries,
+  getNewEntries,
   isLatestPeerHistory,
   isTalkEvent,
   publishHistory,
@@ -527,6 +528,47 @@ describe("peer talk protocol", () => {
     const lineage = getCurrentLineageEntries(entries);
     assert.deepEqual(lineage.map((e) => e.id), ["root", "u1", "a1"], "leaf id at end keeps the full current lineage");
     assert.deepEqual(entriesToTalkEvents(lineage).map((e) => e.message), ["Hi", "Hello"]);
+  });
+
+  it("getNewEntries skips a truncated trailing line but keeps every complete earlier entry", () => {
+    const root = createTestDir();
+    try {
+      const sessionFile = join(root, "session.jsonl");
+      const complete = [
+        { type: "session", id: "root" },
+        { type: "message", id: "u1", parentId: "root", message: { role: "user", content: "Hi" } },
+      ];
+      const raw = complete.map((e) => JSON.stringify(e)).join("\n") + "\n" + `{"type":"message","id":"a1","parentI`;
+      writeFileSync(sessionFile, raw);
+      const parsed = getNewEntries(sessionFile, 0);
+      assert.deepEqual(parsed.map((e: any) => e.id), ["root", "u1"], "complete lines survive a truncated trailing write");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("getNewEntries parses the first entry despite a UTF-8 BOM on its line", () => {
+    const root = createTestDir();
+    try {
+      const sessionFile = join(root, "session.jsonl");
+      const bomLine = "\uFEFF" + JSON.stringify({ type: "session", id: "root" });
+      writeFileSync(sessionFile, bomLine + "\n");
+      const parsed = getNewEntries(sessionFile, 0);
+      assert.deepEqual(parsed.map((e: any) => e.id), ["root"], "BOM-prefixed first line still parses");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("getNewEntries returns an empty array rather than throwing when every line is unparsable", () => {
+    const root = createTestDir();
+    try {
+      const sessionFile = join(root, "session.jsonl");
+      writeFileSync(sessionFile, "not json\n{also not json\n");
+      assert.deepEqual(getNewEntries(sessionFile, 0), []);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects stale v1 artifacts with thinking so no stale thinking appears before the next rebuild", () => {

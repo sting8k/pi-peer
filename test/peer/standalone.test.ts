@@ -1,11 +1,11 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
 import { getTalkRootDir } from "../../pi-extension/pi-peer/herdr.ts";
-import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
+import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, POLL_MS, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
 import { createMockExtensionApi, createTestDir, restoreEnvVar, importSpecifiers } from "./helpers.ts";
@@ -82,7 +82,7 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(evil.includes("/../"), false, "must not contain a traversal segment");
       const slashTraversal = getTalkRootDir("../evil");
       assert.equal(slashTraversal, join(base, ".._evil"), "slash must be collapsed into one safe segment");
-      assert.equal(slashTraversal.startsWith(base + "/"), true, "must stay inside the namespace");
+      assert.equal(slashTraversal.startsWith(base + sep), true, "must stay inside the namespace");
     } finally {
       restoreEnvVar("PI_CODING_AGENT_DIR", prev);
       rmSync(dir, { recursive: true, force: true });
@@ -102,11 +102,11 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any, options?: any) {
+      sendUserMessage(content: any, options?: any) {
         sentMessages.push({ content, options });
       },
     };
-    // No isBusy override: the standalone runtime must self-track via agent_start/agent_end.
+    // No isBusy override: the standalone runtime must self-track via agent_start/agent_settled.
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
         paneId: "pane-standalone", terminalId: "terminal-s", tabId: "tab-s",
@@ -135,17 +135,21 @@ describe("pi-peer standalone runtime", () => {
       assert.match(sentMessages[0].content, /peer_id=/, "sends a public peer id");
       assert.deepEqual(sentMessages[0].options, { deliverAs: "steer" }, "busy message steered mid-turn");
       assert.equal(existsSync(join(inbox, "msg-busy.json")), false, "message claimed after delivery");
+      for (const handler of handlers.get("message_start") ?? []) handler({
+        type: "message_start",
+        message: { role: "user", content: [{ type: "text", text: sentMessages[0].content }] },
+      }, ctx);
       // F2: the claim is kept in-flight (at-least-once) until the turn completes.
-      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), true, "claim kept until agent_end (F2)");
+      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), true, "claim kept until agent_settled (F2)");
       // QUEUE UX: an in-flight `.processing` claim is not counted as queued.
       const sessionsInFlight = await tools.get("talk_sessions").execute("s", {}, undefined, undefined, ctx);
       assert.doesNotMatch(sessionsInFlight.content[0].text, /\([0-9]+ queued\)/, "in-flight claim is not counted as queued");
 
-      // Peer goes idle: agent_end fires; a later message is a fresh user turn.
-      for (const handler of handlers.get("agent_end") ?? []) handler({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] }, ctx);
+      // Peer settles: a later message is a fresh user turn.
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctx);
       await new Promise((resolve) => setTimeout(resolve, 20));
-      // F2: agent_end consumes the in-flight claim for the steered message.
-      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), false, "claim consumed at agent_end");
+      // F2: agent_settled consumes the in-flight claim for the steered message.
+      assert.equal(existsSync(join(inbox, "msg-busy.json.processing")), false, "claim consumed at agent_settled");
       writeFileSync(join(inbox, "msg-idle.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Idle me.")));
       // QUEUE UX: only a still-queued `.json` message shows as `(1 queued)`.
       const sessionsQueued = await tools.get("talk_sessions").execute("s", {}, undefined, undefined, ctx);
@@ -159,7 +163,132 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
-  it("agent_end emits no automatic reply and never creates waiter/reply artifacts", async () => {
+  it("handles Pi's void sendUserMessage contract through message_start and agent_settled", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-void-send";
+    const ctx = {
+      cwd: "/work/void-send",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any, options?: any) {
+        sentMessages.push({ content, options });
+        // Match Pi's real ExtensionAPI contract: this deliberately returns void.
+      },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-void-send", terminalId: "term-void-send", tabId: "tab-void-send",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle" as const,
+      rootDir: () => root,
+      deliveryAckTimeoutMs: 500,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "void-send registration");
+      const inbox = inboxDir(root, sessionId);
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "msg-void.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Void API.")));
+      await waitUntil(() => sentMessages.length === 1, "void send invoked");
+      assert.equal(existsSync(join(inbox, "msg-void.json.processing")), true, "void return is not treated as delivery acknowledgement");
+
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctx);
+      for (const handler of handlers.get("message_start") ?? []) handler({
+        type: "message_start",
+        message: { role: "user", content: [{ type: "text", text: sentMessages[0].content }] },
+      }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-void.json.processing")), true, "message_start keeps the claim through the run");
+
+      // agent_end is deliberately not the settlement boundary.
+      for (const handler of handlers.get("agent_end") ?? []) handler({ type: "agent_end" }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-void.json.processing")), true, "agent_end does not consume the claim");
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-void.json.processing")), false, "agent_settled consumes the acknowledged claim");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requeues a void injection when message_start never arrives", async () => {
+    const root = createTestDir();
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-no-ack";
+    const ctx = {
+      cwd: "/work/no-ack",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: string) {
+        sentMessages.push(content);
+      },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-no-ack", terminalId: "term-no-ack", tabId: "tab-no-ack",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle" as const,
+      rootDir: () => root,
+      deliveryAckTimeoutMs: 30,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "no-ack registration");
+      const inbox = inboxDir(root, sessionId);
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "msg-no-ack.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "No acknowledgement.")));
+
+      await waitUntil(() => sentMessages.length === 1, "void send invoked");
+
+      // The host never engaged a turn. The claim must NOT be handed back to the
+      // live host: it may still be in flight inside it, and redelivering would
+      // duplicate the message. It stays claimed for session_start to recover.
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS + 100));
+      assert.equal(existsSync(join(inbox, "msg-no-ack.json.processing")), true, "claim retained for restart recovery");
+      assert.equal(existsSync(join(inbox, "msg-no-ack.json")), false, "claim not requeued into the live host");
+      assert.equal(sentMessages.length, 1, "no duplicate redelivery");
+
+      // The turn latch is released, so delivery is not blocked forever.
+      writeFileSync(join(inbox, "msg-later.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Later message.")));
+      await waitUntil(() => sentMessages.length === 2, "latch released so later messages still flow", 1_000);
+      assert.match(sentMessages[1], /Later message\./);
+
+      // The later message engages its own turn. Only that message's claim is
+      // committed: the abandoned one belongs to a turn the host never started,
+      // so agent_settled must not consume it along with the turn's own claim.
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctx);
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-later.json.processing")), false, "the turn consumes its own claim");
+      assert.equal(existsSync(join(inbox, "msg-no-ack.json.processing")), true, "an unrelated turn never destroys the abandoned claim");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("agent settlement emits no automatic reply and never creates waiter/reply artifacts", async () => {
     const root = createTestDir();
     const sentMessages: Array<{ content: any; options?: any }> = [];
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -176,7 +305,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any, options?: any) {
+      sendUserMessage(content: any, options?: any) {
         sentMessages.push({ content, options });
       },
     };
@@ -198,10 +327,14 @@ describe("pi-peer standalone runtime", () => {
       writeFileSync(join(inbox, "msg-only.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "No reply expected.")));
       await waitUntil(() => sentMessages.length === 1, "inbound delivered");
       assert.match(sentMessages[0].content, /No reply expected\./);
+      for (const handler of handlers.get("message_start") ?? []) handler({
+        type: "message_start",
+        message: { role: "user", content: [{ type: "text", text: sentMessages[0].content }] },
+      }, ctx);
 
-      // agent_end produces no automatic reply and no peer_pong/waiter/replies.
-      for (const handler of handlers.get("agent_end") ?? []) {
-        handler({ messages: [{ role: "assistant", content: [{ type: "text", text: "My own answer" }] }] }, ctx);
+      // Agent settlement produces no automatic reply and no peer_pong/waiter/replies.
+      for (const handler of handlers.get("agent_settled") ?? []) {
+        handler({ type: "agent_settled" }, ctx);
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
       assert.equal(sentMessages.filter((m) => m.content.startsWith("<peer_pong")).length, 0, "no peer_pong ever sent");
@@ -232,7 +365,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any) {
+      sendUserMessage(content: any) {
         injectAttempts++;
         if (injectAttempts === 1) throw new Error("simulated injection failure");
         sentMessages.push(content);
@@ -290,7 +423,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage() {},
+      sendUserMessage() {},
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -315,6 +448,149 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("coalesces a session_start bind with an early tool call", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    let getPeerCalls = 0;
+    let releaseBind: (() => void) | undefined;
+    const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+    const ctx: any = {
+      cwd: "/work/coalesced-bind",
+      sessionManager: {
+        getSessionId: () => "session-coalesced-bind",
+        getSessionFile: () => join(root, "transcripts", "session-coalesced-bind.jsonl"),
+      },
+    };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => {
+        getPeerCalls++;
+        await bindGate;
+        return {
+          paneId: "pane-coalesced", terminalId: "term-coalesced", tabId: "tab-coalesced",
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        };
+      },
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctx);
+      await waitUntil(() => getPeerCalls === 1, "first bind to start");
+      const toolCall = tools.get("talk_sessions").execute("call", {}, undefined, undefined, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(getPeerCalls, 1, "the early tool call shares the session_start bind");
+      releaseBind?.();
+      await toolCall;
+    } finally {
+      releaseBind?.();
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates a pending bind on shutdown instead of registering after exit", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    let releaseBind: (() => void) | undefined;
+    const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+    const ctx: any = {
+      cwd: "/work/cancelled-bind",
+      sessionManager: {
+        getSessionId: () => "session-cancelled-bind",
+        getSessionFile: () => join(root, "transcripts", "session-cancelled-bind.jsonl"),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => {
+        await bindGate;
+        return {
+          paneId: "pane-cancelled", terminalId: "term-cancelled", tabId: "tab-cancelled",
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        };
+      },
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctx);
+      releaseBind?.();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(existsSync(recordPath(root, "session-cancelled-bind")), false, "cancelled bind writes no registration");
+    } finally {
+      releaseBind?.();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shutdown during a session switch cancels the pending replacement bind", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    let getPeerCalls = 0;
+    let releaseBind: (() => void) | undefined;
+    const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+    const ctx = (sessionId: string) => ({
+      cwd: `/work/${sessionId}`,
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    });
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => {
+        getPeerCalls++;
+        if (getPeerCalls === 2) await bindGate;
+        return {
+          paneId: "pane-switch-shutdown", terminalId: "term-switch-shutdown", tabId: "tab-switch-shutdown",
+          socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+        };
+      },
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    const ctxA = ctx("session-switch-A");
+    const ctxB = ctx("session-switch-B");
+    try {
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctxA);
+      await waitUntil(() => existsSync(recordPath(root, "session-switch-A")), "session A registration");
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, ctxB);
+      await waitUntil(() => getPeerCalls === 2, "session B bind to start");
+
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctxB);
+      releaseBind?.();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(existsSync(recordPath(root, "session-switch-B")), false, "shutdown B prevents its pending bind");
+      assert.equal(existsSync(recordPath(root, "session-switch-A")), false, "shutdown removes the previous runtime registration");
+    } finally {
+      releaseBind?.();
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown" }, ctxB);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("session_start reuses a persisted friendly name for the same session", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -331,7 +607,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage() {},
+      sendUserMessage() {},
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -365,7 +641,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage() {},
+      sendUserMessage() {},
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -408,7 +684,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any) { sentMessages.push(content); },
+      sendUserMessage(content: any) { sentMessages.push(content); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -430,8 +706,10 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(inbox, "msg-orphan.json")), false, "no residual queued file");
       // F2: the reclaimed claim is kept in-flight until the turn completes.
       assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), true, "reclaimed claim kept in-flight (F2)");
-      for (const handler of handlers.get("agent_end") ?? []) handler({ type: "agent_end" }, ctx);
-      assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), false, "claim consumed at agent_end");
+      // The host engages the turn the injection triggered, then settles it.
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctx);
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctx);
+      assert.equal(existsSync(join(inbox, "msg-orphan.json.processing")), false, "claim consumed at agent_settled");
     } finally {
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });
@@ -445,8 +723,8 @@ describe("pi-peer standalone runtime", () => {
       await waitUntil(() => existsSync(join(fixture.root, "sessions", "session-A.json")), "session A registration to appear");
 
       fixture.fireSessionStart(fixture.ctxB);
-      // Registration B is written before A's owned record is removed, so B's
-      // existence implies the ownership transfer has already run.
+      // Session A's owned record is removed before the replacement bind, and
+      // B's existence confirms the new runtime is registered.
       await waitUntil(() => existsSync(join(fixture.root, "sessions", "session-B.json")), "session B registration to appear");
       assert.equal(existsSync(join(fixture.root, "sessions", "session-A.json")), false, "A owned registration removed after switch");
     } finally {
@@ -532,7 +810,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any) { sentMessages.push(content); },
+      sendUserMessage(content: any) { sentMessages.push(content); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -585,7 +863,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) {
         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
       },
-      async sendUserMessage(content: any) { sentMessages.push(content); },
+      sendUserMessage(content: any) { sentMessages.push(content); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({
@@ -624,7 +902,7 @@ describe("pi-peer standalone runtime", () => {
     const api: any = {
       registerTool() {},
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({ paneId: "pane-f1", terminalId: "terminal-f", tabId: "tab-f", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
@@ -642,8 +920,10 @@ describe("pi-peer standalone runtime", () => {
       writeFileSync(join(inbox, "m2.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "Second.")));
       await waitUntil(() => sentMessages.length === 1, "first message drains as a fresh trigger turn");
       assert.equal(sentMessages[0].options, undefined, "first message is a fresh user turn");
-      // F1: the triggered turn is pending (agent_start not yet seen); m2 must NOT drain.
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      // F1: the triggered turn is pending (agent_start not yet seen); m2 must NOT
+      // drain. The window must outlast a poll tick, otherwise a missing latch is
+      // indistinguishable from a tick that simply has not fired yet.
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS + 100));
       assert.equal(sentMessages.length, 1, "no second message drained while turnStartPending");
       assert.equal(existsSync(join(inbox, "m2.json")), true, "m2 stays queued");
       // agent_start engages the turn; the next tick steers m2 rather than opening a second plain turn.
@@ -656,7 +936,7 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
-  it("keeps a fresh-trigger claim in-flight until agent_start/agent_end (F2)", async () => {
+  it("keeps a fresh-trigger claim in-flight until agent_start/agent_settled (F2)", async () => {
     const root = createTestDir();
     const sentMessages: Array<{ content: any; options?: any }> = [];
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -665,7 +945,7 @@ describe("pi-peer standalone runtime", () => {
     const api: any = {
       registerTool() {},
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({ paneId: "pane-f2a", terminalId: "terminal-2", tabId: "tab-2", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
@@ -683,18 +963,18 @@ describe("pi-peer standalone runtime", () => {
       await waitUntil(() => sentMessages.length === 1, "message drains as a fresh trigger turn");
       claim = join(inbox, "m1.json.processing");
       assert.equal(existsSync(claim), true, "claim kept while the turn is pending (F2)");
-      // No agent_start: the claim must persist across several poll ticks.
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      // No agent_start: the claim must persist across a full poll tick.
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS + 100));
       assert.equal(existsSync(claim), true, "claim still in-flight with a delayed agent_start");
     } finally {
-      // Shutdown without agent_end leaves the unconsumed claim recoverable on disk.
+      // Shutdown without agent_settled leaves the unconsumed claim recoverable on disk.
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       assert.equal(existsSync(claim), true, "unconsumed claim left on disk after shutdown");
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("requeues an orphaned claim on session rebind when agent_end was missed (F2)", async () => {
+  it("requeues an orphaned claim on session rebind when agent_settled was missed (F2)", async () => {
     const root = createTestDir();
     const sentMessages: Array<{ content: any; options?: any }> = [];
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -703,7 +983,7 @@ describe("pi-peer standalone runtime", () => {
     const api: any = {
       registerTool() {},
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({ paneId: "pane-f2d", terminalId: "terminal-3", tabId: "tab-3", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
@@ -719,7 +999,7 @@ describe("pi-peer standalone runtime", () => {
       writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", sessionId, "Rebind.")));
       await waitUntil(() => sentMessages.length === 1, "message drains and is claimed");
       assert.equal(existsSync(join(inbox, "m1.json.processing")), true, "claim in-flight");
-      // Miss agent_end: session shuts down and rebinds.
+      // Miss agent_settled: session shuts down and rebinds.
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "reload" }, ctx);
       for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctx);
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -740,7 +1020,7 @@ describe("pi-peer standalone runtime", () => {
     const api: any = {
       registerTool() {},
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
     registerTalkTools(api, {
       getCurrentPeer: async () => ({ paneId: "pane-sw2", terminalId: "terminal-sw", tabId: "tab-sw", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
@@ -758,7 +1038,7 @@ describe("pi-peer standalone runtime", () => {
       writeFileSync(join(inboxA, "m1.json"), JSON.stringify(peerMessage("s1", "sender", "session-SW-A", "Hello A.")));
       await waitUntil(() => sentMessages.length === 1, "A message drains and is claimed");
       assert.equal(existsSync(join(inboxA, "m1.json.processing")), true, "A claim in-flight");
-      // Switch to B without an agent_end or shutdown for A.
+      // Switch to B without an agent_settled or shutdown for A.
       for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctxB);
       // The claim tracked for A is requeued synchronously at session start, not stranded.
       assert.equal(existsSync(join(inboxA, "m1.json.processing")), false, "A claim not stranded as .processing");
@@ -779,7 +1059,7 @@ describe("pi-peer standalone runtime", () => {
     const api: any = {
       registerTool() {},
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-      async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
     registerTalkTools(api, {
       // First bind is immediate; the second (A->B) is deliberately slower than
@@ -819,6 +1099,91 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(root, "sessions", "session-BIND-A.json")), false, "A owned registration removed");
     } finally {
       for (const h of handlers.get("session_shutdown") ?? []) h({ type: "session_shutdown", reason: "quit" }, ctxB);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores agent_start and session_shutdown from a superseded session", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-stale", terminalId: "terminal-st", tabId: "tab-st", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    const ctxOld = { cwd: "/work/old", sessionManager: { getSessionId: () => "session-STALE-OLD", getSessionFile: () => join(root, "transcripts", "session-STALE-OLD.jsonl") } };
+    const ctxNew = { cwd: "/work/new", sessionManager: { getSessionId: () => "session-STALE-NEW", getSessionFile: () => join(root, "transcripts", "session-STALE-NEW.jsonl") } };
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctxOld);
+      await waitUntil(() => existsSync(join(root, "sessions", "session-STALE-OLD.json")), "old registration to appear");
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctxNew);
+      await waitUntil(() => existsSync(join(root, "sessions", "session-STALE-NEW.json")), "new registration to appear");
+      // Late events carrying the superseded session's id must not touch the
+      // live runtime: they belong to a lifecycle that no longer owns it.
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctxOld);
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctxOld);
+      assert.equal(existsSync(join(root, "sessions", "session-STALE-NEW.json")), true, "a stale shutdown must not remove the live registration");
+      const inbox = join(root, "inbox", "session-STALE-NEW");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", "session-STALE-NEW", "Still alive.")));
+      await waitUntil(() => sentMessages.length === 1, "polling to survive a stale shutdown");
+      assert.equal(sentMessages[0].options, undefined, "a stale agent_start must not mark the live runtime busy");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctxNew);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a stale agent_settled and keeps the live session's in-flight claim", async () => {
+    const root = createTestDir();
+    const sentMessages: Array<{ content: any; options?: any }> = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "pane-stale2", terminalId: "terminal-st2", tabId: "tab-st2", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    const ctxOld = { cwd: "/work/old", sessionManager: { getSessionId: () => "session-SETTLE-OLD", getSessionFile: () => join(root, "transcripts", "session-SETTLE-OLD.jsonl") } };
+    const ctxNew = { cwd: "/work/new", sessionManager: { getSessionId: () => "session-SETTLE-NEW", getSessionFile: () => join(root, "transcripts", "session-SETTLE-NEW.jsonl") } };
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctxOld);
+      await waitUntil(() => existsSync(join(root, "sessions", "session-SETTLE-OLD.json")), "old registration to appear");
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "reload" }, ctxNew);
+      await waitUntil(() => existsSync(join(root, "sessions", "session-SETTLE-NEW.json")), "new registration to appear");
+      const inbox = join(root, "inbox", "session-SETTLE-NEW");
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "m1.json"), JSON.stringify(peerMessage("s1", "sender", "session-SETTLE-NEW", "Claimed.")));
+      await waitUntil(() => sentMessages.length === 1, "message to drain for the live session");
+      const claim = join(inbox, "m1.json.processing");
+      assert.equal(existsSync(claim), true, "claim in-flight for the live session");
+      for (const handler of handlers.get("agent_start") ?? []) handler({ type: "agent_start" }, ctxNew);
+      for (const handler of handlers.get("message_start") ?? []) {
+        handler({ type: "message_start", message: { role: "user", content: sentMessages[0].content } }, ctxNew);
+      }
+      // A late settlement from the superseded session must neither consume nor
+      // requeue the live session's acknowledged claim.
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctxOld);
+      assert.equal(existsSync(claim), true, "a stale agent_settled must not consume the live claim");
+      assert.equal(existsSync(join(inbox, "m1.json")), false, "a stale agent_settled must not requeue the live claim");
+      // The owning session's settlement still consumes the claim exactly once.
+      for (const handler of handlers.get("agent_settled") ?? []) handler({ type: "agent_settled" }, ctxNew);
+      assert.equal(existsSync(claim), false, "the owning session's settlement consumes the claim");
+      assert.equal(existsSync(join(inbox, "m1.json")), false, "a consumed message is not requeued");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctxNew);
       rmSync(root, { recursive: true, force: true });
     }
   });

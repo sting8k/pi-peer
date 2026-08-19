@@ -21,7 +21,7 @@ export function safeKey(value: string): string {
   return sanitized;
 }
 
-export function readJson(path: string): any | null {
+export function readJson(path: string): unknown {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch {

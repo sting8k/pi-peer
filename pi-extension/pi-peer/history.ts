@@ -195,9 +195,11 @@ export function entriesToTalkEvents(entries: SessionEntry[]): TalkEvent[] {
 export function getCurrentLineageEntries<T extends SessionEntry>(entries: T[]): T[] {
   const entriesById = new Map<string, T>();
   for (const entry of entries) {
-    if (typeof entry.id === "string" && entry.id.trim()) {
-      entriesById.set(entry.id, entry);
-    }
+    if (typeof entry.id !== "string" || !entry.id.trim()) continue;
+    // Duplicate ids make parent links ambiguous. Publishing either branch
+    // would be less safe than suppressing the snapshot entirely.
+    if (entriesById.has(entry.id)) return [];
+    entriesById.set(entry.id, entry);
   }
 
   // Newest entry with a usable id present in the map is the lineage leaf.
@@ -250,8 +252,8 @@ export function publishHistory(runtime: HistoryRuntime, events: TalkEvent[]): vo
 
 /**
  * Rebuild the bounded history from the peer's own current lineage on
- * startup/resume and on `agent_end` (entries are persisted before the end
- * event), so ids are stable and there is no duplicate risk. Always replaces,
+ * startup/resume and on `agent_settled` (entries are persisted before the
+ * settled event), so ids are stable and there is no duplicate risk. Always replaces,
  * so an empty current lineage clears a stale history.
  */
 export function publishHistoryFromOwnSession(runtime: HistoryRuntime, ctx: any): void {

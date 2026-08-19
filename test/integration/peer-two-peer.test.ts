@@ -1,10 +1,10 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
-import { inboxDir, nowIso } from "../../pi-extension/pi-peer/protocol.ts";
+import { inboxDir, nowIso, POLL_MS } from "../../pi-extension/pi-peer/protocol.ts";
 import { createTestDir } from "../peer/helpers.ts";
 
 function waitUntil(predicate: () => boolean, message: string, timeoutMs = 4_000): Promise<void> {
@@ -49,7 +49,7 @@ function createPeer(
     on(name: string, handler: (...args: any[]) => any) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
-    async sendUserMessage(content: any, options?: any) {
+    sendUserMessage(content: any, options?: any) {
       assert.equal(typeof content, "string", "inbound content must be a string");
       sentMessages.push({ content, options });
     },
@@ -245,6 +245,60 @@ describe("peer two-peer lifecycle (async chat)", () => {
     }
   });
 
+  it("talk_to and talk_latest refuse to target the current session", async () => {
+    const root = createTestDir();
+    const peerStatuses = new Map<string, PeerStatus>();
+    const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
+    const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
+    try {
+      startPeers([sender, receiver], root);
+      await waitUntil(() => existsSync(join(root, "sessions", "session-alpha.json")), "sender registration");
+      const ownRecord = JSON.parse(readFileSync(join(root, "sessions", "session-alpha.json"), "utf8")) as { name: string };
+      // The sender owns a non-empty history, so a missing self-guard would
+      // succeed (self-send / self-read) instead of failing for another reason.
+      mkdirSync(join(root, "latest"), { recursive: true });
+      writeFileSync(join(root, "latest", "session-alpha.json"), JSON.stringify({
+        version: 2,
+        type: "latest",
+        sessionId: "session-alpha",
+        events: [{ type: "user", id: "own-1", createdAt: "2024-01-01T00:00:00.000Z", message: "own note" }],
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      }));
+
+      // Self-targeting is rejected by public peer id and by display name.
+      await assert.rejects(
+        sender.tools.get("talk_to").execute("self-id", { target: "peer-pha", message: "note to self" }, undefined, undefined, sender.ctx),
+        /talk_to cannot target the current session/,
+        "talk_to must refuse the current session addressed by public peer id",
+      );
+      await assert.rejects(
+        sender.tools.get("talk_to").execute("self-name", { target: ownRecord.name, message: "note to self" }, undefined, undefined, sender.ctx),
+        /talk_to cannot target the current session/,
+        "talk_to must refuse the current session addressed by display name",
+      );
+      await assert.rejects(
+        sender.tools.get("talk_latest").execute("self-latest", { target: "peer-pha", count: 1 }, undefined, undefined, sender.ctx),
+        /talk_latest cannot target the current session/,
+        "talk_latest must refuse to read the current session's own history",
+      );
+
+      // Nothing was enqueued for, or injected into, the sender itself.
+      const ownInbox = inboxDir(root, "session-alpha");
+      const ownQueued = existsSync(ownInbox) ? readdirSync(ownInbox) : [];
+      assert.deepEqual(ownQueued, [], "a rejected self-send must not enqueue anything in the sender's own inbox");
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS + 100));
+      assert.equal(sender.sentMessages.length, 0, "the sender must never receive its own message");
+
+      // The guard is scoped to the current session: a real peer still works.
+      const sent = await sender.tools.get("talk_to").execute("peer", { target: "peer-eta", message: "Hello B" }, undefined, undefined, sender.ctx);
+      assert.equal(sent.details.state, "sent");
+      await waitUntil(() => receiver.sentMessages.length === 1, "a legitimate peer target is still delivered");
+    } finally {
+      stopPeers([sender, receiver]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("talk_latest still shows both sides of the chat coherently", async () => {
     const root = createTestDir();
     const peerStatuses = new Map<string, PeerStatus>();
@@ -259,15 +313,16 @@ describe("peer two-peer lifecycle (async chat)", () => {
       await waitUntil(() => receiver.sentMessages.length === 1, "B received A's message");
 
       // Populate B's session file with the inbound message (user) and B's reply
-      // (assistant), then fire agent_end so B publishes its history.
+      // (assistant), then fire agent_settled so B publishes its history after
+      // all retries and queued work have finished.
       const bTag = receiver.sentMessages[0].content;
       writeFileSync(receiver.ctx.sessionManager.getSessionFile(), [
         { type: "session", id: "root-beta" },
         { type: "message", id: "u-q", parentId: "root-beta", timestamp: "2024-01-01T00:00:01.000Z", message: { role: "user", content: bTag } },
         { type: "message", id: "a-q", parentId: "u-q", timestamp: "2024-01-01T00:00:02.000Z", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "B's answer" }] } },
       ].map((e) => JSON.stringify(e)).join("\n") + "\n");
-      for (const handler of receiver.handlers.get("agent_end") ?? []) {
-        handler({ messages: [{ role: "assistant", content: [{ type: "text", text: "B's answer" }] }] }, receiver.ctx);
+      for (const handler of receiver.handlers.get("agent_settled") ?? []) {
+        handler({ type: "agent_settled" }, receiver.ctx);
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
 

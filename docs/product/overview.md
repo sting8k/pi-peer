@@ -1,7 +1,7 @@
 # Product Overview — pi-peer
 
 **pi-peer** is a standalone Pi coding-agent extension that enables peer-to-peer
-chat between independently running Pi sessions inside a HerdR workspace. It is
+chat between independently running Pi sessions inside a Herdr workspace. It is
 symmetric, natural chat between equal agents — not RPC or task delegation to a
 subagent.
 
@@ -20,14 +20,20 @@ no slash commands, no widgets. The product contract is defined here, in
 │  talk_sessions           │ ◄──────► │  talk_sessions           │
 │  pi-peer/talk/<ws>       │  +history│  pi-peer/talk/<ws>       │
 └──────────────────────────┘          └──────────────────────────┘
-                shared HerdR workspace (HERDR_SOCKET_PATH)
+                shared Herdr workspace (HERDR_SOCKET_PATH)
 ```
+
+Each session keeps a stable friendly peer name. The Pi footer shows that name
+with its public peer id, and the Herdr agent panel uses the lowercase name so
+multiple Pi panes are easy to distinguish. If the current tab contains only
+that pane and still has its automatic number label, the tab is mirrored to the
+same name. Herdr currently exposes numeric custom labels the same way as automatic labels, so a manually named numeric-only tab cannot be distinguished and may be mirrored. Herdr name conflicts receive a deterministic short suffix.
 
 ## Tools
 
 | Tool | Purpose | Parameters |
 | --- | --- | --- |
-| `talk_sessions` | List live peers in the current HerdR workspace. | none |
+| `talk_sessions` | List live peers in the current Herdr workspace. | none |
 | `talk_latest` | Read the N most recent **completed** events a peer published. | `target` (required), `count` (1–10, default 1) |
 | `talk_to` | Send a chat message to a peer; returns **delivery confirmation only**. | `target` (required), `message` (required) |
 
@@ -53,12 +59,15 @@ is a presentation-only alias derived by one central formatter.
   messages sharing a creation timestamp have a deterministic filename order,
   but no global enqueue order is claimed.
 - **Reply.** A reply is simply another `talk_to` in the opposite direction,
-  which wakes (idle) or steers (busy) the original sender the same way. Nothing
-  waits for a turn boundary. Durability is recoverable at-least-once: a failed
-  injection is requeued, and orphaned `.processing` claims are reclaimed on
+  which wakes (idle) or steers (busy) the original sender the same way. Pi's
+  fire-and-forget `sendUserMessage` is acknowledged by `message_start`; claims
+  are consumed only at `agent_settled`. Durability is recoverable at-least-once:
+  a synchronously failed injection is requeued immediately, while an
+  unacknowledged one keeps its claim rather than being handed back to a host
+  that may still hold it. Orphaned `.processing` claims are reclaimed on
   reload/rebind and at startup, so a host-accepted-but-unconsumed message is
   recoverable through the host turn — not proof the model consumed it.
-- **No RPC state machine.** There is no automatic `agent_end` reply, no waiter,
+- **No RPC state machine.** There is no automatic `agent_end`/`agent_settled` reply, no waiter,
   no response file, and no `<peer_pong>`. The conversation is carried by plain
   inbound messages; the agents' own turns give it structure.
 - **History.** Bounded (max 10 events) per-peer history of **completed**
@@ -77,14 +86,14 @@ is a presentation-only alias derived by one central formatter.
 
 | Requirement | Value |
 | --- | --- |
-| Pi | `@earendil-works/pi-coding-agent` extension API (peer dependency). |
-| HerdR | Active pane per session: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`. |
+| Pi | `@earendil-works/pi` / `@earendil-works/pi-coding-agent` extension API, `>=0.84.2` (peer dependency). |
+| Herdr | Active pane per session: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`. |
 | Agent dir | `PI_CODING_AGENT_DIR` or `~/.pi/agent`; storage under `pi-peer/talk/<workspace-id>/`. |
 | Opt-out | `PI_PEER_DISABLED=1`. |
 
 ## Validation
 
-The executable proof is `npm test` (52 tests, 3 suites), `npm run test:focused`
-(46 unit tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
+The executable proof is `npm test` (64 tests, 3 suites), `npm run test:focused`
+(58 unit/lifecycle tests), `npm run test:integration` (6 mocked two-peer lifecycle tests),
 and `npm run typecheck` (clean). See `docs/TEST_MATRIX.md` for the acceptance
 matrix.

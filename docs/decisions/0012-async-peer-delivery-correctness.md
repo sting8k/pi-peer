@@ -4,91 +4,101 @@ Date: 2026-08-01
 
 ## Status
 
-Accepted
+Accepted; the F2 acknowledgement-deadline rule is superseded by
+`0013-never-requeue-into-a-live-host.md`. Requeueing an unacknowledged injection
+into a live host duplicates a message the host still holds, because
+acknowledgement latency is unbounded by design. The F1 latch, the
+`agent_settled` boundary, and the void-`sendUserMessage` finding below stand.
 
 ## Context
 
-`0011-standalone-pi-peer-extension.md` and the `feat: make talk_to send-only async
-symmetric peer chat` change made `talk_to` a fire-and-forget send: it writes a
-durable message to the peer's mailbox and returns a confirmation that the message
-was sent, with the peer's reply arriving later as a new `<peer_message>`. A poll
-interval drains the peer's inbox one message per tick.
+`0011-standalone-pi-peer-extension.md` and the async-chat redesign made
+`talk_to` a fire-and-forget send: it writes a durable message to the peer's
+mailbox and returns delivery confirmation, with the peer's reply arriving later
+as a new `<peer_message>`. A poll interval drains the peer's inbox one message
+per tick.
 
-Review surfaced two correctness gaps in that design:
+Review against the Pi `0.84.2` extension contract found three lifecycle facts
+that the runtime must follow:
 
-1. **F1 idle-burst race.** The production `selfBusy` flag only flips at
-   `agent_start`. After a peer injects a first idle message (a fresh plain user
-   turn), the next 250ms tick can still observe `idle` and inject another plain
-   user turn before `agent_start` arrives, opening overlapping plain turns from a
-   burst of queued messages.
-2. **F2 claim lifetime / fire-and-forget.** The `sendUserMessage` Promise only
-   confirms the host *accepted* the injection, not that the turn consumed the
-   injected message. Old code deleted the `.processing` claim immediately on a
-   successful injection, so a crash after acceptance but before the turn completed
-   would lose the message. There was also no recovery path for claims orphaned by
-   a missed `agent_end` or a session rebind.
+1. `agent_end` marks only one low-level run. Pi may still retry, compact and
+   retry, or process queued follow-up messages. `agent_settled` is the boundary
+   after those continuations finish.
+2. `ExtensionAPI.sendUserMessage()` is fire-and-forget and returns `void`.
+   Asynchronous injection failures are not observable through `await`/`catch`.
+3. `message_start` is the host lifecycle acknowledgement that a submitted user
+   message actually entered the agent message stream.
 
 ## Decision
 
-Add a poll-time turn latch and a turn-scoped in-flight claim set to the inbox
-drainer, and make the documented guarantee honest:
+### F1 — Idle-burst latch
 
-- **F1 — turn-start pending latch.** A non-steer (fresh-trigger) injection sets a
-  `turnStartPending` latch *before* the injection. While the latch is set and
-  `agent_start` has not arrived, `drainInbox` returns immediately and does not
-  drain another message. `agent_start` clears the latch and marks the peer busy
-  (when no external busy override is supplied); subsequent messages then steer
-  into the running turn. `agent_end` clears the latch and the busy flag. A failed
-  injection clears the latch and requeues only its own claim, so a burst never
-  opens overlapping plain turns.
-- **F2 — turn-scoped claim lifetime.** A successfully injected `.processing` claim
-  is *not* deleted on injection. It is tracked in an `inFlightClaims` set and the 
-  claim is consumed (deleted) only at `agent_end`, when the turn completes. The
-  claim therefore covers the whole turn, not just the host's `sendUserMessage`
-  acceptance. If injection fails, only that claim is requeued (via a new
-  `requeueClaimedMessage`), never a sibling's in-flight claim.
-- **Rebind / shutdown recovery.** `session_start` (a reload/resume or session
-  rebind) clears local `selfBusy`, `turnStartPending`, and `inFlightClaims`, then
-  requeues every orphaned `.processing` claim so they retry (at-least-once) rather
-  than being lost. `session_shutdown` clears local latch/claim state and leaves any
-  unconsumed `.processing` claims on disk, recoverable by the next startup
-  requeue. This is a best-effort, single-process, at-least-once guarantee.
-- **Honest guarantee.** We guarantee a durable mailbox plus a recoverable
-  at-least-once claim through turn completion. We explicitly do not claim proof of
-  receiver/model consumption beyond the host lifecycle: the claim is consumed at
-  `agent_end`, which is host lifecycle, not a receipt that the model processed the
-  message.
+A non-steer (fresh-trigger) injection sets a `turnStartPending` latch before the
+injection. While the latch is set and `agent_start` has not arrived,
+`drainInbox` returns without draining another message. `agent_start` clears the
+latch and marks the peer busy; subsequent messages steer into the running turn.
+A synchronous injection failure clears the latch and requeues only its own claim.
+
+### F2 — Host-acknowledged, settled-run claim lifetime
+
+A claimed `.processing` file is tracked in one of two states:
+
+- **Pending delivery:** after the host call is invoked, the claim remains
+  `.processing` until the matching `message_start` event arrives. A synchronous
+  failure or a missing acknowledgement after the bounded deadline requeues only
+  that claim.
+- **In-flight delivery:** after `message_start`, the claim remains in
+  `inFlightClaims` until `agent_settled`, then the file is consumed.
+
+The Pi API returns `void`, so the matching `message_start` event is the only
+injection acknowledgement.
+
+### Rebind and shutdown recovery
+
+`session_start` clears local busy/latch state, requeues pending and in-flight
+claims from the previous runtime, and reclaims all orphaned `.processing` files.
+`session_shutdown` cancels pending acknowledgement timers and leaves unconsumed
+claims on disk for the next startup requeue. This is a best-effort,
+single-process, at-least-once guarantee.
+
+### History and status boundary
+
+Busy state is cleared and current-lineage history is rebuilt only at
+`agent_settled`, after Pi's retries, compaction, and queued continuations are
+finished. `agent_end` produces no automatic reply and does not consume claims.
 
 ## Alternatives Considered
 
-1. Keep deleting the claim on successful injection and rely on the host lifecycle
-   alone: rejected because a crash between acceptance and turn completion loses the
-   message, and the review flagged this as a data-loss blocker.
-2. Build a full waiter/ack/RPC acknowledgement protocol to prove model consumption:
-   rejected as over-engineering and out of scope for a symmetric, async,
-   fire-and-forget chat. The at-least-once claim through turn completion is the
-   right durability bar.
-3. Requeue all claims on every failure (the old `requeueProcessing` used at startup
-   only): rejected because that would release another runtime's in-flight claim.
-   Only the acting claim is requeued on an injection failure.
+1. Use `agent_end` as the completion boundary: rejected because Pi documents
+   retries, compaction retries, and queued continuations after that event.
+2. Await `sendUserMessage()` and catch failures: rejected because the real
+   `ExtensionAPI` method returns `void` and reports asynchronous failures through
+   Pi's extension error channel.
+3. Delete the claim immediately after invoking `sendUserMessage`: rejected
+   because the host can accept the call and the process can crash before the
+   message enters the agent stream.
+4. Build a full peer acknowledgement/RPC protocol: rejected as over-engineering
+   and out of scope for symmetric, send-only chat. `message_start` is a local
+   host acknowledgement, not a peer reply.
 
 ## Consequences
 
 Positive:
 
-- A burst of queued messages cannot open overlapping plain turns; after the first
-  idle trigger, the rest steer into the engaged turn.
-- A message accepted by the host stays claimed through the turn, so a crash before
-  `agent_end` is recoverable on the next startup/rebind.
-- Claims orphaned by a missed `agent_end` or a session rebind are requeued and
-  retried rather than silently lost.
+- A burst of queued messages cannot open overlapping plain turns.
+- Busy status and history reflect the full Pi run, not an intermediate retry or
+  queued continuation.
+- The actual void host API is handled without falsely claiming synchronous
+  delivery or error propagation.
+- Claims remain recoverable until Pi acknowledges and settles the host run.
 
 Tradeoffs:
 
-- The guarantee is at-least-once, not exactly-once: a crash or rebind after the
-  host accepted/injected a message but before `agent_end` consumed the claim
-  opens a window in which the message could be re-delivered on recovery. The
-  window is bounded to the host turn, not to model processing.
-- A peer that is perpetually idle after a non-steer injection holds the latch until
-  `agent_start`; injection failures clear the latch so a poison message cannot
-  wedge the mailbox forever.
+- The guarantee is at-least-once, not exactly-once. A crash or timeout after
+  host acceptance can cause redelivery.
+- A delayed `message_start` past the bounded acknowledgement deadline can cause
+  a duplicate; this is preferable to silently losing the durable message.
+  **Revised by `0013`:** this priced the duplicate as rare. It is the common
+  case — the host drains steering only at turn boundaries and may compact before
+  a triggered turn starts — so the deadline no longer requeues.
+- Full live peer-chat E2E remains unavailable on POSIX in this checkout.

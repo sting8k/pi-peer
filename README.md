@@ -1,6 +1,6 @@
 # pi-peer
 
-Peer-to-peer chat between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
+Peer-to-peer chat between Pi coding-agent sessions running in the same Herdr workspace. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
 
 It is symmetric, natural chat between equal agents — not RPC or task delegation to a subagent. There is no request/response correlation, no `timeoutMs`, no waiting, and no `<peer_pong>`. Three tools, nothing else.
 
@@ -17,7 +17,7 @@ It is symmetric, natural chat between equal agents — not RPC or task delegatio
 ## How it works
 
 ```
-                     HerdR workspace
+                     Herdr workspace
     ┌────────────────┐                    ┌────────────────┐
     │  Pi session A  │                    │  Pi session B  │
     │    peer-a1b    │                    │    peer-c3d    │
@@ -43,7 +43,7 @@ A message is delivered to an **idle** receiver as a normal user message (trigger
 
 ## Requirements
 
-- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) running inside a HerdR pane.
+- [Pi coding agent](https://github.com/earendil-works/pi) `>=0.84.2` running inside a Herdr pane.
 - `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket.
 - Node 22.19+ for development (required by the Pi coding-agent SDK).
 
@@ -59,7 +59,7 @@ Or from GitHub:
 pi install git:github.com/sting8k/pi-peer
 ```
 
-Tools register automatically when a Pi session starts inside a HerdR pane. Set `PI_PEER_DISABLED=1` for sessions that must not appear as peers or receive requests, and `PI_CODING_AGENT_DIR` to override the agent directory (default `~/.pi/agent`).
+Tools register automatically when a Pi session starts inside a Herdr pane. Set `PI_PEER_DISABLED=1` for sessions that must not appear as peers or receive requests, and `PI_CODING_AGENT_DIR` to override the agent directory (default `~/.pi/agent`).
 
 Migrating from the pi-roo extension, which used to bundle these tools: set `features.talk=false` in your pi-roo config, install pi-peer, then reload every Pi session. The storage namespace changed (`pi-roo/talk` → `pi-peer/talk`), so the cutover is a clean break with no dual-read migration.
 
@@ -89,7 +89,7 @@ Lists live peers, one per line: `<public-id>  <name>  <status>`. The current ses
 
 A public id is `peer-` plus the last three characters of the session id; the full session id stays internal.
 
-Each session receives a stable friendly name from a preset pet-name pool, unique within the workspace. Reloading keeps the same name. The footer shows `<Name> · <peer-id>`; peer-to-peer tools continue to target the public peer id.
+Each session receives a stable friendly name from a preset pet-name pool, unique within the workspace. Reloading keeps the same name. The footer shows `<Name> · <peer-id>`; inside Herdr, the agent panel is also renamed to the lowercase form of that name so sessions are easy to distinguish; when the current tab contains only this pane and still has its automatic number label, the tab is mirrored to the same name. Herdr currently exposes numeric custom labels the same way as automatic labels, so a manually named numeric-only tab cannot be distinguished and may be mirrored. If Herdr already uses the agent name, a deterministic short suffix is added. Peer-to-peer tools continue to target the public peer id.
 
 ### `talk_to`
 
@@ -120,7 +120,7 @@ Each peer publishes its own bounded history (max 10 events: user, assistant text
 ## Guarantees
 
 - **Liveness decides delivery.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your `talk_to` immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
-- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. The claim is held through the turn (consumed at `agent_end`), not just until the host accepts the injection. A failed injection is requeued, and orphaned `.processing` claims are reclaimed on reload/rebind and at startup, so a host-accepted-but-unconsumed message is recoverable (at-least-once). This is a host-lifecycle guarantee, not proof the model consumed the message.
+- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. The claim is held through the settled agent run (consumed at `agent_settled`), not just until the host accepts the injection. A synchronous injection failure requeues the claim immediately. An injection the host never acknowledged keeps its claim instead: the host may still hold the message, so handing it back would deliver it twice. That claim, and any other orphaned `.processing` claim, is reclaimed on reload/rebind and at startup, so a host-accepted-but-unconsumed message is recoverable (at-least-once). This is a host-lifecycle guarantee, not proof the model consumed the message.
 - **Fair, serial delivery.** One message per poll tick, injected in per-runtime
   creation (filename) order — oldest first within a runtime. Across processes,
   messages sharing a creation timestamp have a deterministic filename order,
@@ -150,9 +150,9 @@ Writes are atomic (temp file plus rename) and the mailbox directory is created w
 
 ```sh
 npm install
-npm test                  # 52 tests (3 suites)
-npm run test:focused      # 46 unit tests
-npm run test:integration  # 6 mocked two-peer lifecycle tests
+npm test                  # 67 tests (3 suites)
+npm run test:focused      # 60 unit/lifecycle tests
+npm run test:integration  # 7 mocked two-peer lifecycle tests
 npm run typecheck         # tsc --noEmit
 ```
 
@@ -164,8 +164,8 @@ Distribution is available from both npm and GitHub. The npm package is published
 
 ## Related Work
 
-- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) — the host whose extension API this builds on.
-- HerdR — the pane/workspace environment that provides session identity and peer discovery.
+- [Pi coding agent](https://github.com/earendil-works/pi) — the host whose extension API this builds on.
+- Herdr — the pane/workspace environment that provides session identity and peer discovery.
 
 ## License
 

@@ -75,7 +75,7 @@ Tradeoffs:
 - Existing pi-roo users must disable talk (`features.talk=false`) before a dual
   install, and all peers must reload to re-register in the new namespace.
 - The public repository `github.com/sting8k/pi-peer` is the canonical home;
-  the current package metadata is public `@sting8k/pi-peer` version `2.1.0`,
+  the current package metadata is public `@sting8k/pi-peer` version `2.1.1`,
   with npm and GitHub distribution.
 - The live new-namespace Herdr cutover has been executed (slice 7): two live
   Pi panes in one workspace discovered each other and exchanged send-only

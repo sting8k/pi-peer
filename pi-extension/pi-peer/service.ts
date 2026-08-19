@@ -11,7 +11,7 @@ import {
   getTalkRootDir,
   type HerdrPeerContext,
 } from "./herdr.ts";
-import { readJson, writeAtomic } from "./storage.ts";
+import { readJson, readJsonChecked, writeAtomic } from "./storage.ts";
 import {
   HISTORY_LIMIT,
   publishHistoryFromOwnSession,
@@ -57,6 +57,13 @@ export type TalkDeps = {
   rootDir?: (workspaceId: string) => string;
   /** Test seam for the host message-start acknowledgement deadline. */
   deliveryAckTimeoutMs?: number;
+  /**
+   * Test seam for `drainInbox`'s read of a queued message. Overriding this is
+   * how the ok/retryable classification itself is proven at the integration
+   * level, independent of whichever delete-failure guard happens to also
+   * mask the same on-disk outcome.
+   */
+  readMessage?: (path: string) => ReturnType<typeof readJsonChecked>;
 };
 
 type Runtime = {
@@ -217,6 +224,7 @@ export function registerTalkTools(
   const getCurrentPeer = deps.getCurrentPeer ?? getCurrentHerdrPeerContextAsync;
   const getStatus = deps.getPeerStatus ?? getHerdrPeerStatusAsync;
   const syncIdentity = deps.syncVisibleIdentity;
+  const readMessage = deps.readMessage ?? readJsonChecked;
   const hasBusyOverride = typeof deps.isBusy === "function";
   // Standalone runtime self-tracks busy through agent_start/agent_settled unless
   // a caller injects an explicit busy function (test/runtime override).
@@ -458,11 +466,30 @@ export function registerTalkTools(
     for (const name of pending) {
       if (!canDeliver()) return;
       const path = join(dir, name);
-      const message = readJson(path);
+      const read = readMessage(path);
+      if (!read.ok) {
+        // A transient read failure is not evidence the message is corrupt.
+        // Leave it queued and let a later tick retry; deleting here loses it.
+        if (read.retryable) continue;
+        // A corrupt entry that cannot be removed must not block the queue: the
+        // tick would throw on the same entry forever and starve every message
+        // behind it.
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          // fall through: skip it this tick
+        }
+        continue;
+      }
+      const message = read.value;
       if (!isPeerMessage(message) || message.to !== current.record.sessionId) {
         // Malformed or misaddressed: cannot be delivered. There is no reply
         // surface anymore, so drop it rather than block a valid sibling.
-        rmSync(path, { force: true });
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          // fall through: skip it this tick
+        }
         continue;
       }
       const processing = `${path}.processing`;

@@ -29,6 +29,33 @@ export function readJson(path: string): unknown {
   }
 }
 
+/**
+ * Read JSON, distinguishing an unusable *file* from an unusable *read*.
+ *
+ * `readJson` collapses both into `null`, which is right for callers that only
+ * need a value and wrong for callers that delete on failure: a transient
+ * `EBUSY`/`EPERM`/`EACCES` (Windows AV, indexer, concurrent writer) is not
+ * evidence that the file is corrupt. Callers that destroy data must use this.
+ */
+export function readJsonChecked(path: string): { ok: true; value: unknown } | { ok: false; retryable: boolean } {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return { ok: false, retryable: false };
+    // Default to retryable for anything that is not confirmed-absent: an
+    // unknown error code must fail safe by keeping the file, not deleting it.
+    return { ok: false, retryable: true };
+  }
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch (error) {
+    if (error instanceof SyntaxError) return { ok: false, retryable: false };
+    return { ok: false, retryable: true };
+  }
+}
+
 export function writeAtomic(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`;

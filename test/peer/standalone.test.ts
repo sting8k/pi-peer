@@ -6,7 +6,7 @@ import { join, sep } from "node:path";
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
 import { getTalkRootDir } from "../../pi-extension/pi-peer/herdr.ts";
 import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, POLL_MS, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
-import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
+import { readJsonChecked, safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
 import { createMockExtensionApi, createTestDir, restoreEnvVar, importSpecifiers } from "./helpers.ts";
 
@@ -896,6 +896,116 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(inbox, "msg-bad-json.json")), false, "malformed JSON dropped");
       assert.equal(existsSync(join(inbox, "msg-bad-type.json")), false, "protocol-invalid message dropped");
       assert.equal(existsSync(join(inbox, "msg-misaddressed.json")), false, "misaddressed message dropped");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a directory-shaped inbox entry does not stall a valid sibling behind it (realistic EISDIR)", async () => {
+    // This proves the tick survives a real EISDIR and keeps draining — the
+    // observable outcome (trap kept, sibling delivered) is also produced by
+    // the delete-failure guard alone (rmSync throws, catch swallows it), so
+    // this test does NOT by itself prove readJsonChecked's retryable
+    // classification. That is proven separately below via the `readMessage`
+    // seam, which is deterministic and does not depend on which of the two
+    // guards happens to produce the same on-disk result.
+    const root = createTestDir();
+    const tools = new Map<string, any>();
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-receiver-transient";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-r2", terminalId: "term-r2", tabId: "tab-r2",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      // A directory named like a queued message: readFileSync throws EISDIR
+      // (Linux) / EPERM (Windows) — neither ENOENT nor SyntaxError — so the
+      // entry must survive the tick rather than be treated as corrupt.
+      const trapPath = join(inbox, "msg-trap.json");
+      mkdirSync(trapPath, { recursive: true });
+      // Sorts after the trap (localeCompare: "t" < "v"), so drainInbox always
+      // reaches the trap first.
+      writeFileSync(join(inbox, "msg-valid.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Deliver me despite the trap.")));
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      assert.equal(existsSync(trapPath), true, "transiently-unreadable entry is kept, not deleted");
+      assert.equal(sentMessages.length, 1, "the valid sibling behind the trap is still delivered");
+      assert.match(sentMessages[0], /Deliver me despite the trap\./);
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("readMessage seam: a retryable classification is skipped without ever deleting or delivering it", async () => {
+    // Deterministic proof of the `if (!read.ok) { if (read.retryable) continue; ... }`
+    // branch itself, decoupled from the delete-failure guard: the injected
+    // stub reports retryable for a file that is perfectly valid and
+    // addressed on disk, so the only thing that can explain it never being
+    // delivered nor deleted is drainInbox honouring the classification.
+    const root = createTestDir();
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-receiver-seam";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-r3", terminalId: "term-r3", tabId: "tab-r3",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+      readMessage: (path: string) => (path.endsWith("msg-soft.json") ? { ok: false, retryable: true } : readJsonChecked(path)),
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      const softPath = join(inbox, "msg-soft.json");
+      writeFileSync(softPath, JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Would deliver if not forced retryable.")));
+      // Sorts after msg-soft.json ("s" < "v"), so drainInbox reaches the
+      // stubbed entry first on every tick.
+      writeFileSync(join(inbox, "msg-valid.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Only me should be delivered.")));
+
+      await waitUntil(() => sentMessages.length === 1, "sibling delivered");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      assert.equal(sentMessages.length, 1, "the stubbed-retryable entry is never delivered");
+      assert.match(sentMessages[0], /Only me should be delivered\./);
+      assert.equal(existsSync(softPath), true, "the stubbed-retryable entry is never deleted");
     } finally {
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });

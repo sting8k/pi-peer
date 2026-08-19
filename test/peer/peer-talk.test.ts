@@ -41,6 +41,7 @@ import {
   publishHistoryFromOwnSession,
   readHistory,
 } from "../../pi-extension/pi-peer/history.ts";
+import { readJsonChecked } from "../../pi-extension/pi-peer/storage.ts";
 import { createTestDir, restoreEnvVar } from "./helpers.ts";
 
 describe("peer talk protocol", () => {
@@ -558,5 +559,28 @@ describe("peer talk protocol", () => {
     assert.equal(Value.Check(TalkSessionsParams, {}), true, "talk_sessions takes no parameters");
     assert.equal(Value.Check(TalkLatestParams, { target: "peer-abc", count: 3 }), true, "talk_latest accepts target and count");
     assert.equal(Value.Check(TalkLatestParams, { target: "peer-abc", count: 11 }), false, "talk_latest count 11 is invalid");
+  });
+
+  it("readJsonChecked distinguishes corrupt content, absence, and success", () => {
+    const dir = createTestDir();
+    try {
+      const corrupt = join(dir, "corrupt.json");
+      writeFileSync(corrupt, "{not json");
+      const corruptResult = readJsonChecked(corrupt);
+      assert.equal(corruptResult.ok, false, "corrupt JSON is not ok");
+      assert.equal(!corruptResult.ok && corruptResult.retryable, false, "corrupt JSON is not retryable");
+
+      const missingResult = readJsonChecked(join(dir, "missing.json"));
+      assert.equal(missingResult.ok, false, "missing file is not ok");
+      assert.equal(!missingResult.ok && missingResult.retryable, false, "missing file is not retryable");
+
+      const valid = join(dir, "valid.json");
+      writeFileSync(valid, JSON.stringify({ hello: "world" }));
+      const validResult = readJsonChecked(valid);
+      assert.equal(validResult.ok, true, "valid JSON is ok");
+      assert.deepEqual(validResult.ok ? validResult.value : undefined, { hello: "world" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

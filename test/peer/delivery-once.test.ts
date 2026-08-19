@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -132,5 +132,83 @@ describe("regression: duplicate delivery", () => {
       await wait(1200);   // 4x the deadline: pre-fix this loops forever
       assert.equal(injections.length, 1, `injected ${injections.length}x despite the transform`);
     } finally { pi.fire("session_shutdown", { type: "session_shutdown" }); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("BUG#6 agent_start after the turn-start deadline commits the claim exactly once", async () => {
+    const root = join(tmpdir(), "r-" + randomUUID()); mkdirSync(root, { recursive: true });
+    const sessionId = "s-late-start";
+    const handlers = new Map<string, Array<(...a: any[]) => any>>();
+    const sentMessages: string[] = [];
+    const ctx = { cwd: "/w", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, "t.jsonl") } };
+    const fire = (n: string, ev: any) => { for (const h of handlers.get(n) ?? []) h(ev, ctx); };
+    const api: any = {
+      registerTool() {},
+      on: (n: string, h: any) => { handlers.set(n, [...(handlers.get(n) ?? []), h]); },
+      // No auto agent_start here (unlike FakePi): the host is slow to engage
+      // the turn, which is exactly the gap this test drives through.
+      sendUserMessage: (content: string) => { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "p", terminalId: "t", tabId: "tb", socketPath: "/tmp/s.sock", workspaceId: "w1" }),
+      getPeerStatus: async () => "idle" as const,
+      rootDir: () => root, deliveryAckTimeoutMs: 5,
+    });
+    try {
+      fire("session_start", { type: "session_start" });
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "reg");
+      drop(root, sessionId, "compaction delayed this turn");
+      await waitUntil(() => sentMessages.length === 1, "claimed and injected");
+      const inbox = inboxDir(root, sessionId);
+      const name = readdirSync(inbox).find((f: string) => f.endsWith(".processing"));
+      const processingPath = join(inbox, name!);
+      assert.equal(existsSync(processingPath), true, "claim taken before the deadline");
+
+      // Past the 5ms deadline: expireTurnStartLatch marks the claim expired but
+      // leaves it pending (ADR 0013) rather than requeueing it.
+      await wait(200);
+      assert.equal(existsSync(processingPath), true, "expired claim is still pending, not requeued");
+      assert.equal(existsSync(processingPath.replace(/\.processing$/, "")), false, "expired claim did not reappear as a queued .json");
+
+      // agent_start finally arrives (the documented compaction case): the
+      // expired claim must be adopted as this turn's trigger, not skipped.
+      fire("agent_start", { type: "agent_start" });
+      fire("agent_settled", { type: "agent_settled" });
+      assert.equal(existsSync(processingPath), false, "claim committed exactly once, not leaked to disk");
+      assert.equal(existsSync(processingPath.replace(/\.processing$/, "")), false, "no .json twin recreated by session_start requeue");
+    } finally { fire("session_shutdown", { type: "session_shutdown" }); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("an expired claim with no following agent_start still survives for session_start", async () => {
+    const root = join(tmpdir(), "r-" + randomUUID()); mkdirSync(root, { recursive: true });
+    const sessionId = "s-never-started";
+    const handlers = new Map<string, Array<(...a: any[]) => any>>();
+    const sentMessages: string[] = [];
+    const ctx = { cwd: "/w", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, "t.jsonl") } };
+    const fire = (n: string, ev: any) => { for (const h of handlers.get(n) ?? []) h(ev, ctx); };
+    const api: any = {
+      registerTool() {},
+      on: (n: string, h: any) => { handlers.set(n, [...(handlers.get(n) ?? []), h]); },
+      sendUserMessage: (content: string) => { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({ paneId: "p", terminalId: "t", tabId: "tb", socketPath: "/tmp/s.sock", workspaceId: "w1" }),
+      getPeerStatus: async () => "idle" as const,
+      rootDir: () => root, deliveryAckTimeoutMs: 5,
+    });
+    try {
+      fire("session_start", { type: "session_start" });
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "reg");
+      drop(root, sessionId, "host never engages this one");
+      await waitUntil(() => sentMessages.length === 1, "claimed and injected");
+      const inbox = inboxDir(root, sessionId);
+      const name = readdirSync(inbox).find((f: string) => f.endsWith(".processing"));
+      const processingPath = join(inbox, name!);
+
+      // No agent_start ever arrives — the host abandoned the turn entirely.
+      await wait(200);
+      fire("agent_settled", { type: "agent_settled" });
+      assert.equal(existsSync(processingPath), true, "claim must survive for session_start recovery (ADR 0013)");
+      assert.equal(sentMessages.length, 1, "no duplicate redelivery");
+    } finally { fire("session_shutdown", { type: "session_shutdown" }); rmSync(root, { recursive: true, force: true }); }
   });
 });

@@ -304,13 +304,19 @@ export function registerTalkTools(
   // before it reaches the transcript, which no content match can follow. Once
   // agent_start fires the prompt is committed to the run.
   //
-  // Only the injection this turn was started for is committed. An expired claim
-  // belongs to an earlier turn the host never engaged; adopting it here would
-  // delete it at agent_settled without it ever being processed, so it stays
-  // pending for session_start recovery.
+  // An unexpired claim always wins: it is the unambiguous trigger for this
+  // turn. When none exists, the oldest expired non-steer claim is adopted
+  // instead — a claim that expired only because the host was slow (compaction
+  // can hold a turn past the deadline) is still the injection this turn was
+  // started for. Adopting it here is what keeps agent_settled from leaking the
+  // claim to disk, where session_start would requeue an already-processed
+  // message. A claim with no following agent_start at all is untouched by this
+  // function and stays pending for session_start recovery.
   const commitTriggeredDeliveries = (): void => {
-    for (const [processingPath, pending] of [...pendingDeliveries]) {
-      if (pending.steer || pending.expired) continue;
+    const entries = [...pendingDeliveries].filter(([, pending]) => !pending.steer);
+    const fresh = entries.filter(([, pending]) => !pending.expired);
+    const chosen = fresh.length > 0 ? fresh : entries.slice(0, 1);
+    for (const [processingPath, pending] of chosen) {
       takePendingDelivery(processingPath);
       commitPendingDelivery(processingPath, pending);
     }

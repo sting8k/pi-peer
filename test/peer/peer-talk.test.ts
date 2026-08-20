@@ -289,6 +289,7 @@ describe("peer talk protocol", () => {
       { sessionId: "alpha-111", name: "api", cwd: "/api", workspaceId: "ws", paneId: "p1", terminalId: "t1", schemaVersion: 1, createdAt: "now" },
       { sessionId: "beta-222", name: "web", cwd: "/web", workspaceId: "ws", paneId: "p2", terminalId: "t2", schemaVersion: 1, createdAt: "now" },
       { sessionId: "beta-333", name: "web", cwd: "/web-2", workspaceId: "ws", paneId: "p3", terminalId: "t3", schemaVersion: 1, createdAt: "now" },
+      { sessionId: "gamma-444", name: "Zhang", cwd: "/zhang", workspaceId: "ws", paneId: "p4", terminalId: "t4", schemaVersion: 1, createdAt: "now" },
     ];
     assert.equal(resolveTarget(records, "peer-111").sessionId, "alpha-111", "public peer id resolves");
     assert.equal(resolveTarget(records, "peer-333").sessionId, "beta-333");
@@ -298,6 +299,22 @@ describe("peer talk protocol", () => {
     assert.throws(() => resolveTarget(records, "alpha"), /not found/, "session id prefix is not a target");
     assert.throws(() => resolveTarget(records, "beta"), /not found/, "session id prefix is not a target");
     assert.throws(() => resolveTarget(records, "web"), /ambiguous/, "duplicate display name is ambiguous");
+    // Herdr renders agent names lowercase in the UI; PEER_NAME_POOL is TitleCase.
+    assert.equal(resolveTarget(records, "zhang").sessionId, "gamma-444", "lowercase target resolves a TitleCase display name");
+    assert.equal(resolveTarget(records, "ZHANG").sessionId, "gamma-444", "uppercase target resolves too");
+    assert.equal(resolveTarget(records, "Zhang").sessionId, "gamma-444", "exact match still wins directly, never falls through to the loose pass");
+  });
+
+  it("resolveTarget fails closed when two records share a display name only by case", () => {
+    const records: PeerRecord[] = [
+      { sessionId: "alpha-555", name: "Gizmo", cwd: "/g1", workspaceId: "ws", paneId: "p5", terminalId: "t5", schemaVersion: 1, createdAt: "now" },
+      { sessionId: "beta-666", name: "gizmo", cwd: "/g2", workspaceId: "ws", paneId: "p6", terminalId: "t6", schemaVersion: 1, createdAt: "now" },
+    ];
+    // Neither record equals the target exactly, so this exercises the
+    // case-insensitive fallback's own ambiguity check, not the exact-match one.
+    assert.throws(() => resolveTarget(records, "GIZMO"), /ambiguous/, "records differing only by case are ambiguous under the loose match");
+    assert.equal(resolveTarget(records, "Gizmo").sessionId, "alpha-555", "an exact hit is never turned into an ambiguity error by the loose fallback");
+    assert.equal(resolveTarget(records, "gizmo").sessionId, "beta-666");
   });
 
   it("fails closed when two live records share the same public peer id", () => {

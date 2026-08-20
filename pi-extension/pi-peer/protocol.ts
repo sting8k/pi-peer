@@ -364,6 +364,14 @@ export function resolveTarget(records: PeerRecord[], target: string): PeerRecord
   const exactName = records.filter((record) => record.name === target);
   if (exactName.length === 1) return exactName[0];
   if (exactName.length > 1) throw new Error(`Peer name is ambiguous: ${target}`);
+  // Herdr renders agent names in lowercase, but PEER_NAME_POOL is TitleCase, so
+  // an agent reading a name off the UI and typing it back would otherwise never
+  // match. Exact match is always attempted first, so an exact hit can never be
+  // turned into an ambiguity error by this fallback.
+  const folded = target.toLowerCase();
+  const looseName = records.filter((record) => record.name.toLowerCase() === folded);
+  if (looseName.length === 1) return looseName[0];
+  if (looseName.length > 1) throw new Error(`Peer name is ambiguous: ${target}`);
   throw new Error(`Peer session not found: ${target}`);
 }
 

@@ -28,6 +28,8 @@ import {
   requeueClaimedMessage,
   requeueProcessing,
   resolveTarget,
+  sessionDir,
+  withRegistrationLock,
   type PeerMessage,
   type PeerRecord,
 } from "../../pi-extension/pi-peer/protocol.ts";
@@ -339,6 +341,29 @@ describe("peer talk protocol", () => {
       requeueProcessing(root, "session-b");
       assert.ok(existsSync(join(inbox, "msg-1.json")));
       assert.equal(existsSync(join(inbox, "msg-1.json.processing")), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("withRegistrationLock holds the lock until an async action settles", async () => {
+    const root = createTestDir();
+    // The lock path is private to protocol.ts; reconstruct it from the
+    // exported sessionDir the same way registrationLockPath does internally.
+    const lockPath = join(sessionDir(root), ".registration-lock");
+    try {
+      let resolveAction!: () => void;
+      const gate = new Promise<void>((resolve) => { resolveAction = resolve; });
+      const settled = withRegistrationLock(root, async () => {
+        await gate;
+        return "done";
+      });
+      // Give the lock acquisition (which is itself async) a chance to run.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(existsSync(lockPath), true, "lock is held while the async action is in flight");
+      resolveAction();
+      assert.equal(await settled, "done");
+      assert.equal(existsSync(lockPath), false, "lock is released only after the action resolves");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

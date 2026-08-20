@@ -135,7 +135,7 @@ function isMissingError(error: unknown): boolean {
 }
 
 /** Serialize name selection and registration writes across peer processes. */
-export async function withRegistrationLock<T>(root: string, action: () => T): Promise<T> {
+export async function withRegistrationLock<T>(root: string, action: () => T | Promise<T>): Promise<T> {
   const lockPath = registrationLockPath(root);
   const ownerPath = join(lockPath, "owner");
   const ownerToken = `${process.pid}-${randomUUID()}`;
@@ -164,7 +164,7 @@ export async function withRegistrationLock<T>(root: string, action: () => T): Pr
   }
 
   try {
-    return action();
+    return await action();
   } finally {
     try {
       if (readFileSync(ownerPath, "utf8") === ownerToken) {

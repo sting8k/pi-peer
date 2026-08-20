@@ -202,6 +202,19 @@ async function executeTalkLatest(
   };
 }
 
+/**
+ * List a directory that another process may delete concurrently
+ * (`sweepDeadSessions`, peer shutdown). The existsSync guard cannot close that
+ * window, so absence is a normal result, not an error.
+ */
+function listDirSafe(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 /** Queue depth of a peer: count of still-queued `.json` message files in its
  * inbox dir. In-flight `.processing` claims are already injected and are not
  * counted. A missing inbox dir means zero, never an error.
@@ -211,7 +224,7 @@ function inboxCount(root: string, sessionId: string): number {
   if (!existsSync(dir)) return 0;
   // Count only still-queued `.json` messages. In-flight `.processing` claims
   // are already injected into the current turn, so they are not "queued".
-  return readdirSync(dir).filter((name) => name.endsWith(".json")).length;
+  return listDirSafe(dir).filter((name) => name.endsWith(".json")).length;
 }
 
 export function registerTalkTools(
@@ -466,7 +479,7 @@ export function registerTalkTools(
     if (turnStartPending || !canDeliver()) return;
     const dir = inboxDir(current.root, current.record.sessionId);
     if (!existsSync(dir)) return;
-    const pending = readdirSync(dir)
+    const pending = listDirSafe(dir)
       .filter((name) => name.endsWith(".json"))
       .sort((left, right) => left.localeCompare(right));
     for (const name of pending) {

@@ -959,6 +959,115 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("talk_sessions reports 0 queued and does not throw when a peer's inbox path is not a directory", async () => {
+    // existsSync(dir) alone is not proof that readdirSync(dir) will succeed:
+    // a plain file happening to occupy the inbox path (leftover from an
+    // older build, filesystem corruption, or any writer racing the mkdir)
+    // makes existsSync report true while readdirSync throws ENOTDIR. This is
+    // the concrete failure listDirSafe closes — unlike a genuinely missing
+    // directory, which the existing existsSync guard already handled before
+    // this task.
+    const root = createTestDir();
+    const tools = new Map<string, any>();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-inbox-not-a-dir";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-notdir", terminalId: "term-notdir", tabId: "tab-notdir",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(join(root, "inbox"), { recursive: true });
+      rmSync(inbox, { recursive: true, force: true });
+      writeFileSync(inbox, "not a directory");
+      assert.equal(existsSync(inbox), true, "the bogus path exists");
+
+      const result = await tools.get("talk_sessions").execute("call", {}, undefined, undefined, ctx);
+      assert.doesNotMatch(result.content[0].text, /\([0-9]+ queued\)/, "queue depth degrades to 0 rather than throwing");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a delivery tick against an inbox path that is not a directory does not stall polling", async () => {
+    // "Does not stall polling" cannot be observed through the heartbeat or
+    // eventual recovery alone: the outer setInterval try/catch
+    // (service.ts:~600) logs-and-returns on any throw, so ensureRecord (which
+    // runs before drainInbox each tick) keeps the registration fresh, and a
+    // later tick recovers once the bogus path is replaced, regardless of
+    // whether drainInbox itself ever threw. console.error is the one signal
+    // that actually distinguishes "tick completed cleanly" from "tick threw
+    // and was caught", so it is what this test must assert on.
+    const originalConsoleError = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    const root = createTestDir();
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-tick-not-a-dir";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-notdir2", terminalId: "term-notdir2", tabId: "tab-notdir2",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(join(root, "inbox"), { recursive: true });
+      rmSync(inbox, { recursive: true, force: true });
+      writeFileSync(inbox, "not a directory");
+
+      // Let several ticks run against the bogus path without crashing the poll.
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS * 3 + 100));
+
+      assert.equal(errors.length, 0, "drainInbox must not throw (and be caught) on a non-directory inbox path");
+
+      // Once the bogus path is replaced by a real inbox dir, delivery resumes.
+      rmSync(inbox, { force: true });
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "msg-recovered.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Recovered after the bogus path.")));
+      await waitUntil(() => sentMessages.length === 1, "delivery resumes once the path is a real directory again");
+      assert.match(sentMessages[0], /Recovered after the bogus path\./);
+    } finally {
+      console.error = originalConsoleError;
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("readMessage seam: a retryable classification is skipped without ever deleting or delivering it", async () => {
     // Deterministic proof of the `if (!read.ok) { if (read.retryable) continue; ... }`
     // branch itself, decoupled from the delete-failure guard: the injected

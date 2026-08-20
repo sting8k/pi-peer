@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { readJson, safeKey, writeAtomic } from "./storage.ts";
@@ -10,7 +10,7 @@ import type { HerdrAgentStatus, HerdrPeerContext } from "./herdr.ts";
  * standalone pi-peer runtime.
  *
  * Invariants of the peer-chat protocol:
- *  - HerdR-only, workspace identity verified on every status read,
+ *  - Herdr-only, workspace identity verified on every status read,
  *  - atomic mailbox writes (`writeAtomic`) with queued -> `.processing` state,
  *  - symmetric, send-only semantics: `talk_to` enqueues one durable message and
  *    returns delivery confirmation; a reply is simply another `talk_to` in the
@@ -65,6 +65,8 @@ export const RECORD_STALE_MS = 60_000;
 export const DEAD_SESSION_TTL_MS = 24 * 60 * 60_000;
 /** Cadence for the cross-session dead-session sweep on the idle poll. */
 export const DEAD_SESSION_SWEEP_MS = 5 * 60_000;
+const REGISTRATION_LOCK_RETRY_MS = 10;
+const REGISTRATION_LOCK_STALE_MS = 30_000;
 
 export const PEER_NAME_POOL = [
   "Mark", "Coco", "Dario", "Rex", "Tibo", "Bella", "Xi", "Peanut", "Pooh", "Biscuit",
@@ -73,22 +75,23 @@ export const PEER_NAME_POOL = [
 
 function peerNameHash(sessionId: string): number {
   let hash = 5381;
-  for (let index = 0; index < sessionId.length; index++) {
-    hash = (((hash << 5) + hash) ^ sessionId.charCodeAt(index)) >>> 0;
+  for (const character of sessionId) {
+    hash = (((hash << 5) + hash) ^ (character.codePointAt(0) ?? 0)) >>> 0;
   }
   return hash;
 }
 
 export function pickPeerName(sessionId: string, taken: Set<string>): string {
+  const takenNames = new Set([...taken].map((name) => name.toLowerCase()));
   const start = peerNameHash(sessionId) % PEER_NAME_POOL.length;
   for (let offset = 0; offset < PEER_NAME_POOL.length; offset++) {
     const name = PEER_NAME_POOL[(start + offset) % PEER_NAME_POOL.length];
-    if (!taken.has(name)) return name;
+    if (!takenNames.has(name.toLowerCase())) return name;
   }
   for (let suffix = 2; ; suffix++) {
     for (let offset = 0; offset < PEER_NAME_POOL.length; offset++) {
       const name = `${PEER_NAME_POOL[(start + offset) % PEER_NAME_POOL.length]}-${suffix}`;
-      if (!taken.has(name)) return name;
+      if (!takenNames.has(name.toLowerCase())) return name;
     }
   }
 }
@@ -115,6 +118,67 @@ export function sessionDir(root: string): string {
   return join(root, "sessions");
 }
 
+function registrationLockPath(root: string): string {
+  return join(sessionDir(root), ".registration-lock");
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" ? (error as NodeJS.ErrnoException).code : undefined;
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return errorCode(error) === "EEXIST";
+}
+
+function isMissingError(error: unknown): boolean {
+  return errorCode(error) === "ENOENT";
+}
+
+/** Serialize name selection and registration writes across peer processes. */
+export async function withRegistrationLock<T>(root: string, action: () => T | Promise<T>): Promise<T> {
+  const lockPath = registrationLockPath(root);
+  const ownerPath = join(lockPath, "owner");
+  const ownerToken = `${process.pid}-${randomUUID()}`;
+
+  for (;;) {
+    // Re-ensure on every attempt: the retry below yields, and the tree can be
+    // removed underneath us in that window. Recreating here is what makes a
+    // vanished parent self-healing instead of fatal.
+    mkdirSync(sessionDir(root), { recursive: true, mode: 0o700 });
+    let createdLock = false;
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      createdLock = true;
+      writeFileSync(ownerPath, ownerToken, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      break;
+    } catch (error) {
+      if (createdLock) rmSync(lockPath, { recursive: true, force: true });
+      if (!isAlreadyExistsError(error)) throw error;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > REGISTRATION_LOCK_STALE_MS) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // The lock was released between stat/rm; retry the acquisition.
+      }
+      await new Promise((resolve) => setTimeout(resolve, REGISTRATION_LOCK_RETRY_MS));
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    try {
+      if (readFileSync(ownerPath, "utf8") === ownerToken) {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    } catch {
+      // Another process already recovered or replaced a stale lock.
+    }
+  }
+}
+
 export function inboxDir(root: string, sessionId: string): string {
   return join(root, "inbox", safeKey(sessionId));
 }
@@ -123,33 +187,32 @@ export function recordPath(root: string, sessionId: string): string {
   return join(sessionDir(root), `${safeKey(sessionId)}.json`);
 }
 
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 export function isPeerRecord(value: any): value is PeerRecord {
   return value?.schemaVersion === 1
-    && typeof value.sessionId === "string"
-    && value.sessionId.length > 0
-    && typeof value.name === "string"
-    && typeof value.cwd === "string"
-    && typeof value.workspaceId === "string"
-    && typeof value.paneId === "string"
-    && typeof value.terminalId === "string"
-    && (value.tabId === undefined || typeof value.tabId === "string")
-    && (value.registrationId === undefined || typeof value.registrationId === "string")
-    && typeof value.createdAt === "string";
+    && nonEmptyString(value.sessionId)
+    && nonEmptyString(value.name)
+    && nonEmptyString(value.cwd)
+    && nonEmptyString(value.workspaceId)
+    && nonEmptyString(value.paneId)
+    && nonEmptyString(value.terminalId)
+    && (value.tabId === undefined || nonEmptyString(value.tabId))
+    && (value.registrationId === undefined || nonEmptyString(value.registrationId))
+    && nonEmptyString(value.createdAt);
 }
 
 export function isPeerMessage(value: any): value is PeerMessage {
   return value?.version === 1
     && value.type === "peer_message"
-    && typeof value.id === "string"
-    && value.id.length > 0
-    && typeof value.from === "string"
-    && value.from.length > 0
-    && typeof value.fromName === "string"
-    && value.fromName.length > 0
-    && typeof value.to === "string"
-    && value.to.length > 0
-    && typeof value.message === "string"
-    && typeof value.createdAt === "string";
+    && nonEmptyString(value.id)
+    && nonEmptyString(value.from)
+    && nonEmptyString(value.fromName)
+    && nonEmptyString(value.to)
+    && nonEmptyString(value.message)
+    && nonEmptyString(value.createdAt);
 }
 
 /**
@@ -161,9 +224,15 @@ export function isPeerMessage(value: any): value is PeerMessage {
  * `.processing` claim is dropped.
  */
 export function requeueClaimedMessage(processingPath: string): void {
+  if (!existsSync(processingPath)) return;
   const pending = processingPath.slice(0, -".processing".length);
-  if (existsSync(pending)) rmSync(processingPath, { force: true });
-  else renameSync(processingPath, pending);
+  try {
+    if (existsSync(pending)) rmSync(processingPath, { force: true });
+    else renameSync(processingPath, pending);
+  } catch (error) {
+    if (isAlreadyExistsError(error) && existsSync(pending)) rmSync(processingPath, { force: true });
+    else if (!isMissingError(error)) throw error;
+  }
 }
 
 export function ensureRecord(root: string, record: PeerRecord): void {
@@ -298,6 +367,14 @@ export function resolveTarget(records: PeerRecord[], target: string): PeerRecord
   const exactName = records.filter((record) => record.name === target);
   if (exactName.length === 1) return exactName[0];
   if (exactName.length > 1) throw new Error(`Peer name is ambiguous: ${target}`);
+  // Herdr renders agent names in lowercase, but PEER_NAME_POOL is TitleCase, so
+  // an agent reading a name off the UI and typing it back would otherwise never
+  // match. Exact match is always attempted first, so an exact hit can never be
+  // turned into an ambiguity error by this fallback.
+  const folded = target.toLowerCase();
+  const looseName = records.filter((record) => record.name.toLowerCase() === folded);
+  if (looseName.length === 1) return looseName[0];
+  if (looseName.length > 1) throw new Error(`Peer name is ambiguous: ${target}`);
   throw new Error(`Peer session not found: ${target}`);
 }
 
@@ -310,10 +387,7 @@ export function requeueProcessing(root: string, sessionId: string): void {
   const dir = inboxDir(root, sessionId);
   if (!existsSync(dir)) return;
   for (const name of readdirSync(dir).filter((entry) => entry.endsWith(".processing"))) {
-    const processing = join(dir, name);
-    const pending = join(dir, name.slice(0, -".processing".length));
-    if (existsSync(pending)) rmSync(processing, { force: true });
-    else renameSync(processing, pending);
+    requeueClaimedMessage(join(dir, name));
   }
 }
 
@@ -337,7 +411,7 @@ export async function liveRecords(
   for (const record of loadRecords(root)) {
     if (record.workspaceId !== workspaceId) continue;
     // A crashed process stops heartbeating its registration; its stale record
-    // is not a live peer even if the HerdR pane still exists.
+    // is not a live peer even if the Herdr pane still exists.
     if (!isRegisteredLive(root, record.sessionId)) continue;
     try {
       const status = await getStatus({
@@ -349,14 +423,27 @@ export async function liveRecords(
       }, signal);
       result.push({ record, status });
     } catch {
-      // A stale or moved HerdR pane is not a live peer.
+      // A stale or moved Herdr pane is not a live peer.
     }
   }
   return result;
 }
 
+// The body is agent-authored text from another peer. A literal peer_message
+// delimiter inside it would close the tag early and let the sender forge a
+// second block carrying a from/peer_id it does not own, so both delimiters are
+// defanged before the body is embedded.
+function sealPeerMessageBody(body: string): string {
+  // Case- and whitespace-tolerant: the receiving agent reads the wrapper as
+  // markup, so any spelling a reader would accept as a tag must be defanged, not
+  // only the exact bytes this module emits.
+  return body
+    .replace(/<\s*\/\s*peer_message\s*>/gi, "&lt;/peer_message&gt;")
+    .replace(/<\s*peer_message(?=[\s>/]|$)/gi, "&lt;peer_message");
+}
+
 function escapeAttribute(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return value.replaceAll("&", "&amp;").replaceAll("\"", "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 /**
@@ -373,7 +460,7 @@ export function peerMessageTag(message: PeerMessage): string {
     `<peer_message from="${escapeAttribute(message.fromName)}" peer_id="${escapeAttribute(peerId)}" sent_at="${escapeAttribute(message.createdAt)}">`,
     `Reply if useful with talk_to({ target: "${peerId}", message: "..." }).`,
     "",
-    message.message,
+    sealPeerMessageBody(message.message),
     "</peer_message>",
   ].join("\n");
 }

@@ -18,9 +18,9 @@ unrelated product surfaces: batch delegation (`call_agents`,
 `subagents_list`, `subagent_resume`), agent configuration, loop workflows,
 mux spawning, and the persistent advisor.
 
-The peer runtime itself is self-contained — HerdR workspace identity,
-filesystem mailboxes, bounded event history, and versioned request/reply
-envelopes. It has no runtime dependency on any delegation, loop, or advisor
+The peer runtime itself is self-contained — Herdr workspace identity,
+filesystem mailboxes, bounded event history, and versioned send-only
+message envelopes. It has no runtime dependency on any delegation, loop, or advisor
 module. Packaging it inside pi-roo forced every peer session to carry the
 entire subagent/loop/advisor surface just to use the talk tools, and disabling
 talk still left the rest of the host extension registered.
@@ -35,7 +35,7 @@ Extract peer talk into a dedicated standalone package, `pi-peer`:
   no renderers, no widgets.
 - **No source dependency on the host.** The standalone runtime imports no
   subagent, loop, or advisor module. Its only seams are the Pi extension API
-  and the HerdR environment (env vars + CLI).
+  and the Herdr environment (env vars + CLI).
 - **Generic opt-out.** `PI_PEER_DISABLED=1` is the opt-out: the entrypoint
   returns before registering anything. No host feature gate is required; any
   host can use the same env var.
@@ -75,27 +75,24 @@ Tradeoffs:
 - Existing pi-roo users must disable talk (`features.talk=false`) before a dual
   install, and all peers must reload to re-register in the new namespace.
 - The public repository `github.com/sting8k/pi-peer` is the canonical home;
-  this clean-history root commit is the initial `main` release. Package
-  metadata targets it (`author`: `sting8k`, `repository`/`homepage`/`bugs`
-  set, `version: 1.0.0` — slice 10). npm publishing is out of scope:
-  `private: true`, GitHub-only distribution.
-- The live new-namespace HerdR cutover has been executed (slice 7): two live
-  Pi panes in one workspace discovered each other and exchanged a `talk_to`
-  request/reply (marker `PI_PEER_3WAY_OK`), with reverse discovery/read
+  the current package metadata is public `@sting8k/pi-peer` version `2.1.1`,
+  with npm and GitHub distribution.
+- The live new-namespace Herdr cutover has been executed (slice 7): two live
+  Pi panes in one workspace discovered each other and exchanged send-only
+  `talk_to` messages (marker `PI_PEER_3WAY_OK`), with reverse discovery/read
   passes and version-2 history artifacts that never publish thinking. Proof
-  is recorded in `docs/TEST_MATRIX.md` and story `US-010`; abort/
-  session-switch/fail-closed behavior remains automated-proof only.
+  is recorded in `docs/TEST_MATRIX.md` and story `US-010`; POSIX live runtime
+  and full live peer-chat coverage remain unverified.
 
 ## Follow-Up
 
-- ~~Execute a live two-session HerdR cutover in the `pi-peer/talk` namespace~~
+- ~~Execute a live two-session Herdr cutover in the `pi-peer/talk` namespace~~
   (story `US-010`) — **done** (slice 7, live pass recorded).
 - ~~Perform the clean-history initial `main` push to `github.com/sting8k/pi-peer`~~
   — **done**: this clean-history root commit is the initial `main` release;
   install instructions target `git:github.com/sting8k/pi-peer`.
-- ~~Refresh `author`/`repository` package metadata at release~~ — **done**
-  (slice 10): metadata targets `sting8k/pi-peer` (`author`, `repository`,
-  `homepage`, `bugs`, `version: 1.0.0`, `private: true`).
+- ~~Refresh package metadata at release~~ — **done** (slice 10): metadata
+  targets `sting8k/pi-peer` with public npm/GitHub distribution.
 - User-facing peer identity is the public id `peer-<last 3 chars of session
   id>` (slice 8): `talk_sessions` returns it, examples lead with it, and
   target resolution accepts the public id or a unique display name, failing

@@ -195,9 +195,11 @@ export function entriesToTalkEvents(entries: SessionEntry[]): TalkEvent[] {
 export function getCurrentLineageEntries<T extends SessionEntry>(entries: T[]): T[] {
   const entriesById = new Map<string, T>();
   for (const entry of entries) {
-    if (typeof entry.id === "string" && entry.id.trim()) {
-      entriesById.set(entry.id, entry);
-    }
+    if (typeof entry.id !== "string" || !entry.id.trim()) continue;
+    // Duplicate ids make parent links ambiguous. Publishing either branch
+    // would be less safe than suppressing the snapshot entirely.
+    if (entriesById.has(entry.id)) return [];
+    entriesById.set(entry.id, entry);
   }
 
   // Newest entry with a usable id present in the map is the lineage leaf.
@@ -227,7 +229,19 @@ export function getCurrentLineageEntries<T extends SessionEntry>(entries: T[]): 
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+  const entries: SessionEntry[] = [];
+  for (const line of lines.slice(afterLine)) {
+    // A session file is appended to while it is read, so the trailing line can be
+    // a partial write, and an editor can leave a BOM on the first line. Skipping
+    // the unusable line keeps the rest of the transcript publishable; failing the
+    // whole read makes talk_latest silently empty.
+    try {
+      entries.push(JSON.parse(line.trim()) as SessionEntry);
+    } catch {
+      continue;
+    }
+  }
+  return entries;
 }
 
 export function readHistory(root: string, sessionId: string): LatestPeerHistory {
@@ -250,8 +264,8 @@ export function publishHistory(runtime: HistoryRuntime, events: TalkEvent[]): vo
 
 /**
  * Rebuild the bounded history from the peer's own current lineage on
- * startup/resume and on `agent_end` (entries are persisted before the end
- * event), so ids are stable and there is no duplicate risk. Always replaces,
+ * startup/resume and on `agent_settled` (entries are persisted before the
+ * settled event), so ids are stable and there is no duplicate risk. Always replaces,
  * so an empty current lineage clears a stale history.
  */
 export function publishHistoryFromOwnSession(runtime: HistoryRuntime, ctx: any): void {

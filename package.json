@@ -1,7 +1,7 @@
 {
   "name": "@sting8k/pi-peer",
-  "version": "2.1.0",
-  "description": "Standalone peer-to-peer Pi communication over the HerdR workspace - talk_to, talk_sessions, and talk_latest tools with a resilient local mailbox.",
+  "version": "2.1.1",
+  "description": "Standalone peer-to-peer Pi communication over the Herdr workspace - talk_to, talk_sessions, and talk_latest tools with a resilient local mailbox.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -31,7 +31,7 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
@@ -43,9 +43,9 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.2",
-    "@sinclair/typebox": "^0.34.49",
     "@types/node": "^24.0.0",
     "tsx": "^4.23.6",
+    "typebox": "1.3.7",
     "typescript": "^5.9.3"
   }
 }

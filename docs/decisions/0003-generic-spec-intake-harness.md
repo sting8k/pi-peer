@@ -4,7 +4,11 @@ Date: 2026-05-05
 
 ## Status
 
-Accepted
+Accepted, retired 2026-08-20
+
+Retired 2026-08-20: protocol v1 reached end of life on 2026-08-10 and the
+repository now follows `docs/WORKFLOW.md`. Kept as the record of why the
+retired mechanism existed.
 
 ## Context
 

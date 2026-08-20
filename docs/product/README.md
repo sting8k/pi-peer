@@ -1,7 +1,7 @@
 # Product Docs — pi-peer
 
 This folder is the current product contract for the standalone **pi-peer**
-extension (peer-to-peer Pi communication over a HerdR workspace). It describes
+extension (peer-to-peer Pi communication over a Herdr workspace). It describes
 only pi-peer; the pi-roo subagent/loop/advisor product is out of scope here.
 
 ## Files
@@ -9,7 +9,7 @@ only pi-peer; the pi-roo subagent/loop/advisor product is out of scope here.
 - `overview.md` — purpose, user-facing model, the three tools, semantics, and
   runtime requirements.
 - `docs/TEST_MATRIX.md` — validation matrix and commands for the peer-talk
-  surface (kept at repo root of `docs/` alongside other Harness docs).
+  surface.
 
 ## Source Relationship
 
@@ -18,17 +18,18 @@ only pi-peer; the pi-roo subagent/loop/advisor product is out of scope here.
 | Public entrypoint | `README.md` |
 | Runtime (ships in package) | `pi-extension/pi-peer/*` |
 | Executable proof | `test/peer/`, `test/integration/`, `npm test`, `npm run typecheck` |
-| Decisions | `docs/decisions/0009`, `0010`, `0011` |
-| Stories | `docs/stories/epics/E06-peer-talk/US-009`, `docs/stories/epics/E07-pi-peer-standalone/US-010` |
+| Decisions | `docs/decisions/0009`–`0013` |
+| Durable plans | `docs/plans/` (none active) |
 
 ## Process
 
-1. Product truth lives here; a change to the contract is a story.
-2. Stories carry a proof plan; executable proof must pass before a story is
-   done.
+1. Product truth lives here; executable proof must pass before a contract
+   change is done.
+2. Work spanning sessions gets one document in `docs/plans/active/`, moved to
+   `docs/plans/completed/` only after validation.
 3. Durable decisions land in `docs/decisions/` as numbered ADRs.
-4. Harness context (`docs/HARNESS.md`, `docs/CONTEXT_RULES.md`,
-   `docs/HARNESS_COMPONENTS.md`) references this folder as the source of truth.
+4. `docs/WORKFLOW.md` carries the process; it references this folder as the
+   product source of truth.
 
-When the product contract changes, update this folder first, then the story and
+When the product contract changes, update this folder first, then the proof and
 the decision that captures the change.

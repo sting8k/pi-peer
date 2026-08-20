@@ -423,7 +423,12 @@ export async function liveRecords(
 // second block carrying a from/peer_id it does not own, so both delimiters are
 // defanged before the body is embedded.
 function sealPeerMessageBody(body: string): string {
-  return body.replaceAll("</peer_message>", "&lt;/peer_message&gt;").replaceAll("<peer_message", "&lt;peer_message");
+  // Case- and whitespace-tolerant: the receiving agent reads the wrapper as
+  // markup, so any spelling a reader would accept as a tag must be defanged, not
+  // only the exact bytes this module emits.
+  return body
+    .replace(/<\s*\/\s*peer_message\s*>/gi, "&lt;/peer_message&gt;")
+    .replace(/<\s*peer_message(?=[\s>/]|$)/gi, "&lt;peer_message");
 }
 
 function escapeAttribute(value: string): string {

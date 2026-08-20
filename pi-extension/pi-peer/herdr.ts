@@ -40,16 +40,6 @@ interface HerdrAgentRenameResult {
   agent?: { name?: string };
 }
 
-interface HerdrTabInfo {
-  label: string;
-  pane_count: number;
-  custom_name?: string | null;
-}
-
-interface HerdrTabRenameResult {
-  tab?: { label?: string };
-}
-
 interface HerdrResponse<T> {
   result?: T;
 }
@@ -57,7 +47,16 @@ interface HerdrResponse<T> {
 const HERDR_CLI_TIMEOUT_MS = 5_000;
 const HERDR_AGENT_NAME_MAX_LENGTH = 32;
 const HERDR_AGENT_FALLBACK_SUFFIX_LENGTH = 8;
-const AUTO_TAB_LABEL_PATTERN = /^[1-9]\d*$/;
+/**
+ * Fixed, never-derived source id. `--clear-title` only clears the title for the
+ * source that set it, so deriving this from a session id or peer name would strand
+ * the previous run's title forever with no way to clear it.
+ */
+const HERDR_METADATA_SOURCE = "pi-peer";
+// Orders report-metadata calls within this process's lifetime only. Herdr
+// rejects an out-of-order report for the same --source; it must not be
+// persisted, since it has no meaning across a process restart.
+let herdrMetadataSeq = 0;
 
 function trimHerdrNameSuffix(value: string): string {
   let end = value.length;
@@ -168,30 +167,6 @@ function herdrPaneFrom(value: unknown): HerdrPane {
   return pane as HerdrPane;
 }
 
-function herdrTabFrom(value: unknown): HerdrTabInfo {
-  const candidate = value && typeof value === "object"
-    ? value as { tab?: Partial<HerdrTabInfo> }
-    : {};
-  const tab = candidate.tab;
-  if (typeof tab?.label !== "string" || typeof tab.pane_count !== "number") {
-    throw new TypeError("Herdr response did not include complete tab information");
-  }
-  return tab as HerdrTabInfo;
-}
-
-export function shouldMirrorPeerNameToSinglePaneTab(tab: {
-  paneCount: number;
-  label: string;
-  customName?: string | null;
-}): boolean {
-  // Prefer an explicit ownership signal when a newer Herdr API provides it.
-  if (tab.customName !== undefined) return tab.paneCount === 1 && tab.customName === null;
-  // Current Herdr TabInfo omits custom_name; automatic labels are the current
-  // positive decimal tab position (which can differ from stable `number` after
-  // a tab is closed), so never compare the label with `number` here.
-  return tab.paneCount === 1 && AUTO_TAB_LABEL_PATTERN.test(tab.label);
-}
-
 export function getHerdrBinaryPath(): string {
   return process.env.HERDR_BIN_PATH || "herdr";
 }
@@ -215,6 +190,9 @@ async function herdrRunAsync(
   return stdout;
 }
 
+/** Injectable for tests only; production always uses the real CLI. */
+export type HerdrRunner = (args: string[], socketPath: string, options: HerdrRunAsyncOptions) => Promise<string>;
+
 async function getHerdrPaneAsync(
   paneId: string,
   socketPath: string,
@@ -222,15 +200,6 @@ async function getHerdrPaneAsync(
 ): Promise<HerdrPane> {
   const raw = await herdrRunAsync(["pane", "get", paneId], socketPath, options);
   return herdrPaneFrom(decodeHerdrJson(raw, "pane get"));
-}
-
-async function getHerdrTabAsync(
-  tabId: string,
-  socketPath: string,
-  options: HerdrRunAsyncOptions = {},
-): Promise<HerdrTabInfo> {
-  const raw = await herdrRunAsync(["tab", "get", tabId], socketPath, options);
-  return herdrTabFrom(decodeHerdrJson(raw, "tab get"));
 }
 
 function herdrAgentStatusFrom(pane: HerdrPane): HerdrAgentStatus {
@@ -290,41 +259,64 @@ async function renameHerdrAgentWithFallbackAsync(
   }
 }
 
-async function renameSinglePaneTabAsync(
-  peer: HerdrPeerContext,
-  name: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  // A pane can move after session_start. Resolve the tab from the pane at the
-  // point of rename so a cached tab id cannot rename an unrelated tab.
-  const currentPane = await getHerdrPaneAsync(peer.paneId, peer.socketPath, { signal });
-  if (currentPane.workspace_id !== peer.workspaceId) {
-    throw new Error("Herdr pane workspace changed before tab rename");
-  }
-  if (currentPane.terminal_id !== peer.terminalId) {
-    throw new Error("Herdr pane terminal changed before tab rename");
-  }
-  const tabId = currentPane.tab_id;
-  if (!tabId) return;
-  const tab = await getHerdrTabAsync(tabId, peer.socketPath, { signal });
-  if (!shouldMirrorPeerNameToSinglePaneTab({
-    paneCount: tab.pane_count,
-    label: tab.label,
-    customName: tab.custom_name,
-  })) return;
-
-  const raw = await herdrRunAsync(
-    ["tab", "rename", tabId, name],
-    peer.socketPath,
-    { signal },
-  );
-  const result = decodeHerdrJson<HerdrTabRenameResult>(raw, "tab rename");
-  if (result?.tab?.label !== name) {
-    throw new Error(`Herdr tab rename did not apply label ${name}`);
-  }
+/**
+ * Decide what to do with the pane's metadata title given the pane's current
+ * `manual_label`. Pure and total: pi-peer never writes `manual_label`, so a
+ * non-empty label always means someone else set it, and pi-peer defers by
+ * clearing its own title rather than fighting for the slot.
+ */
+export function decideHerdrPaneTitleAction(label: string | undefined): "publish" | "clear" {
+  return label ? "clear" : "publish";
 }
 
-/** Keep the current Pi's Herdr agent and auto-named single-pane tab readable. */
+async function readHerdrPaneLabelAsync(
+  peer: HerdrPeerContext,
+  signal: AbortSignal | undefined,
+  run: HerdrRunner,
+): Promise<string | undefined> {
+  const raw = await run(["pane", "get", peer.paneId], peer.socketPath, { signal });
+  const result = decodeHerdrJson<{ pane?: { label?: string } }>(raw, "pane get");
+  return result?.pane?.label;
+}
+
+/**
+ * Publish the peer's display name onto the pane border via Herdr's metadata
+ * title slot (`herdr pane report-metadata --title`), which outranks
+ * `manual_label` on the border but is a separate field and never writes it.
+ * See docs/plans/active/0001-peer-hardening-and-pane-label.md Task 7.
+ *
+ * `--agent pi` ties the title's visibility to Herdr's own independent "pi"
+ * process detection: Herdr stops showing it as soon as it detects the pi
+ * process has exited from this pane, with no shutdown hook or GC needed here.
+ */
+export async function publishHerdrPaneTitleAsync(
+  peer: HerdrPeerContext,
+  appliedName: string,
+  signal?: AbortSignal,
+  run: HerdrRunner = herdrRunAsync,
+): Promise<void> {
+  const label = await readHerdrPaneLabelAsync(peer, signal, run);
+  const action = decideHerdrPaneTitleAction(label);
+  const args = action === "clear"
+    ? ["pane", "report-metadata", peer.paneId, "--source", HERDR_METADATA_SOURCE, "--clear-title"]
+    : [
+      "pane", "report-metadata", peer.paneId,
+      "--source", HERDR_METADATA_SOURCE,
+      "--agent", "pi",
+      "--title", appliedName,
+      "--seq", String(++herdrMetadataSeq),
+    ];
+  await run(args, peer.socketPath, { signal });
+}
+
+
+/**
+ * Keep the current Pi's Herdr agent panel name and pane border title readable.
+ * Does not touch tab labels: pi-peer used to mirror the name onto an
+ * auto-numbered single-pane tab, but Herdr's tab API has no separate slot and
+ * no undo for that write, so the tab is deliberately left alone (see
+ * docs/plans/active/0001-peer-hardening-and-pane-label.md Task 7).
+ */
 export async function syncCurrentHerdrIdentityAsync(
   peer: HerdrPeerContext,
   name: string,
@@ -340,13 +332,13 @@ export async function syncCurrentHerdrIdentityAsync(
     agentError = error;
   }
 
-  // Mirror the tab only once the agent panel accepted the name; otherwise the
-  // tab would advertise a name the agent never took.
+  // Publish the title only once the agent panel accepted the name; otherwise
+  // the border would advertise a name the agent never took.
   if (!agentError) {
     try {
-      await renameSinglePaneTabAsync(peer, appliedName, signal);
+      await publishHerdrPaneTitleAsync(peer, appliedName, signal);
     } catch (error) {
-      console.error("pi-peer Herdr single-pane tab rename failed", error);
+      console.error("pi-peer Herdr pane title publish failed", error);
     }
   }
 

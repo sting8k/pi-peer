@@ -8,11 +8,13 @@ import { pathToFileURL } from "node:url";
 import { Value } from "typebox/value";
 
 import {
+  decideHerdrPaneTitleAction,
   getAgentConfigDir,
   getHerdrBinaryPath,
   herdrAgentNameFromPeerName,
   herdrPeerIdentityMatches,
-  shouldMirrorPeerNameToSinglePaneTab,
+  publishHerdrPaneTitleAsync,
+  type HerdrRunner,
 } from "../../pi-extension/pi-peer/herdr.ts";
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "../../pi-extension/pi-peer/schemas.ts";
 import {
@@ -215,28 +217,102 @@ describe("peer talk protocol", () => {
     assert.equal(herdrPeerIdentityMatches(peer, { workspace_id: "workspace-1", terminal_id: "terminal-2" }), false);
   });
 
-  it("mirrors only automatic labels for single-pane tabs", () => {
-    assert.equal(
-      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3" }),
-      true,
-    );
-    assert.equal(
-      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 2, label: "3" }),
-      false,
-    );
-    assert.equal(
-      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "editor" }),
-      false,
-    );
-    assert.equal(
-      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3", customName: "3" }),
-      false,
-      "an explicit custom label wins when Herdr exposes the metadata",
-    );
-    assert.equal(
-      shouldMirrorPeerNameToSinglePaneTab({ paneCount: 1, label: "3", customName: null }),
-      true,
-    );
+  it("decideHerdrPaneTitleAction: publish when absent or empty, clear when the user already owns the label", () => {
+    assert.equal(decideHerdrPaneTitleAction(undefined), "publish", "no label set at all");
+    assert.equal(decideHerdrPaneTitleAction(""), "publish", "empty-string label is treated the same as absent");
+    assert.equal(decideHerdrPaneTitleAction("zhang"), "clear", "a non-empty label always means someone other than pi-peer set it");
+  });
+
+  it("publishHerdrPaneTitleAsync: publish argv carries source/agent/title and never touches manual_label or a TTL", async () => {
+    const calls: { args: string[]; socketPath: string }[] = [];
+    const run: HerdrRunner = async (args, socketPath) => {
+      calls.push({ args, socketPath });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      return JSON.stringify({ result: {} });
+    };
+    const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+
+    assert.equal(calls.length, 2, "reads the label once, then issues exactly one report-metadata call");
+    assert.deepEqual(calls[0].args, ["pane", "get", "pane-1"]);
+    const publishArgs = calls[1].args;
+    assert.deepEqual(publishArgs.slice(0, 3), ["pane", "report-metadata", "pane-1"]);
+    assert.ok(publishArgs.includes("--source"), "has --source");
+    assert.equal(publishArgs[publishArgs.indexOf("--source") + 1], "pi-peer");
+    assert.ok(publishArgs.includes("--agent"), "has --agent");
+    assert.equal(publishArgs[publishArgs.indexOf("--agent") + 1], "pi");
+    assert.ok(publishArgs.includes("--title"), "has --title");
+    assert.equal(publishArgs[publishArgs.indexOf("--title") + 1], "zhang");
+    assert.ok(!publishArgs.includes("--ttl-ms"), "never a TTL: a dead pi process must not linger with an expiring title");
+    assert.ok(!publishArgs.includes("rename"), "never the rename verb");
+    assert.ok(!publishArgs.includes("--clear-title"), "publish path never clears");
+  });
+
+  it("publishHerdrPaneTitleAsync: clear argv carries source/clear-title and nothing else when the user owns the label", async () => {
+    const calls: { args: string[] }[] = [];
+    const run: HerdrRunner = async (args) => {
+      calls.push({ args });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { label: "zhang" } } });
+      return JSON.stringify({ result: {} });
+    };
+    const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+
+    const clearArgs = calls[1].args;
+    assert.deepEqual(clearArgs, ["pane", "report-metadata", "pane-1", "--source", "pi-peer", "--clear-title"]);
+  });
+
+  it("publishHerdrPaneTitleAsync: never emits a tab-rename or pane-rename argv under any input", async () => {
+    const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+    for (const label of [undefined, "", "someone-else"]) {
+      const seenArgv: string[][] = [];
+      const run: HerdrRunner = async (args) => {
+        seenArgv.push(args);
+        if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { label } } });
+        return JSON.stringify({ result: {} });
+      };
+      await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+      for (const args of seenArgv) {
+        assert.notDeepEqual(args.slice(0, 2), ["tab", "rename"], `no tab rename for label=${JSON.stringify(label)}`);
+        assert.notDeepEqual(args.slice(0, 2), ["pane", "rename"], `no pane rename for label=${JSON.stringify(label)}`);
+      }
+    }
+  });
+
+  it("publishHerdrPaneTitleAsync: --source is a fixed constant across calls with different peer names", async () => {
+    // The trap: --clear-title only clears the title for the source that set it.
+    // A source derived from the peer name/session id would strand every prior
+    // run's title with no way to ever clear it again.
+    const sources: string[] = [];
+    const run: HerdrRunner = async (args) => {
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      const idx = args.indexOf("--source");
+      if (idx >= 0) sources.push(args[idx + 1]);
+      return JSON.stringify({ result: {} });
+    };
+    const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "pooh", undefined, run);
+    assert.equal(sources.length, 2);
+    assert.equal(sources[0], sources[1], "same --source regardless of the applied peer name");
+    assert.equal(sources[0], "pi-peer");
+  });
+
+  it("publishHerdrPaneTitleAsync: --seq strictly increases across successive publish calls", async () => {
+    const seqs: number[] = [];
+    const run: HerdrRunner = async (args) => {
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      const idx = args.indexOf("--seq");
+      if (idx >= 0) seqs.push(Number(args[idx + 1]));
+      return JSON.stringify({ result: {} });
+    };
+    const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
+    await publishHerdrPaneTitleAsync(peer, "one", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "two", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "three", undefined, run);
+    assert.equal(seqs.length, 3);
+    assert.ok(seqs[1] > seqs[0], "seq strictly increases (call 2 > call 1)");
+    assert.ok(seqs[2] > seqs[1], "seq strictly increases (call 3 > call 2)");
   });
 
   it("picks a deterministic name for the same session and taken set", () => {

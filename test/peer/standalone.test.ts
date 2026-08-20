@@ -1227,6 +1227,63 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("talk_to does not enqueue into the target inbox when the signal aborts during liveRecords", async () => {
+    const root = createTestDir();
+    const tools = new Map<string, any>();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-sender-abort";
+    const targetSessionId = "session-target-abort";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/sender", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage() {},
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-sender-abort", terminalId: "term-sender-abort", tabId: "tab-sender-abort",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      // liveRecords calls this once per live record; a real delay here gives
+      // the test a window to abort while executeTalkTo is still inside the
+      // `await liveRecords(...)` call.
+      getPeerStatus: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return "idle" as const;
+      },
+      rootDir: () => root,
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      mkdirSync(sessionDir(root), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "sender session registration");
+      // A second live peer, registered directly (not through its own runtime).
+      writeFileSync(recordPath(root, targetSessionId), JSON.stringify({
+        schemaVersion: 1, sessionId: targetSessionId, name: "target-abort", cwd: "/work/target",
+        workspaceId: "workspace-1", paneId: "pane-target-abort", terminalId: "term-target-abort",
+        tabId: "tab-target-abort", createdAt: nowIso(),
+      }));
+
+      const controller = new AbortController();
+      const call = tools.get("talk_to").execute("call", { target: "target-abort", message: "hello" }, controller.signal, undefined, ctx);
+      // Abort while getPeerStatus is still delaying inside liveRecords.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      controller.abort();
+
+      await assert.rejects(call, "an abort that lands during liveRecords must reject, not enqueue");
+      const targetInbox = inboxDir(root, targetSessionId);
+      const queued = existsSync(targetInbox) ? readdirSync(targetInbox).filter((f) => f.endsWith(".json")) : [];
+      assert.deepEqual(queued, [], "no message was enqueued into the target inbox after the abort");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("shutdown is clean: no fabricated reply, no waiter/reply dirs, registration removed, polling stops", async () => {
     const root = createTestDir();
     const sentMessages: string[] = [];

@@ -131,6 +131,9 @@ async function executeTalkTo(
   if (!target) throw new Error("talk_to requires a target");
   if (!message) throw new Error("talk_to requires a non-empty message");
   const peers = await liveRecords(runtime.root, runtime.record.workspaceId, runtime.peer.socketPath, getStatus, signal);
+  // liveRecords probes every peer over the Herdr socket and can take a while;
+  // an abort that lands during that await must not still enqueue the message.
+  signal?.throwIfAborted?.();
   const targetRecord = resolveTarget(peers.map((entry) => entry.record), target);
   if (targetRecord.sessionId === runtime.record.sessionId) throw new Error("talk_to cannot target the current session");
   const sent: PeerMessage = {

@@ -227,11 +227,11 @@ describe("peer talk protocol", () => {
     const calls: { args: string[]; socketPath: string }[] = [];
     const run: HerdrRunner = async (args, socketPath) => {
       calls.push({ args, socketPath });
-      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { pane_id: "pane-1", terminal_id: "terminal-1" } } });
       return JSON.stringify({ result: {} });
     };
     const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
-    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "zhang", { run });
 
     assert.equal(calls.length, 2, "reads the label once, then issues exactly one report-metadata call");
     assert.deepEqual(calls[0].args, ["pane", "get", "pane-1"]);
@@ -252,11 +252,11 @@ describe("peer talk protocol", () => {
     const calls: { args: string[] }[] = [];
     const run: HerdrRunner = async (args) => {
       calls.push({ args });
-      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { label: "zhang" } } });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { pane_id: "pane-1", terminal_id: "terminal-1", label: "zhang" } } });
       return JSON.stringify({ result: {} });
     };
     const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
-    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "zhang", { run });
 
     const clearArgs = calls[1].args;
     assert.deepEqual(clearArgs, ["pane", "report-metadata", "pane-1", "--source", "pi-peer", "--clear-title"]);
@@ -268,10 +268,10 @@ describe("peer talk protocol", () => {
       const seenArgv: string[][] = [];
       const run: HerdrRunner = async (args) => {
         seenArgv.push(args);
-        if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { label } } });
+        if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { pane_id: "pane-1", terminal_id: "terminal-1", label } } });
         return JSON.stringify({ result: {} });
       };
-      await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
+      await publishHerdrPaneTitleAsync(peer, "zhang", { run });
       for (const args of seenArgv) {
         assert.notDeepEqual(args.slice(0, 2), ["tab", "rename"], `no tab rename for label=${JSON.stringify(label)}`);
         assert.notDeepEqual(args.slice(0, 2), ["pane", "rename"], `no pane rename for label=${JSON.stringify(label)}`);
@@ -285,14 +285,14 @@ describe("peer talk protocol", () => {
     // run's title with no way to ever clear it again.
     const sources: string[] = [];
     const run: HerdrRunner = async (args) => {
-      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { pane_id: "pane-1", terminal_id: "terminal-1" } } });
       const idx = args.indexOf("--source");
       if (idx >= 0) sources.push(args[idx + 1]);
       return JSON.stringify({ result: {} });
     };
     const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
-    await publishHerdrPaneTitleAsync(peer, "zhang", undefined, run);
-    await publishHerdrPaneTitleAsync(peer, "pooh", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "zhang", { run });
+    await publishHerdrPaneTitleAsync(peer, "pooh", { run });
     assert.equal(sources.length, 2);
     assert.equal(sources[0], sources[1], "same --source regardless of the applied peer name");
     assert.equal(sources[0], "pi-peer");
@@ -301,15 +301,15 @@ describe("peer talk protocol", () => {
   it("publishHerdrPaneTitleAsync: --seq strictly increases across successive publish calls", async () => {
     const seqs: number[] = [];
     const run: HerdrRunner = async (args) => {
-      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: {} } });
+      if (args[0] === "pane" && args[1] === "get") return JSON.stringify({ result: { pane: { pane_id: "pane-1", terminal_id: "terminal-1" } } });
       const idx = args.indexOf("--seq");
       if (idx >= 0) seqs.push(Number(args[idx + 1]));
       return JSON.stringify({ result: {} });
     };
     const peer = { paneId: "pane-1", terminalId: "terminal-1", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" };
-    await publishHerdrPaneTitleAsync(peer, "one", undefined, run);
-    await publishHerdrPaneTitleAsync(peer, "two", undefined, run);
-    await publishHerdrPaneTitleAsync(peer, "three", undefined, run);
+    await publishHerdrPaneTitleAsync(peer, "one", { run });
+    await publishHerdrPaneTitleAsync(peer, "two", { run });
+    await publishHerdrPaneTitleAsync(peer, "three", { run });
     assert.equal(seqs.length, 3);
     assert.ok(seqs[1] > seqs[0], "seq strictly increases (call 2 > call 1)");
     assert.ok(seqs[2] > seqs[1], "seq strictly increases (call 3 > call 2)");

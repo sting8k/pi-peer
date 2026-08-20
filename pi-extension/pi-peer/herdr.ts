@@ -34,6 +34,8 @@ interface HerdrPane {
   terminal_id: string;
   tab_id?: string;
   workspace_id?: string;
+  // Herdr omits this key when a pane has no manual label; absent, not empty.
+  label?: string;
 }
 
 interface HerdrAgentRenameResult {
@@ -190,15 +192,21 @@ async function herdrRunAsync(
   return stdout;
 }
 
-/** Injectable for tests only; production always uses the real CLI. */
+/** The boundary every Herdr CLI invocation passes through. Production satisfies it with `herdrRunAsync`; tests substitute a fake. */
 export type HerdrRunner = (args: string[], socketPath: string, options: HerdrRunAsyncOptions) => Promise<string>;
+
+interface HerdrCallOptions extends HerdrRunAsyncOptions {
+  /** Substitutes the Herdr CLI. Defaults to the real one; tests pass a fake. */
+  run?: HerdrRunner;
+}
 
 async function getHerdrPaneAsync(
   paneId: string,
   socketPath: string,
-  options: HerdrRunAsyncOptions = {},
+  options: HerdrCallOptions = {},
 ): Promise<HerdrPane> {
-  const raw = await herdrRunAsync(["pane", "get", paneId], socketPath, options);
+  const { run = herdrRunAsync, ...rest } = options;
+  const raw = await run(["pane", "get", paneId], socketPath, rest);
   return herdrPaneFrom(decodeHerdrJson(raw, "pane get"));
 }
 
@@ -269,16 +277,6 @@ export function decideHerdrPaneTitleAction(label: string | undefined): "publish"
   return label ? "clear" : "publish";
 }
 
-async function readHerdrPaneLabelAsync(
-  peer: HerdrPeerContext,
-  signal: AbortSignal | undefined,
-  run: HerdrRunner,
-): Promise<string | undefined> {
-  const raw = await run(["pane", "get", peer.paneId], peer.socketPath, { signal });
-  const result = decodeHerdrJson<{ pane?: { label?: string } }>(raw, "pane get");
-  return result?.pane?.label;
-}
-
 /**
  * Publish the peer's display name onto the pane border via Herdr's metadata
  * title slot (`herdr pane report-metadata --title`), which outranks
@@ -292,11 +290,11 @@ async function readHerdrPaneLabelAsync(
 export async function publishHerdrPaneTitleAsync(
   peer: HerdrPeerContext,
   appliedName: string,
-  signal?: AbortSignal,
-  run: HerdrRunner = herdrRunAsync,
+  options: HerdrCallOptions = {},
 ): Promise<void> {
-  const label = await readHerdrPaneLabelAsync(peer, signal, run);
-  const action = decideHerdrPaneTitleAction(label);
+  const { run = herdrRunAsync, ...rest } = options;
+  const pane = await getHerdrPaneAsync(peer.paneId, peer.socketPath, options);
+  const action = decideHerdrPaneTitleAction(pane.label);
   const args = action === "clear"
     ? ["pane", "report-metadata", peer.paneId, "--source", HERDR_METADATA_SOURCE, "--clear-title"]
     : [
@@ -306,7 +304,7 @@ export async function publishHerdrPaneTitleAsync(
       "--title", appliedName,
       "--seq", String(++herdrMetadataSeq),
     ];
-  await run(args, peer.socketPath, { signal });
+  await run(args, peer.socketPath, rest);
 }
 
 
@@ -336,7 +334,7 @@ export async function syncCurrentHerdrIdentityAsync(
   // the border would advertise a name the agent never took.
   if (!agentError) {
     try {
-      await publishHerdrPaneTitleAsync(peer, appliedName, signal);
+      await publishHerdrPaneTitleAsync(peer, appliedName, { signal });
     } catch (error) {
       console.error("pi-peer Herdr pane title publish failed", error);
     }

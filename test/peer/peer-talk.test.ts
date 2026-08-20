@@ -445,6 +445,36 @@ describe("peer talk protocol", () => {
     }
   });
 
+  it("withRegistrationLock recovers when its parent directory vanishes during a retry", async () => {
+    const root = createTestDir();
+    try {
+      // Force the contender into the retry loop: the holder keeps the lock long
+      // enough that the contender is guaranteed to hit EEXIST and start
+      // backing off (the `await setTimeout(...)` at the yield point this test
+      // targets).
+      const holder = withRegistrationLock(root, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return "holder";
+      });
+      const contender = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return withRegistrationLock(root, () => "contender");
+      })();
+      // Remove the parent mid-retry. Every retry attempt from here until the
+      // holder releases at t=300ms hits the vanished directory (~240ms window,
+      // not a narrow race) -- without the fix, mkdirSync(lockPath) throws
+      // ENOENT and the contender never recovers.
+      setTimeout(() => rmSync(sessionDir(root), { recursive: true, force: true }), 60);
+
+      const [holderResult, contenderResult] = await Promise.allSettled([holder, contender]);
+      assert.equal(holderResult.status, "fulfilled");
+      assert.equal(contenderResult.status, "fulfilled", contenderResult.status === "rejected" ? String(contenderResult.reason) : undefined);
+      assert.equal(contenderResult.status === "fulfilled" ? contenderResult.value : undefined, "contender");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("drops a pre-existing queued twin when requeueing a claim", () => {
     const root = createTestDir();
     try {

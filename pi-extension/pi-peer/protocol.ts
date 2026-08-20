@@ -139,9 +139,12 @@ export async function withRegistrationLock<T>(root: string, action: () => T | Pr
   const lockPath = registrationLockPath(root);
   const ownerPath = join(lockPath, "owner");
   const ownerToken = `${process.pid}-${randomUUID()}`;
-  mkdirSync(sessionDir(root), { recursive: true, mode: 0o700 });
 
   for (;;) {
+    // Re-ensure on every attempt: the retry below yields, and the tree can be
+    // removed underneath us in that window. Recreating here is what makes a
+    // vanished parent self-healing instead of fatal.
+    mkdirSync(sessionDir(root), { recursive: true, mode: 0o700 });
     let createdLock = false;
     try {
       mkdirSync(lockPath, { mode: 0o700 });

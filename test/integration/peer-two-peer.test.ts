@@ -66,11 +66,21 @@ function createPeer(
   return { ctx, tools, handlers, sentMessages };
 }
 
-function startPeers(peers: PeerHandle[], root: string): void {
+async function startPeers(peers: PeerHandle[], root: string): Promise<void> {
   mkdirSync(join(root, "transcripts"), { recursive: true });
-  for (const peer of peers) {
+  await Promise.all(peers.map((peer) => {
     for (const handler of peer.handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, peer.ctx);
-  }
+  }));
+  // The handler above is deliberately fire-and-forget in production
+  // (service.ts session_start: `void ensureRuntime(...).then(...)`), so it
+  // returns nothing awaitable itself -- Promise.all here only sequences the
+  // synchronous dispatch. Wait on the real postcondition instead: every
+  // peer's registration record exists on disk, exactly what a caller needing
+  // a live peer actually depends on.
+  await waitUntil(
+    () => peers.every((peer) => existsSync(join(root, "sessions", `${peer.ctx.sessionManager.getSessionId()}.json`))),
+    "all peers registered",
+  );
 }
 
 function stopPeers(peers: PeerHandle[]): void {
@@ -86,8 +96,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver], root);
 
       const started = Date.now();
       const result = await sender.tools.get("talk_to").execute(
@@ -119,8 +128,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta", { busy: () => receiverBusy.value });
     const third = createPeer(root, peerStatuses, "session-gamma", "pane-gamma");
     try {
-      startPeers([sender, receiver, third], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver, third], root);
 
       // Idle receiver: plain fresh user turn.
       receiverBusy.value = false;
@@ -155,8 +163,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver], root);
 
       // Enqueue three messages synchronously (all queued before any delivery).
       const inbox = inboxDir(root, "session-beta");
@@ -192,8 +199,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha", { busy: () => senderBusy.value });
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver], root);
 
       // A sends to B; B receives it.
       await sender.tools.get("talk_to").execute("a", { target: "peer-eta", message: "hello B" }, undefined, undefined, sender.ctx);
@@ -225,8 +231,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver], root);
 
       await assert.rejects(
         sender.tools.get("talk_to").execute("dead", { target: "peer-zzz", message: "x" }, undefined, undefined, sender.ctx),
@@ -251,7 +256,10 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
+      await startPeers([sender, receiver], root);
+      // startPeers already waits for both peers' registration records; this is
+      // now redundant but harmless (immediately true) -- left in place because
+      // ownRecord is read from the same file right below.
       await waitUntil(() => existsSync(join(root, "sessions", "session-alpha.json")), "sender registration");
       const ownRecord = JSON.parse(readFileSync(join(root, "sessions", "session-alpha.json"), "utf8")) as { name: string };
       // The sender owns a non-empty history, so a missing self-guard would
@@ -305,8 +313,7 @@ describe("peer two-peer lifecycle (async chat)", () => {
     const sender = createPeer(root, peerStatuses, "session-alpha", "pane-alpha");
     const receiver = createPeer(root, peerStatuses, "session-beta", "pane-beta");
     try {
-      startPeers([sender, receiver], root);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await startPeers([sender, receiver], root);
 
       // A sends to B; B receives the inbound <peer_message>.
       await sender.tools.get("talk_to").execute("a", { target: "peer-eta", message: "Question Q" }, undefined, undefined, sender.ctx);

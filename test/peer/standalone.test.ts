@@ -1068,6 +1068,112 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("readMessage seam: the non-retryable rmSync guard survives an EISDIR that readJsonChecked no longer routes through it", async () => {
+    // Since Task 1's fix, readJsonChecked classifies a directory-shaped entry
+    // as retryable, so the real EISDIR trap test never reaches this rmSync
+    // call any more — that guard has zero coverage under the default deps.
+    // The stub forces non-retryable so the trap still reaches rmSync(dir),
+    // which still throws EISDIR (force only swallows ENOENT), proving the
+    // try/catch here is what keeps that throw from escaping the tick.
+    const root = createTestDir();
+    const originalConsoleError = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-receiver-guard-a";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-ga", terminalId: "term-ga", tabId: "tab-ga",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+      readMessage: (path: string) => (path.endsWith("msg-trap.json") ? { ok: false, retryable: false } : readJsonChecked(path)),
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      const trapPath = join(inbox, "msg-trap.json");
+      mkdirSync(trapPath, { recursive: true });
+      writeFileSync(join(inbox, "msg-valid.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Delivered past the non-retryable trap.")));
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      assert.equal(errors.length, 0, "rmSync's EISDIR must be caught, not escape the tick");
+      assert.equal(sentMessages.length, 1, "the sibling behind the trap is still delivered");
+      assert.match(sentMessages[0], /Delivered past the non-retryable trap\./);
+    } finally {
+      console.error = originalConsoleError;
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("readMessage seam: the malformed/misaddressed rmSync guard survives an EISDIR too", async () => {
+    const root = createTestDir();
+    const originalConsoleError = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => { errors.push(args); };
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-receiver-guard-b";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/receiver", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-gb", terminalId: "term-gb", tabId: "tab-gb",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+      // ok:true with a body that fails isPeerMessage routes into the
+      // malformed/misaddressed branch instead of the read-failure branch.
+      readMessage: (path: string) => (path.endsWith("msg-trap.json") ? { ok: true, value: { not: "a peer message" } } : readJsonChecked(path)),
+    });
+    try {
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => existsSync(recordPath(root, sessionId)), "receiver session registration");
+
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      const trapPath = join(inbox, "msg-trap.json");
+      mkdirSync(trapPath, { recursive: true });
+      writeFileSync(join(inbox, "msg-valid.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Delivered past the malformed trap.")));
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      assert.equal(errors.length, 0, "rmSync's EISDIR must be caught, not escape the tick");
+      assert.equal(sentMessages.length, 1, "the sibling behind the trap is still delivered");
+      assert.match(sentMessages[0], /Delivered past the malformed trap\./);
+    } finally {
+      console.error = originalConsoleError;
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("readMessage seam: a retryable classification is skipped without ever deleting or delivering it", async () => {
     // Deterministic proof of the `if (!read.ok) { if (read.retryable) continue; ... }`
     // branch itself, decoupled from the delete-failure guard: the injected

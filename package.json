@@ -1,6 +1,6 @@
 {
   "name": "@sting8k/pi-peer",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Standalone peer-to-peer Pi communication over the Herdr workspace - talk_to, talk_sessions, and talk_latest tools with a resilient local mailbox.",
   "keywords": [
     "pi-package",

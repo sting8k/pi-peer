@@ -26,6 +26,13 @@ function peerMessage(from: string, fromName: string, to: string, message: string
   return { version: 1, type: "peer_message", id, from, fromName, to, message, createdAt: nowIso() };
 }
 
+// Pane-label CLI calls are always injected in tests: the default impl spawns
+// the real `herdr` binary against a fake socket context.
+const noopPaneLabelDeps = {
+  renamePane: async () => {},
+  clearPaneLabel: async () => {},
+};
+
 describe("pi-peer standalone runtime", () => {
   it("entrypoint registers exactly the three talk tools", () => {
     const { api, registeredTools, registeredCommands, registeredRenderers } = createMockExtensionApi();
@@ -107,7 +114,7 @@ describe("pi-peer standalone runtime", () => {
       },
     };
     // No isBusy override: the standalone runtime must self-track via agent_start/agent_end.
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-standalone", terminalId: "terminal-s", tabId: "tab-s",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -180,7 +187,7 @@ describe("pi-peer standalone runtime", () => {
         sentMessages.push({ content, options });
       },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-no-reply", terminalId: "term-no-reply", tabId: "tab-no-reply",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -238,7 +245,7 @@ describe("pi-peer standalone runtime", () => {
         sentMessages.push(content);
       },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-requeue", terminalId: "term-requeue", tabId: "tab-requeue",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -292,7 +299,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage() {},
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-status", terminalId: "term-status", tabId: "tab-status",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -315,6 +322,189 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("session_start labels the pane with the peer display name; cached path does not re-rename", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    const renames: Array<{ paneId: string; label: string }> = [];
+    const clears: string[] = [];
+    const sessionId = "session-rename";
+    const ctx: any = {
+      cwd: "/work/rename",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, { ...noopPaneLabelDeps,
+      getCurrentPeer: async () => ({
+        paneId: "pane-rename", terminalId: "terminal-rn", tabId: "tab-rn",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { renames.push({ paneId, label }); },
+      clearPaneLabel: async (paneId: string) => { clears.push(paneId); },
+      rootDir: () => root,
+    });
+    try {
+      // Cold shutdown before any bind: no runtime, so no clear must fire.
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      assert.equal(clears.length, 0, "shutdown without a bound runtime does not clear");
+
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await waitUntil(() => renames.length === 1, "pane rename on bind");
+      const record = JSON.parse(readFileSync(recordPath(root, sessionId), "utf8"));
+      assert.deepEqual(renames, [{ paneId: "pane-rename", label: record.name }]);
+
+      // Cached fast-path: a tool call on the same session must not re-rename
+      // (a manual pane rename mid-session is never fought over).
+      await tools.get("talk_sessions").execute("s", {}, undefined, undefined, ctx);
+      assert.equal(renames.length, 1, "cached runtime does not re-rename the pane");
+
+      // Shutdown clears the pane label so a dead pane stops advertising the name.
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      await waitUntil(() => clears.length === 1, "pane label cleared on shutdown");
+      assert.deepEqual(clears, ["pane-rename"]);
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pane-label ops are serialized: switch renames and shutdown clear keep lifecycle order", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    const pending: Array<() => void> = [];
+    const defer = (tag: string) => new Promise<void>((resolve) => { ops.push(tag); pending.push(resolve); });
+    let currentSessionId = "session-slow-a";
+    const ctx: any = {
+      cwd: "/work/slow-rename",
+      sessionManager: {
+        getSessionId: () => currentSessionId,
+        getSessionFile: () => join(root, "transcripts", `${currentSessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-slow", terminalId: "terminal-slow", tabId: "tab-slow",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (_paneId: string, label: string) => { await defer(`rename:${label}`); },
+      clearPaneLabel: async (paneId: string) => { await defer(`clear:${paneId}`); },
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // Bind A: rename A starts and stays pending (deferred).
+      fire("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const nameA = JSON.parse(readFileSync(recordPath(root, "session-slow-a"), "utf8")).name;
+      assert.deepEqual(ops, [`rename:${nameA}`], "bind A renames once");
+
+      // Switch to session B: rename B is queued behind the pending rename A.
+      currentSessionId = "session-slow-b";
+      fire("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(ops.length, 1, "rename B waits for the slow rename A");
+      // Read B's record now: shutdown below removes the owned registration.
+      const nameB = JSON.parse(readFileSync(recordPath(root, "session-slow-b"), "utf8")).name;
+
+      // Shutdown: clear is queued behind rename B, not called early.
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(ops.length, 1, "clear waits for the queued renames");
+
+      // Resolve in order: A completes -> B fires -> resolve B -> clear fires.
+      pending[0](); // rename A settles
+      await waitUntil(() => ops.length === 2, "rename B fires after rename A settles");
+      assert.equal(ops[1], `rename:${nameB}`);
+      pending[1](); // rename B settles
+      await waitUntil(() => ops.length === 3, "clear fires after rename B settles");
+      assert.equal(ops[2], "clear:pane-slow");
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a bind that crosses shutdown never commits a runtime, registration, or pane rename", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const tools = new Map<string, any>();
+    const ops: string[] = [];
+    const statusCalls: Array<[string, string | undefined]> = [];
+    const sessionId = "session-zombie";
+    const ctx: any = {
+      cwd: "/work/zombie",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+      ui: { setStatus: (key: string, text?: string) => { statusCalls.push([key, text]); } },
+    };
+    const api: any = {
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    let resolvePeer: (value: any) => void = () => {};
+    registerTalkTools(api, {
+      getCurrentPeer: () => new Promise((resolve) => { resolvePeer = resolve; }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (_paneId: string, label: string) => { ops.push(`rename:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`clear:${paneId}`); },
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // Bind starts and stays pending inside getCurrentPeer.
+      fire("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Shutdown lands while the bind is still awaiting its peer context.
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+
+      // The bind resolves after shutdown: it must not commit anything.
+      resolvePeer({
+        paneId: "pane-zombie", terminalId: "terminal-z", tabId: "tab-z",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      assert.equal(ops.length, 0, "no pane rename or clear for a dead bind");
+      assert.equal(existsSync(recordPath(root, sessionId)), false, "no registration resurrected");
+      assert.deepEqual(statusCalls, [["pi-peer", undefined]], "no peer status published");
+
+      // (A tool call after shutdown is impossible in a real host: tools die
+      // with the session. The generation guard covers the bind-pending window.)
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("session_start reuses a persisted friendly name for the same session", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
@@ -333,7 +523,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage() {},
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-reuse", terminalId: "terminal-reuse", tabId: "tab-reuse",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -367,7 +557,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage() {},
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-switch", terminalId: "terminal-switch", tabId: "tab-switch",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -410,7 +600,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage(content: any) { sentMessages.push(content); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-reclaim", terminalId: "term-reclaim", tabId: "tab-reclaim",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -534,7 +724,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage(content: any) { sentMessages.push(content); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-r", terminalId: "term-r", tabId: "tab-r",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -587,7 +777,7 @@ describe("pi-peer standalone runtime", () => {
       },
       async sendUserMessage(content: any) { sentMessages.push(content); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({
         paneId: "pane-clean", terminalId: "term-clean", tabId: "tab-clean",
         socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1",
@@ -626,7 +816,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
       async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({ paneId: "pane-f1", terminalId: "terminal-f", tabId: "tab-f", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
       getPeerStatus: async () => "idle",
       rootDir: () => root,
@@ -667,7 +857,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
       async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({ paneId: "pane-f2a", terminalId: "terminal-2", tabId: "tab-2", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
       getPeerStatus: async () => "idle",
       rootDir: () => root,
@@ -705,7 +895,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
       async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({ paneId: "pane-f2d", terminalId: "terminal-3", tabId: "tab-3", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
       getPeerStatus: async () => "idle",
       rootDir: () => root,
@@ -742,7 +932,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
       async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       getCurrentPeer: async () => ({ paneId: "pane-sw2", terminalId: "terminal-sw", tabId: "tab-sw", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
       getPeerStatus: async () => "idle",
       rootDir: () => root,
@@ -781,7 +971,7 @@ describe("pi-peer standalone runtime", () => {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
       async sendUserMessage(content: any, options?: any) { sentMessages.push({ content, options }); },
     };
-    registerTalkTools(api, {
+    registerTalkTools(api, { ...noopPaneLabelDeps,
       // First bind is immediate; the second (A->B) is deliberately slower than
       // one poll tick (POLL_MS = 250ms).
       async getCurrentPeer() {

@@ -6,9 +6,11 @@ import { join } from "node:path";
 
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "./schemas.ts";
 import {
+  clearPaneLabelAsync,
   getCurrentHerdrPeerContextAsync,
   getHerdrPeerStatusAsync,
   getTalkRootDir,
+  renamePaneAsync,
   type HerdrPeerContext,
 } from "./herdr.ts";
 import { readJson, writeAtomic } from "./storage.ts";
@@ -48,6 +50,8 @@ type TalkLatest = Static<typeof TalkLatestParams>;
 export type TalkDeps = {
   getCurrentPeer?: typeof getCurrentHerdrPeerContextAsync;
   getPeerStatus?: typeof getHerdrPeerStatusAsync;
+  renamePane?: typeof renamePaneAsync;
+  clearPaneLabel?: typeof clearPaneLabelAsync;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
 };
@@ -167,11 +171,24 @@ export function registerTalkTools(
   // standalone entrypoint (index.ts) via PI_PEER_DISABLED.
   const getCurrentPeer = deps.getCurrentPeer ?? getCurrentHerdrPeerContextAsync;
   const getStatus = deps.getPeerStatus ?? getHerdrPeerStatusAsync;
+  const renamePane = deps.renamePane ?? renamePaneAsync;
+  const clearPaneLabel = deps.clearPaneLabel ?? clearPaneLabelAsync;
   const hasBusyOverride = typeof deps.isBusy === "function";
   // Standalone runtime self-tracks busy through agent_start/agent_end unless a
   // caller injects an explicit busy function (test/runtime override).
   let selfBusy = false;
   const isBusy = hasBusyOverride ? deps.isBusy! : () => selfBusy;
+  // Pane-label mutations are serialized: a slow rename must never complete
+  // after a later clear/rename and leave a stale peer name on the pane.
+  // Errors are swallowed inside the queue (cosmetic, never block lifecycle).
+  let paneLabelQueue: Promise<void> = Promise.resolve();
+  const enqueuePaneLabelOp = (op: () => Promise<void>): void => {
+    paneLabelQueue = paneLabelQueue.then(op).catch(() => {});
+  };
+  // Lifecycle generation: bumped on shutdown. A bind that was awaiting its
+  // peer context when shutdown landed must not commit a runtime, write a
+  // registration, or enqueue a pane rename — it belongs to a dead session.
+  let lifecycleGeneration = 0;
   // F1: a non-steer (fresh-trigger) injection is in flight waiting for
   // agent_start to engage a turn. While set, no further message is drained, so
   // a burst of overlapping plain user turns cannot open in the gap between the
@@ -254,14 +271,18 @@ export function registerTalkTools(
     }
   };
 
-  const ensureRuntime = async (ctx: any, signal?: AbortSignal): Promise<Runtime> => {
+  const ensureRuntime = async (ctx: any, signal?: AbortSignal): Promise<Runtime | null> => {
     const sessionId = ctx.sessionManager.getSessionId();
     const current = runtime;
     if (current && current.record.sessionId === sessionId) {
       ensureRecord(current.root, current.record);
       return current;
     }
+    const bindGeneration = lifecycleGeneration;
     const peer = await getCurrentPeer(signal);
+    // The bind crossed a shutdown while awaiting the peer context: committing
+    // now would resurrect a dead session (registration, pane label, footer).
+    if (bindGeneration !== lifecycleGeneration) return null;
     const root = rootDir(peer.workspaceId);
     const existing = readJson(recordPath(root, sessionId));
     const name = isPeerRecord(existing) && existing.sessionId === sessionId
@@ -296,6 +317,11 @@ export function registerTalkTools(
       removeOwnedRecord(current.root, current.record);
     }
     runtime = { peer, record, root };
+    // Cosmetic, best-effort: label our pane with the peer display name. Fires
+    // only on fresh runtime creation (bind/switch), never the cached fast-path,
+    // so a manual pane rename mid-session is never fought over. Serialized so
+    // it cannot complete after a subsequent switch's rename or a shutdown clear.
+    enqueuePaneLabelOp(() => renamePane(peer.paneId, record.name));
     if (!interval) {
       interval = setInterval(() => {
         if (!runtime) return;
@@ -330,6 +356,7 @@ export function registerTalkTools(
     parameters: TalkSessionsParams,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
+      if (!current) throw new Error("pi-peer unavailable: session ended during bind");
       const peers = await liveRecords(current.root, current.record.workspaceId, current.peer.socketPath, getStatus, signal);
       const lines = peers.map(({ record, status }) => {
         const base = `${publicPeerId(record.sessionId)}  ${record.name}  ${status}${record.sessionId === current.record.sessionId ? "  (current)" : ""}`;
@@ -351,6 +378,7 @@ export function registerTalkTools(
     parameters: TalkLatestParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
+      if (!current) throw new Error("pi-peer unavailable: session ended during bind");
       return executeTalkLatest(params as TalkLatest, current, getStatus, signal);
     },
   });
@@ -363,6 +391,7 @@ export function registerTalkTools(
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
+      if (!current) throw new Error("pi-peer unavailable: session ended during bind");
       return executeTalkTo(params as TalkTo, current, getStatus, signal);
     },
   });
@@ -381,6 +410,9 @@ export function registerTalkTools(
     inFlightClaims.clear();
     void ensureRuntime(ctx)
       .then((current) => {
+        // Stale bind invalidated by a shutdown that landed mid-bind: nothing
+        // was committed, so there is nothing to publish or display.
+        if (!current) return;
         // A rebind may have missed agent_end; requeue any orphaned in-flight
         // claims so they retry (at-least-once) rather than being lost.
         requeueProcessing(current.root, current.record.sessionId);
@@ -413,6 +445,9 @@ export function registerTalkTools(
     publishHistoryFromOwnSession(runtime, ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
+    // Invalidate any bind still awaiting its peer context: it must not
+    // commit a runtime, resurrect a registration, or enqueue a pane rename.
+    lifecycleGeneration++;
     ctx.ui?.setStatus("pi-peer", undefined);
     // Clear local F1/F2 state. Unconsumed `.processing` claims are left on disk
     // (recoverable via the next startup requeue) so nothing is lost on shutdown.
@@ -423,6 +458,11 @@ export function registerTalkTools(
       // inbox/latest artifacts are not lifecycle-owned and are left for the
       // cross-session GC sweep.
       removeOwnedRecord(runtime.root, runtime.record);
+      // Return the pane label: a dead pane must not keep advertising the peer
+      // name. Cosmetic, best-effort, serialized behind any in-flight rename so
+      // the clear always lands last.
+      const paneId = runtime.peer.paneId;
+      enqueuePaneLabelOp(() => clearPaneLabel(paneId));
     }
     if (interval) clearInterval(interval);
     interval = null;

@@ -156,3 +156,20 @@ export async function getHerdrPeerStatusAsync(
   }
   return herdrAgentStatusFrom(current);
 }
+
+/**
+ * Label a pane with a display name (cosmetic, best-effort).
+ * `herdr pane rename` sets the pane `label` field without touching the
+ * terminal's own title escape sequences. Errors must be swallowed by callers.
+ */
+export async function renamePaneAsync(paneId: string, label: string, signal?: AbortSignal): Promise<void> {
+  await herdrRunAsync(["pane", "rename", paneId, label], undefined, { signal });
+}
+
+/**
+ * Remove a pane's display label (cosmetic, best-effort). Used on shutdown so
+ * a dead pane does not keep advertising a peer name. Errors must be swallowed.
+ */
+export async function clearPaneLabelAsync(paneId: string, signal?: AbortSignal): Promise<void> {
+  await herdrRunAsync(["pane", "rename", paneId, "--clear"], undefined, { signal });
+}

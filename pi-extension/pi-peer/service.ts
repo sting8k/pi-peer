@@ -11,6 +11,7 @@ import {
   getCurrentHerdrPeerContextAsync,
   getHerdrPeerStatusAsync,
   getTalkRootDir,
+  HerdrUnavailableError,
   renamePaneAsync,
   renameTabAsync,
   type HerdrPeerContext,
@@ -444,6 +445,12 @@ export function registerTalkTools(
       })
       .catch((err) => {
         // Bind failed: release the latch so the previous runtime is not wedged.
+        if (err instanceof HerdrUnavailableError) {
+          // Expected when Pi runs outside Herdr: one quiet line, no stack —
+          // the extension stays loaded; talk tools fail with a clear message.
+          console.error("pi-peer: not inside a Herdr pane — peer talk disabled");
+          return;
+        }
         console.error("pi-peer session bind failed", err);
       })
       .finally(() => { bindInProgress = false; });

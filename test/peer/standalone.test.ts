@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
-import { getTalkRootDir, probePaneCountAsync } from "../../pi-extension/pi-peer/herdr.ts";
+import { getTalkRootDir, HerdrUnavailableError, probePaneCountAsync } from "../../pi-extension/pi-peer/herdr.ts";
 import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
@@ -34,6 +34,68 @@ const noopPaneLabelDeps = {
   renameTab: async () => {},
   clearTabLabel: async () => {},
 };
+
+describe("pi-peer outside Herdr", () => {
+  it("bind failure logs one quiet line, no stack; unexpected errors keep the stack", async () => {
+    const captured: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { captured.push(args); };
+    const restore = () => { console.error = originalError; };
+    try {
+      const root = createTestDir();
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const ctx: any = {
+        cwd: "/work/outside",
+        sessionManager: {
+          getSessionId: () => "session-outside",
+          getSessionFile: () => join(root, "transcripts", "session-outside.jsonl"),
+        },
+      };
+      const api: any = {
+        registerTool() {},
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        },
+        async sendUserMessage() {}
+      };
+      registerTalkTools(api, {
+        getCurrentPeer: async () => { throw new HerdrUnavailableError(); },
+        getPeerStatus: async () => "idle",
+        rootDir: () => root,
+      });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(captured.length, 1, "exactly one log line outside Herdr");
+      assert.equal(typeof captured[0][0], "string", "quiet line is a string, not an error object");
+      assert.doesNotMatch(String(captured[0][0]), /\n/, "no stack trace");
+
+      // Unexpected bind errors keep the full error object for debugging.
+      captured.length = 0;
+      const handlers2 = new Map<string, Array<(...args: any[]) => any>>();
+      const api2: any = {
+        registerTool() {},
+        on(name: string, handler: (...args: any[]) => any) {
+          handlers2.set(name, [...(handlers2.get(name) ?? []), handler]);
+        },
+        async sendUserMessage() {}
+      };
+      registerTalkTools(api2, {
+        getCurrentPeer: async () => { throw new Error("socket exploded"); },
+        getPeerStatus: async () => "idle",
+        rootDir: () => root,
+      });
+      for (const handler of handlers2.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(captured.length, 1);
+      assert.match(String(captured[0][0]), /bind failed/);
+      assert.ok(captured[0][1] instanceof Error, "unexpected errors keep the error object");
+      rmSync(root, { recursive: true, force: true });
+    } finally {
+      restore();
+    }
+  });
+
+});
 
 describe("herdr paneCount probe", () => {
   it("degrades to undefined on CLI failure, malformed JSON, or missing field", async () => {

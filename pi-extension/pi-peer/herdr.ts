@@ -43,6 +43,18 @@ interface HerdrResponse<T> {
 
 const HERDR_CLI_TIMEOUT_MS = 5_000;
 
+/**
+ * Expected condition: Pi is not running inside a Herdr pane, so the peer
+ * runtime is simply unavailable (tools fail with a clear message; bind logs
+ * one quiet line instead of a stack trace).
+ */
+export class HerdrUnavailableError extends Error {
+  constructor(message = "Peer talk requires Pi to run inside an active Herdr pane") {
+    super(message);
+    this.name = "HerdrUnavailableError";
+  }
+}
+
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 export function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -153,7 +165,7 @@ export async function probePaneCountAsync(
  */
 export async function getCurrentHerdrPeerContextAsync(signal?: AbortSignal): Promise<HerdrPeerContext> {
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-    throw new Error("Peer talk requires Pi to run inside an active Herdr pane");
+    throw new HerdrUnavailableError();
   }
   const socketPath = herdrSocketPath();
   const pane = await getHerdrPaneAsync(process.env.HERDR_PANE_ID, socketPath, { signal });

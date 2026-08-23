@@ -27,12 +27,14 @@ function peerMessage(from: string, fromName: string, to: string, message: string
 }
 
 // Pane/tab-label CLI calls are always injected in tests: the default impl
-// spawns the real `herdr` binary against a fake socket context.
+// spawns the real `herdr` binary against a fake socket context. The default
+// surface probe degrades to undefined (no migration ever fires).
 const noopPaneLabelDeps = {
   renamePane: async () => {},
   clearPaneLabel: async () => {},
   renameTab: async () => {},
   clearTabLabel: async () => {},
+  probePaneCount: async () => undefined as number | undefined,
 };
 
 describe("pi-peer outside Herdr", () => {
@@ -691,6 +693,124 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+
+  it("heartbeat migrates the label when a split lands between binds (tab -> pane)", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    let paneCount = 1;
+    const sessionId = "session-mig";
+    const ctx: any = {
+      cwd: "/work/migrate",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-mig", terminalId: "terminal-mig", tabId: "tab-mig",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1", paneCount,
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
+      renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
+      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
+      probePaneCount: async () => paneCount,
+      surfaceCheckMs: 20,
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // Single-pane bind: the tab is the visible surface.
+      fire("session_start");
+      await waitUntil(() => ops.length === 1, "tab rename on bind");
+      assert.match(ops[0], /^tab:tab-mig:/);
+      const name = ops[0].split(":")[2];
+
+      // A split lands; the heartbeat probe now sees 2 panes.
+      paneCount = 2;
+      await waitUntil(() => ops.length === 3, "migrates tab label to pane");
+      assert.equal(ops[1], "tab-clear:tab-mig", "stale tab label cleared");
+      assert.equal(ops[2], `pane:pane-mig:${name}`, "pane takes the name");
+
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await waitUntil(() => ops.length === 4, "pane clear on shutdown");
+      assert.equal(ops[3], "pane-clear:pane-mig");
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("heartbeat migrates back when panes close (pane -> tab)", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    let paneCount = 2;
+    const sessionId = "session-mig-back";
+    const ctx: any = {
+      cwd: "/work/migrate-back",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-mb", terminalId: "terminal-mb", tabId: "tab-mb",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1", paneCount,
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
+      renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
+      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
+      probePaneCount: async () => paneCount,
+      surfaceCheckMs: 20,
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // Split bind: the pane is the visible surface.
+      fire("session_start");
+      await waitUntil(() => ops.length === 1, "pane rename on bind");
+      assert.match(ops[0], /^pane:pane-mb:/);
+      const name = ops[0].split(":")[2];
+
+      // Panes close back to one; the probe sees 1 again.
+      paneCount = 1;
+      await waitUntil(() => ops.length === 3, "migrates pane label back to tab");
+      assert.equal(ops[1], "pane-clear:pane-mb", "pane label cleared");
+      assert.equal(ops[2], `tab:tab-mb:${name}`, "tab takes the name back");
+
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await waitUntil(() => ops.length === 4, "tab clear on shutdown");
+      assert.equal(ops[3], "tab-clear:tab-mb");
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("session_start reuses a persisted friendly name for the same session", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();

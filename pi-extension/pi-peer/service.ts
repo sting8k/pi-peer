@@ -12,6 +12,7 @@ import {
   getHerdrPeerStatusAsync,
   getTalkRootDir,
   HerdrUnavailableError,
+  probePaneCountAsync,
   renamePaneAsync,
   renameTabAsync,
   type HerdrPeerContext,
@@ -34,6 +35,7 @@ import {
   nowIso,
   peerMessageTag,
   pickPeerName,
+  HEARTBEAT_INTERVAL_MS,
   POLL_MS,
   publicPeerId,
   recordPath,
@@ -57,6 +59,10 @@ export type TalkDeps = {
   clearPaneLabel?: typeof clearPaneLabelAsync;
   renameTab?: typeof renameTabAsync;
   clearTabLabel?: typeof clearTabLabelAsync;
+  probePaneCount?: typeof probePaneCountAsync;
+  /** Cadence for re-checking the label surface (splits/panes-closed between
+   * binds). Test seam; defaults to the registration heartbeat interval. */
+  surfaceCheckMs?: number;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
 };
@@ -180,6 +186,8 @@ export function registerTalkTools(
   const clearPaneLabel = deps.clearPaneLabel ?? clearPaneLabelAsync;
   const renameTab = deps.renameTab ?? renameTabAsync;
   const clearTabLabel = deps.clearTabLabel ?? clearTabLabelAsync;
+  const probePaneCount = deps.probePaneCount ?? probePaneCountAsync;
+  const surfaceCheckMs = deps.surfaceCheckMs ?? HEARTBEAT_INTERVAL_MS;
   const hasBusyOverride = typeof deps.isBusy === "function";
   // Standalone runtime self-tracks busy through agent_start/agent_end unless a
   // caller injects an explicit busy function (test/runtime override).
@@ -196,6 +204,9 @@ export function registerTalkTools(
   };
   type LabeledSurface = { kind: "pane" | "tab"; id: string };
   let labeledSurface: LabeledSurface | null = null;
+  // Last label-surface re-check (splits/pane-closes between binds); 0 forces
+  // a check on the first heartbeat tick after bind.
+  let lastSurfaceCheckAt = 0;
   const renameSurface = (surface: LabeledSurface, label: string) =>
     surface.kind === "pane" ? renamePane(surface.id, label) : renameTab(surface.id, label);
   const clearSurface = (surface: LabeledSurface) =>
@@ -354,6 +365,33 @@ export function registerTalkTools(
         // must not depend on sendUserMessage semantics (fire-and-forget in
         // the host today, declared Promise<void>) or on the drain chain.
         ensureRecord(currentRuntime.root, currentRuntime.record);
+        // Label surface re-evaluation on the heartbeat cadence: a split or
+        // pane-close between binds changes which surface is visible. Probe is
+        // cosmetic best-effort (undefined -> no-op). A rebind that lands
+        // mid-probe re-stamps labeledSurface (fresh object), so the stale-
+        // check below drops this migration instead of fighting the bind.
+        if (Date.now() - lastSurfaceCheckAt >= surfaceCheckMs) {
+          lastSurfaceCheckAt = Date.now();
+          const surface = labeledSurface;
+          if (surface && currentRuntime.peer.tabId) {
+            void probePaneCount(currentRuntime.peer.tabId, currentRuntime.peer.socketPath)
+              .then((count) => {
+                if (runtime !== currentRuntime || labeledSurface !== surface || count === undefined) return;
+                if (surface.kind === "tab" && count > 1) {
+                  labeledSurface = { kind: "pane", id: currentRuntime.peer.paneId };
+                  const next = labeledSurface;
+                  enqueueLabelOp(() => clearSurface(surface));
+                  enqueueLabelOp(() => renameSurface(next, currentRuntime.record.name));
+                } else if (surface.kind === "pane" && count === 1) {
+                  labeledSurface = { kind: "tab", id: currentRuntime.peer.tabId! };
+                  const next = labeledSurface;
+                  enqueueLabelOp(() => clearSurface(surface));
+                  enqueueLabelOp(() => renameSurface(next, currentRuntime.record.name));
+                }
+              })
+              .catch(() => {});
+          }
+        }
         if (drainInFlight) return;
         drainInFlight = drainInbox(pi, currentRuntime)
           .then(() => {

@@ -218,13 +218,10 @@ export async function clearPaneLabelAsync(paneId: string, signal?: AbortSignal):
 
 /**
  * Label a tab (single-pane sessions have no visible pane labels; the tab
- * bar is their only name surface). `herdr tab rename` has no --clear; an
- * empty label restores default rendering. Best-effort, swallow errors.
+ * bar is their only name surface). `herdr tab rename` has no --clear and
+ * an empty label renders as a blank tab — to release a tab, rename it to
+ * the workspace name instead (see service.ts). Best-effort, swallow errors.
  */
 export async function renameTabAsync(tabId: string, label: string, signal?: AbortSignal): Promise<void> {
   await herdrRunAsync(["tab", "rename", tabId, label], undefined, { signal });
-}
-
-export async function clearTabLabelAsync(tabId: string, signal?: AbortSignal): Promise<void> {
-  await herdrRunAsync(["tab", "rename", tabId, ""], undefined, { signal });
 }

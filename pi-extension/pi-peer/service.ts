@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "./schemas.ts";
 import {
   clearPaneLabelAsync,
-  clearTabLabelAsync,
   getCurrentHerdrPeerContextAsync,
   getHerdrPeerStatusAsync,
   getTalkRootDir,
@@ -58,7 +57,6 @@ export type TalkDeps = {
   renamePane?: typeof renamePaneAsync;
   clearPaneLabel?: typeof clearPaneLabelAsync;
   renameTab?: typeof renameTabAsync;
-  clearTabLabel?: typeof clearTabLabelAsync;
   probePaneCount?: typeof probePaneCountAsync;
   /** Cadence for re-checking the label surface (splits/panes-closed between
    * binds). Test seam; defaults to the registration heartbeat interval. */
@@ -185,7 +183,6 @@ export function registerTalkTools(
   const renamePane = deps.renamePane ?? renamePaneAsync;
   const clearPaneLabel = deps.clearPaneLabel ?? clearPaneLabelAsync;
   const renameTab = deps.renameTab ?? renameTabAsync;
-  const clearTabLabel = deps.clearTabLabel ?? clearTabLabelAsync;
   const probePaneCount = deps.probePaneCount ?? probePaneCountAsync;
   const surfaceCheckMs = deps.surfaceCheckMs ?? HEARTBEAT_INTERVAL_MS;
   const hasBusyOverride = typeof deps.isBusy === "function";
@@ -202,15 +199,21 @@ export function registerTalkTools(
   const enqueueLabelOp = (op: () => Promise<void>): void => {
     labelQueue = labelQueue.then(op).catch(() => {});
   };
-  type LabeledSurface = { kind: "pane" | "tab"; id: string };
+  // A surface owns its release data: panes clear (--clear), tabs are renamed
+  // back to the OWNING workspace's name (empty labels render as blank tabs).
+  type LabeledSurface = { kind: "pane" | "tab"; id: string; workspaceId: string };
   let labeledSurface: LabeledSurface | null = null;
   // Last label-surface re-check (splits/pane-closes between binds); 0 forces
   // a check on the first heartbeat tick after bind.
   let lastSurfaceCheckAt = 0;
   const renameSurface = (surface: LabeledSurface, label: string) =>
     surface.kind === "pane" ? renamePane(surface.id, label) : renameTab(surface.id, label);
-  const clearSurface = (surface: LabeledSurface) =>
-    surface.kind === "pane" ? clearPaneLabel(surface.id) : clearTabLabel(surface.id);
+  // Releasing a surface: panes have a real clear (--clear); tabs do not, so
+  // a tab is restored to its owning workspace's name. The workspace travels
+  // with the surface object so a stale surface from a previous runtime is
+  // never renamed with the NEW runtime's workspace id.
+  const releaseSurface = (surface: LabeledSurface) =>
+    surface.kind === "pane" ? clearPaneLabel(surface.id) : renameTab(surface.id, surface.workspaceId);
   // Lifecycle generation: bumped on shutdown. A bind that was awaiting its
   // peer context when shutdown landed must not commit a runtime, write a
   // registration, or enqueue a pane rename — it belongs to a dead session.
@@ -349,11 +352,11 @@ export function registerTalkTools(
     // fast-path, so a manual rename mid-session is never fought over.
     // Serialized so an op cannot complete after a later op for this surface.
     const surface: LabeledSurface = peer.paneCount === 1 && peer.tabId
-      ? { kind: "tab", id: peer.tabId }
-      : { kind: "pane", id: peer.paneId };
+      ? { kind: "tab", id: peer.tabId, workspaceId: peer.workspaceId }
+      : { kind: "pane", id: peer.paneId, workspaceId: peer.workspaceId };
     if (labeledSurface && (labeledSurface.kind !== surface.kind || labeledSurface.id !== surface.id)) {
       const stale = labeledSurface;
-      enqueueLabelOp(() => clearSurface(stale));
+      enqueueLabelOp(() => releaseSurface(stale));
     }
     enqueueLabelOp(() => renameSurface(surface, record.name));
     labeledSurface = surface;
@@ -378,14 +381,14 @@ export function registerTalkTools(
               .then((count) => {
                 if (runtime !== currentRuntime || labeledSurface !== surface || count === undefined) return;
                 if (surface.kind === "tab" && count > 1) {
-                  labeledSurface = { kind: "pane", id: currentRuntime.peer.paneId };
+                  labeledSurface = { kind: "pane", id: currentRuntime.peer.paneId, workspaceId: currentRuntime.peer.workspaceId };
                   const next = labeledSurface;
-                  enqueueLabelOp(() => clearSurface(surface));
+                  enqueueLabelOp(() => releaseSurface(surface));
                   enqueueLabelOp(() => renameSurface(next, currentRuntime.record.name));
                 } else if (surface.kind === "pane" && count === 1) {
-                  labeledSurface = { kind: "tab", id: currentRuntime.peer.tabId! };
+                  labeledSurface = { kind: "tab", id: currentRuntime.peer.tabId!, workspaceId: currentRuntime.peer.workspaceId };
                   const next = labeledSurface;
-                  enqueueLabelOp(() => clearSurface(surface));
+                  enqueueLabelOp(() => releaseSurface(surface));
                   enqueueLabelOp(() => renameSurface(next, currentRuntime.record.name));
                 }
               })
@@ -531,7 +534,7 @@ export function registerTalkTools(
       // Serialized behind any in-flight rename so the clear lands last.
       const surface = labeledSurface;
       labeledSurface = null;
-      if (surface) enqueueLabelOp(() => clearSurface(surface));
+      if (surface) enqueueLabelOp(() => releaseSurface(surface));
     }
     if (interval) clearInterval(interval);
     interval = null;

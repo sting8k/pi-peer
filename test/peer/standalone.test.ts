@@ -33,7 +33,6 @@ const noopPaneLabelDeps = {
   renamePane: async () => {},
   clearPaneLabel: async () => {},
   renameTab: async () => {},
-  clearTabLabel: async () => {},
   probePaneCount: async () => undefined as number | undefined,
 };
 
@@ -585,7 +584,7 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
-  it("single-pane session labels the tab, not the pane; shutdown clears the tab", async () => {
+  it("single-pane session labels the tab, not the pane; shutdown restores the workspace label", async () => {
     const root = createTestDir();
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
     const ops: string[] = [];
@@ -613,7 +612,6 @@ describe("pi-peer standalone runtime", () => {
       renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
       clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
       renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
-      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
       rootDir: () => root,
     });
     const fire = (name: string, event: any = { type: name }) => {
@@ -627,7 +625,7 @@ describe("pi-peer standalone runtime", () => {
 
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       await waitUntil(() => ops.length === 2, "tab clear on shutdown");
-      assert.deepEqual(ops[1], "tab-clear:tab-lone");
+      assert.deepEqual(ops[1], "tab:tab-lone:workspace-1", "tab restored to the workspace name");
     } finally {
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       rmSync(root, { recursive: true, force: true });
@@ -663,7 +661,6 @@ describe("pi-peer standalone runtime", () => {
       renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
       clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
       renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
-      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
       rootDir: () => root,
     });
     const fire = (name: string, event: any = { type: name }) => {
@@ -680,7 +677,7 @@ describe("pi-peer standalone runtime", () => {
       currentSessionId = "session-split-2";
       fire("session_start");
       await waitUntil(() => ops.length === 3, "stale tab cleared and pane renamed on rebind");
-      assert.equal(ops[1], "tab-clear:tab-split", "stale tab label cleared");
+      assert.equal(ops[1], "tab:tab-split:workspace-1", "stale tab label restored to the workspace name");
       const secondName = JSON.parse(readFileSync(recordPath(root, "session-split-2"), "utf8")).name;
       assert.equal(ops[2], `pane:pane-split:${secondName}`, "pane is now the visible surface");
 
@@ -723,7 +720,6 @@ describe("pi-peer standalone runtime", () => {
       renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
       clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
       renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
-      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
       probePaneCount: async () => paneCount,
       surfaceCheckMs: 20,
       rootDir: () => root,
@@ -741,7 +737,7 @@ describe("pi-peer standalone runtime", () => {
       // A split lands; the heartbeat probe now sees 2 panes.
       paneCount = 2;
       await waitUntil(() => ops.length === 3, "migrates tab label to pane");
-      assert.equal(ops[1], "tab-clear:tab-mig", "stale tab label cleared");
+      assert.equal(ops[1], "tab:tab-mig:workspace-1", "stale tab label restored to the workspace name");
       assert.equal(ops[2], `pane:pane-mig:${name}`, "pane takes the name");
 
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
@@ -782,7 +778,6 @@ describe("pi-peer standalone runtime", () => {
       renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
       clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
       renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
-      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
       probePaneCount: async () => paneCount,
       surfaceCheckMs: 20,
       rootDir: () => root,
@@ -805,7 +800,65 @@ describe("pi-peer standalone runtime", () => {
 
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       await waitUntil(() => ops.length === 4, "tab clear on shutdown");
-      assert.equal(ops[3], "tab-clear:tab-mb");
+      assert.equal(ops[3], "tab:tab-mb:workspace-1", "tab restored to the workspace name");
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("bind transition releases a stale surface with the OWNING workspace, not the new one", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    let sessionId = "session-ws-a";
+    let workspaceId = "ws-a";
+    let tabId = "tab-a";
+    const ctx: any = {
+      cwd: "/work/ws-ownership",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-ws", terminalId: "terminal-ws", tabId,
+        socketPath: "/tmp/herdr.sock", workspaceId, paneCount: 1,
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
+      renameTab: async (id: string, label: string) => { ops.push(`tab:${id}:${label}`); },
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // Bind A: single pane in workspace ws-a -> labels tab-a.
+      fire("session_start");
+      await waitUntil(() => ops.length === 1, "tab rename on bind A");
+      assert.match(ops[0], /^tab:tab-a:/);
+
+      // Switch to session B that lives in a DIFFERENT workspace and tab.
+      sessionId = "session-ws-b";
+      workspaceId = "ws-b";
+      tabId = "tab-b";
+      fire("session_start");
+      await waitUntil(() => ops.length === 3, "stale tab released, new tab labeled");
+      assert.equal(ops[1], "tab:tab-a:ws-a", "stale tab restored to ITS OWN workspace name");
+      assert.match(ops[2], /^tab:tab-b:/, "new tab labeled with peer B name");
+
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await waitUntil(() => ops.length === 4, "shutdown releases tab-b");
+      assert.equal(ops[3], "tab:tab-b:ws-b");
     } finally {
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       rmSync(root, { recursive: true, force: true });

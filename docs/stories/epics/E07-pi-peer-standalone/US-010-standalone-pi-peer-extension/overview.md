@@ -26,7 +26,7 @@ The repo describes and ships only the standalone **pi-peer** package:
 
 ## Affected Users
 
-- Pi users installing peer-to-peer talk between HerdR sessions (primary).
+- Pi users installing peer-to-peer talk between Herdr sessions (primary).
 - pi-roo extension users migrating: must set `features.talk=false` before dual
   install and reload all peers.
 - Future maintainers of the pi-peer package.
@@ -49,6 +49,6 @@ The repo describes and ships only the standalone **pi-peer** package:
 - No dual-read migration between `pi-roo/talk` and `pi-peer/talk`.
 - No npm publishing: the package is `private: true` and distributed from
   GitHub only (`author`/`repository`/`version` refreshed in slice 10).
-- Live HerdR E2E was executed in slice 7 (two live Pi panes in one workspace)
+- Live Herdr E2E was executed in slice 7 (two live Pi panes in one workspace)
   and the pass is recorded in this story's validation and `docs/TEST_MATRIX.md`;
   abort/session-switch/fail-closed remain mocked-only.

@@ -4,13 +4,13 @@
 
 | Entity | Definition |
 | --- | --- |
-| `PeerRecord` | Registration for a live Pi session: `sessionId` (full id, internal identity), `name`, `cwd`, `workspaceId`, HerdR pane/terminal/tab, `registrationId`, `createdAt`. |
+| `PeerRecord` | Registration for a live Pi session: `sessionId` (full id, internal identity), `name`, `cwd`, `workspaceId`, Herdr pane/terminal/tab, `registrationId`, `createdAt`. |
 | `TalkRequest` | Versioned request envelope: `id`, `from`, `to`, `message`, `route` (visited session ids), `createdAt`. |
 | `TalkResponse` | Versioned response envelope: `requestId`, `from`, `to`, `ok`, `message` or `error`, `createdAt`. |
 | `TalkWaiter` | Caller-owned pending-wake tracker: `requestId`, `from`, `to`, `targetName?`, `createdAt`, `timedOutAt?`. Written for every `talk_to`; consumed on direct reply, abort, or after the `<peer_pong>` wake. |
 | `TalkEvent` | Completed conversation event published by a session: `type` (user/assistant/toolCall/toolResult), `id`, `createdAt`, `message`. |
 | `LatestPeerHistory` | Bounded per-peer history artifact: up to 10 `TalkEvent`s, rebuilt from the session's own current lineage. |
-| `HerdrPeerContext` | Workspace identity resolved from HerdR pane env + CLI: `workspaceId`, `paneId`, `terminalId`, `tabId`, `socketPath`. |
+| `HerdrPeerContext` | Workspace identity resolved from Herdr pane env + CLI: `workspaceId`, `paneId`, `terminalId`, `tabId`, `socketPath`. |
 
 Business rules:
 
@@ -47,7 +47,7 @@ Business rules:
 - `talk_latest` → read target's `latest/<session-id>.json`, slice last N
   events, annotate in-progress turns.
 - `talk_sessions` → list live records for the workspace, filter dead panes via
-  HerdR status.
+  Herdr status.
 - `session_shutdown` → remove own registration, stop polling.
 
 ## Interface Contract
@@ -83,7 +83,7 @@ closed.
 
 ## UI / Platform Impact
 
-- HerdR-only: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`.
+- Herdr-only: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`.
 - No slash commands, no message renderers, no widgets.
 - `PI_PEER_DISABLED=1` for opt-out. OS-neutral; validated on macOS/Linux,
   Windows not validated.

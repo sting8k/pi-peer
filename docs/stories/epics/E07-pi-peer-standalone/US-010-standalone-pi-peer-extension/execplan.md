@@ -27,7 +27,7 @@ In scope:
 Out of scope:
 
 - Push/release of the `pi-peer` branch (local commits after independent review are allowed).
-- Live new-namespace HerdR cutover execution: **done** in slice 7 (live pass
+- Live new-namespace Herdr cutover execution: **done** in slice 7 (live pass
   recorded in `docs/TEST_MATRIX.md` and validation below).
 - npm publishing stays out of scope (`private: true`, GitHub-only).
 - Any pi-roo main merge, delegation/loop/advisor features, or dual-read
@@ -43,7 +43,7 @@ Risk flags:
   survive the move byte-for-byte.
 - **Data model** — storage namespace changes (`pi-roo/talk` → `pi-peer/talk`);
   chosen as a clean break, no migration code.
-- **Weak proof** — no live HerdR E2E available; mocked two-peer lifecycle only.
+- **Weak proof** — no live Herdr E2E available; mocked two-peer lifecycle only.
   (Resolved in slice 7: live two-pane cutover passed; abort/session-switch/
   fail-closed remain mocked-only.)
 
@@ -65,7 +65,7 @@ Hard gates:
    docs/stories/decisions, add ADR `0011` and this story. (this slice)
 4. **Verification** — full suite + pack dry-run + link/diff checks. (this
    slice)
-5. **Live cutover (done)** — ran two live Pi panes in a HerdR workspace and
+5. **Live cutover (done)** — ran two live Pi panes in a Herdr workspace and
    confirmed talk under the new namespace, including reload re-registration.
    Pass recorded in slice 7 (see `docs/TEST_MATRIX.md` and validation below).
 6. **Release: initial `main` publish — pass** — this clean-history root commit

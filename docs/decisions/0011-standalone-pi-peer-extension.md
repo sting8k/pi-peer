@@ -18,7 +18,7 @@ unrelated product surfaces: batch delegation (`call_agents`,
 `subagents_list`, `subagent_resume`), agent configuration, loop workflows,
 mux spawning, and the persistent advisor.
 
-The peer runtime itself is self-contained — HerdR workspace identity,
+The peer runtime itself is self-contained — Herdr workspace identity,
 filesystem mailboxes, bounded event history, and versioned request/reply
 envelopes. It has no runtime dependency on any delegation, loop, or advisor
 module. Packaging it inside pi-roo forced every peer session to carry the
@@ -35,7 +35,7 @@ Extract peer talk into a dedicated standalone package, `pi-peer`:
   no renderers, no widgets.
 - **No source dependency on the host.** The standalone runtime imports no
   subagent, loop, or advisor module. Its only seams are the Pi extension API
-  and the HerdR environment (env vars + CLI).
+  and the Herdr environment (env vars + CLI).
 - **Generic opt-out.** `PI_PEER_DISABLED=1` is the opt-out: the entrypoint
   returns before registering anything. No host feature gate is required; any
   host can use the same env var.
@@ -79,7 +79,7 @@ Tradeoffs:
   metadata targets it (`author`: `sting8k`, `repository`/`homepage`/`bugs`
   set, `version: 1.0.0` — slice 10). npm publishing is out of scope:
   `private: true`, GitHub-only distribution.
-- The live new-namespace HerdR cutover has been executed (slice 7): two live
+- The live new-namespace Herdr cutover has been executed (slice 7): two live
   Pi panes in one workspace discovered each other and exchanged a `talk_to`
   request/reply (marker `PI_PEER_3WAY_OK`), with reverse discovery/read
   passes and version-2 history artifacts that never publish thinking. Proof
@@ -88,7 +88,7 @@ Tradeoffs:
 
 ## Follow-Up
 
-- ~~Execute a live two-session HerdR cutover in the `pi-peer/talk` namespace~~
+- ~~Execute a live two-session Herdr cutover in the `pi-peer/talk` namespace~~
   (story `US-010`) — **done** (slice 7, live pass recorded).
 - ~~Perform the clean-history initial `main` push to `github.com/sting8k/pi-peer`~~
   — **done**: this clean-history root commit is the initial `main` release;

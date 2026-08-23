@@ -5,7 +5,7 @@
 The extraction is done when: (1) the standalone runtime and package pass the
 full executable suite, (2) `npm pack --dry-run` ships only the runtime
 surface, (3) docs describe only pi-peer with no broken links/paths, and
-(4) no unrelated files changed. The live new-namespace HerdR cutover is
+(4) no unrelated files changed. The live new-namespace Herdr cutover is
 **done** (slice 7, two live Pi panes in one workspace; evidence below).
 Harness CLI is absent in this checkout, so **durable rows are unavailable**;
 this story's validation is the executable proof, the live cutover evidence,
@@ -17,7 +17,7 @@ and the doc audit below.
 | --- | --- |
 | Unit | Entrypoint registers exactly the 3 talk tools, no commands/renderers; protocol v1 (envelopes, resolve, route-cycle, request message, requeue, remove-owned); history v2 (bounded, no thinking, own-lineage rebuild, publish/read); storage `safeKey` + atomic write. |
 | Integration | Mocked two-peer lifecycle: request delivery → peer `agent_end` response capture; busy queueing; latest-history reads. |
-| E2E | Live two-session HerdR cutover in the `pi-peer/talk` namespace — **passed** (slice 7). Public-id verification (slice 9) **passed** after both peers reloaded on the slice-8 commit: discovery by public id, `talk_latest`/`talk_to` by public id, inbound `peer_id` match, raw-id rejection, no thinking. |
+| E2E | Live two-session Herdr cutover in the `pi-peer/talk` namespace — **passed** (slice 7). Public-id verification (slice 9) **passed** after both peers reloaded on the slice-8 commit: discovery by public id, `talk_latest`/`talk_to` by public id, inbound `peer_id` match, raw-id rejection, no thinking. |
 | Platform | macOS/Linux executed; Windows not validated. |
 | Performance | N/A (bounded history 10 events; atomic single-file writes). |
 | Logs/Audit | History artifacts + tool progress details (`queued`/`processing`/`completed`); `session_shutdown` record removal. |
@@ -51,7 +51,7 @@ grep -nE "pi-interactive-subagents|call_agents|subagent|loop-workflow|advisor|fe
 | `npm run typecheck` | clean (tsc 5.9.3) |
 | `npm pack --dry-run` | 10 files (7 runtime sources + package.json/README/LICENSE, npm auto-included; no tests or Harness docs) |
 | Markdown link/path scan | all kept-file references resolve; retired refs removed |
-| Live HerdR cutover (slice 7) | **pass** — two live Pi panes in one workspace: `talk_sessions` = 2 peers; `talk_to` round-trip completed with `PI_PEER_3WAY_OK`; reverse discovery/read pass (10 events, oldest-first, labels assistant/toolCall/toolResult, no thinking); post-response history 6 events in order, peer idle; filesystem artifacts: 2 session records + 2 latest artifacts, history version 2, event counts 10 and 6, thinking events 0. Abort/session-switch/fail-closed remain automated-proof only. |
+| Live Herdr cutover (slice 7) | **pass** — two live Pi panes in one workspace: `talk_sessions` = 2 peers; `talk_to` round-trip completed with `PI_PEER_3WAY_OK`; reverse discovery/read pass (10 events, oldest-first, labels assistant/toolCall/toolResult, no thinking); post-response history 6 events in order, peer idle; filesystem artifacts: 2 session records + 2 latest artifacts, history version 2, event counts 10 and 6, thinking events 0. Abort/session-switch/fail-closed remain automated-proof only. |
 | Live public-id verification (slice 9) | **pass** — after both peers reloaded on the slice-8 commit: `talk_sessions` returned exactly two distinct public IDs in `peer-<last3>` format with correct current markers (display names may duplicate; IDs differ); `talk_latest`/`talk_to` resolved by public id (marker `PUBLIC_PEER_ID_LIVE_OK`, oldest-first, no thinking); inbound `peer_message` exposed `peer_id` equal to the sender's public id while keeping the full session id internal; receiver-side `talk_sessions`/`talk_latest` succeeded (labels toolCall/toolResult/assistant, no thinking); a live raw full-session-id target was rejected with `Peer session not found`; session registration filenames remain keyed by full internal session IDs. Collision behavior remains automated-test proven only. |
 | `git diff --cached --check` | clean |
 
@@ -69,6 +69,6 @@ migration/history context only).
   root commit is published as the initial `main` release, and the canonical
   install `pi install git:github.com/sting8k/pi-peer` resolves from it. npm
   publishing stays out of scope.
-- Live HerdR cutover passed (slice 7, pre-dating the public-id format);
+- Live Herdr cutover passed (slice 7, pre-dating the public-id format);
   public-id live verification passed in slice 9 (see rows above); durable
   Harness rows unavailable (CLI absent).

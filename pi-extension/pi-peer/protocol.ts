@@ -10,7 +10,7 @@ import type { HerdrAgentStatus, HerdrPeerContext } from "./herdr.ts";
  * standalone pi-peer runtime.
  *
  * Invariants of the peer-chat protocol:
- *  - HerdR-only, workspace identity verified on every status read,
+ *  - Herdr-only, workspace identity verified on every status read,
  *  - atomic mailbox writes (`writeAtomic`) with queued -> `.processing` state,
  *  - symmetric, send-only semantics: `talk_to` enqueues one durable message and
  *    returns delivery confirmation; a reply is simply another `talk_to` in the
@@ -337,7 +337,7 @@ export async function liveRecords(
   for (const record of loadRecords(root)) {
     if (record.workspaceId !== workspaceId) continue;
     // A crashed process stops heartbeating its registration; its stale record
-    // is not a live peer even if the HerdR pane still exists.
+    // is not a live peer even if the Herdr pane still exists.
     if (!isRegisteredLive(root, record.sessionId)) continue;
     try {
       const status = await getStatus({
@@ -349,7 +349,7 @@ export async function liveRecords(
       }, signal);
       result.push({ record, status });
     } catch {
-      // A stale or moved HerdR pane is not a live peer.
+      // A stale or moved Herdr pane is not a live peer.
     }
   }
   return result;

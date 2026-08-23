@@ -8,10 +8,10 @@ import { safeKey } from "./storage.ts";
 const execFileAsync = promisify(execFile);
 
 /**
- * HerdR-only peer integration for the standalone pi-peer runtime.
+ * Herdr-only peer integration for the standalone pi-peer runtime.
  *
  * This module owns the two things a peer needs from the host mux:
- *  - the current peer's HerdR context (workspace identity), and
+ *  - the current peer's Herdr context (workspace identity), and
  *  - live status of other peers (workspace identity verification).
  *
  * It deliberately stays source-independent of any host agent or mux runtime.
@@ -57,7 +57,7 @@ export function getTalkRootDir(workspaceId: string): string {
 function herdrSocketPath(): string {
   const socketPath = process.env.HERDR_SOCKET_PATH;
   if (!socketPath || !isAbsolute(socketPath)) {
-    throw new Error("HerdR backend requires an absolute HERDR_SOCKET_PATH");
+    throw new Error("Herdr backend requires an absolute HERDR_SOCKET_PATH");
   }
   return socketPath;
 }
@@ -71,7 +71,7 @@ function decodeHerdrJson<T>(stdout: string, operation: string): T {
     return parsed as T;
   } catch (error) {
     throw new Error(
-      `HerdR ${operation} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      `Herdr ${operation} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -82,7 +82,7 @@ function herdrPaneFrom(value: unknown): HerdrPane {
     : {};
   const pane = candidate.pane ?? candidate.agent;
   if (typeof pane?.pane_id !== "string" || typeof pane.terminal_id !== "string") {
-    throw new Error("HerdR response did not include pane_id and terminal_id");
+    throw new Error("Herdr response did not include pane_id and terminal_id");
   }
   return pane as HerdrPane;
 }
@@ -123,16 +123,16 @@ function herdrAgentStatusFrom(pane: HerdrPane): HerdrAgentStatus {
 }
 
 /**
- * Establish the current peer's HerdR context. Requires Pi to run inside an
- * active HerdR pane (workspace identity originates from the pane metadata).
+ * Establish the current peer's Herdr context. Requires Pi to run inside an
+ * active Herdr pane (workspace identity originates from the pane metadata).
  */
 export async function getCurrentHerdrPeerContextAsync(signal?: AbortSignal): Promise<HerdrPeerContext> {
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-    throw new Error("Peer talk requires Pi to run inside an active HerdR pane");
+    throw new Error("Peer talk requires Pi to run inside an active Herdr pane");
   }
   const socketPath = herdrSocketPath();
   const pane = await getHerdrPaneAsync(process.env.HERDR_PANE_ID, socketPath, { signal });
-  if (!pane.workspace_id) throw new Error("HerdR pane get did not include workspace_id");
+  if (!pane.workspace_id) throw new Error("Herdr pane get did not include workspace_id");
   return {
     paneId: process.env.HERDR_PANE_ID,
     terminalId: pane.terminal_id,
@@ -152,7 +152,7 @@ export async function getHerdrPeerStatusAsync(
 ): Promise<HerdrAgentStatus> {
   const current = await getHerdrPaneAsync(peer.paneId, peer.socketPath, { signal });
   if (current.workspace_id !== peer.workspaceId || current.tab_id !== peer.tabId || current.terminal_id !== peer.terminalId) {
-    throw new Error("HerdR peer identity changed");
+    throw new Error("Herdr peer identity changed");
   }
   return herdrAgentStatusFrom(current);
 }

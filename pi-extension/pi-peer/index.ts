@@ -6,7 +6,7 @@ import { registerTalkTools } from "./service.ts";
  * Standalone pi-peer extension entrypoint.
  *
  * Registers exactly three tools: `talk_sessions`, `talk_latest`, `talk_to`.
- * The runtime is HerdR-only and self-tracks busy through agent_start/agent_end.
+ * The runtime is Herdr-only and self-tracks busy through agent_start/agent_end.
  * Setting `PI_PEER_DISABLED=1` disables registration entirely.
  *
  * This entrypoint is source-independent: no dependency on any host agent extension.

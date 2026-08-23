@@ -1,7 +1,7 @@
 # Test Matrix
 
 This matrix is the validation contract for the standalone **pi-peer**
-extension. The product is peer-to-peer Pi chat over a HerdR workspace; the only
+extension. The product is peer-to-peer Pi chat over a Herdr workspace; the only
 shipped surface is the three talk tools. Everything here is executable from the
 repo root.
 
@@ -26,5 +26,5 @@ Status values: `implemented` | `partial` | `planned` | `removed`.
 | Platform | Status | Notes |
 | --- | --- | --- |
 | macOS/Linux (tsx, node) | implemented | Covered by unit/integration suites. |
-| HerdR workspace (live panes) | partial | Discovery/registration and the storage namespace were validated live in the earlier RPC-era cutover; the async chat semantics (send-only `talk_to`, idle trigger, busy steer, reverse-talk reply) are automated-proof only. |
+| Herdr workspace (live panes) | partial | Discovery/registration and the storage namespace were validated live in the earlier RPC-era cutover; the async chat semantics (send-only `talk_to`, idle trigger, busy steer, reverse-talk reply) are automated-proof only. |
 | Windows | not validated | Harness CLI exists for Windows; peer runtime is env-driven and expected to be OS-neutral. |

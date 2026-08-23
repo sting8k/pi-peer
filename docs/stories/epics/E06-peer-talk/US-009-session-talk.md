@@ -10,7 +10,7 @@ normal
 
 ## Product Contract
 
-Pi sessions running in the same HerdR workspace can discover one another and exchange blocking request/reply messages through a small filesystem mailbox protocol. Sessions are peers: the pi-peer extension does not create, own, restart, or inspect another session's transcript.
+Pi sessions running in the same Herdr workspace can discover one another and exchange blocking request/reply messages through a small filesystem mailbox protocol. Sessions are peers: the pi-peer extension does not create, own, restart, or inspect another session's transcript.
 
 ## Relevant Product Docs
 
@@ -21,7 +21,7 @@ Pi sessions running in the same HerdR workspace can discover one another and exc
 
 ## Acceptance Criteria
 
-- `talk_sessions` lists live peer Pi sessions in the current HerdR workspace by public peer id (`peer-xxx`) and display name.
+- `talk_sessions` lists live peer Pi sessions in the current Herdr workspace by public peer id (`peer-xxx`) and display name.
 - `talk_latest({ target, count? })` returns the most recent completed conversation events (user messages, assistant text, tool calls, tool results; thinking is never published) ordered oldest-first, with peer status, warning when it excludes an in-progress turn, without the caller reading the target's transcript. `count` defaults to 1, min 1, max 10; out-of-range or non-integer values are rejected.
 - On startup/resume and on `agent_end`, a peer rebuilds its bounded history of up to 10 completed conversation events from its own current lineage (entries are persisted before the end event), so event ids are stable and there is no duplicate risk.
 - `talk_to({ target, message, timeoutMs? })` resolves a public peer id or unique display name and blocks until the target returns its final assistant response.
@@ -36,9 +36,9 @@ Pi sessions running in the same HerdR workspace can discover one another and exc
 
 - Tools: `talk_sessions`, `talk_latest`, `talk_to`.
 - `talk_latest` reads the peer's bounded history artifact (`talk/<workspace-id>/latest/<session-id>.json`), never the transcript; the publisher owns the history (bounded to 10 events, rebuilt from its own durable current lineage on startup/resume and on `agent_end`).
-- Scope: current HerdR workspace only.
+- Scope: current Herdr workspace only.
 - Storage: `<agent-dir>/pi-peer/talk/<workspace-id>/{sessions,latest,inbox,replies}` (agent-dir = `PI_CODING_AGENT_DIR` or `~/.pi/agent`; clean break from the legacy `pi-roo/talk` namespace, see decision `0011`).
-- Registry liveness: verify the registered HerdR pane at list/send time; no heartbeat.
+- Registry liveness: verify the registered Herdr pane at list/send time; no heartbeat.
 - Delivery: receiver extension polls its inbox while idle, injects one visible custom message, and captures the final assistant output from `agent_end`.
 - Recovery: startup requeues the current session's claimed `.processing` request.
 - Non-goals: broker, acknowledgements, retries, in-flight turn cancellation, priority, full transcript access, auto-spawn/restart, distributed deadlock detection.
@@ -49,8 +49,8 @@ Pi sessions running in the same HerdR workspace can discover one another and exc
 | --- | --- |
 | Unit | Envelope validation, target resolution, route cycle protection, atomic mailbox claim/requeue, progress updates, snapshot labeling, reply extraction, `count` validation, event extraction for real event types (thinking skipped), bounded-history truncation, empty-lineage clear, stale v1-artifact rejection, resume without duplicates. |
 | Integration | Tool registration and mocked two-session queued/processing/request/reply lifecycle. |
-| E2E | Not required for implementation; live HerdR smoke **passed** in slice 7 (see `US-010` validation). |
-| Platform | HerdR workspace/pane identity and live status verification. |
+| E2E | Not required for implementation; live Herdr smoke **passed** in slice 7 (see `US-010` validation). |
+| Platform | Herdr workspace/pane identity and live status verification. |
 | Release | `npm test`; `npm run test:integration`. |
 
 ## Harness Delta
@@ -64,11 +64,11 @@ Pi sessions running in the same HerdR workspace can discover one another and exc
 
 - `npm test`: 27/27 pass (3 suites) — entrypoint registration, envelope validation, target resolution, route cycle protection, atomic mailbox claim/requeue, busy queue, session-switch registration ownership transfer, fail-closed current-lineage rebuild (trailing non-id entry ignored, obsolete branches excluded, empty lineage clears stale history), mocked two-session request/reply, `count` validation, event extraction for real event types (user, assistant text, tool call, tool result) with thinking skipped, bounded-history truncation, empty-lineage clear, stale v1-artifact rejection, and resume without duplicates.
 - `npm run test:focused`: 24/24 pass (unit only).
-- `npm run test:integration`: 3/3 pass (mocked two-session lifecycle; live HerdR cases skipped because no backend was available).
+- `npm run test:integration`: 3/3 pass (mocked two-session lifecycle; live Herdr cases skipped because no backend was available).
 - `npm run typecheck`: clean.
 - `npm pack --dry-run`: 10 files (7 runtime sources + package.json/README/LICENSE, npm auto-included; no tests or Harness docs).
 - `git diff --check`: pass.
-- Live two-session HerdR smoke in the new `pi-peer/talk` namespace: **passed**
+- Live two-session Herdr smoke in the new `pi-peer/talk` namespace: **passed**
   (slice 7, see `US-010` validation). Two live Pi panes in one workspace
   discovered each other (`talk_sessions` = 2 peers), exchanged a `talk_to`
   request/reply (marker `PI_PEER_3WAY_OK`), and read bounded version-2

@@ -1,6 +1,6 @@
 # pi-peer
 
-Peer-to-peer chat between Pi coding-agent sessions running in the same HerdR workspace. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
+Peer-to-peer chat between Pi coding-agent sessions running in the same Herdr workspace. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
 
 It is symmetric, natural chat between equal agents — not RPC or task delegation to a subagent. There is no request/response correlation, no `timeoutMs`, no waiting, and no `<peer_pong>`. Three tools, nothing else.
 
@@ -17,7 +17,7 @@ It is symmetric, natural chat between equal agents — not RPC or task delegatio
 ## How it works
 
 ```
-                     HerdR workspace
+                     Herdr workspace
     ┌────────────────┐                    ┌────────────────┐
     │  Pi session A  │                    │  Pi session B  │
     │    peer-a1b    │                    │    peer-c3d    │
@@ -43,7 +43,7 @@ A message is delivered to an **idle** receiver as a normal user message (trigger
 
 ## Requirements
 
-- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) running inside a HerdR pane.
+- [Pi coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent) running inside a Herdr pane.
 - `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket.
 - Node 22.19+ for development (required by the Pi coding-agent SDK).
 
@@ -59,7 +59,7 @@ Or from GitHub:
 pi install git:github.com/sting8k/pi-peer
 ```
 
-Tools register automatically when a Pi session starts inside a HerdR pane. Set `PI_PEER_DISABLED=1` for sessions that must not appear as peers or receive requests, and `PI_CODING_AGENT_DIR` to override the agent directory (default `~/.pi/agent`).
+Tools register automatically when a Pi session starts inside a Herdr pane. Set `PI_PEER_DISABLED=1` for sessions that must not appear as peers or receive requests, and `PI_CODING_AGENT_DIR` to override the agent directory (default `~/.pi/agent`).
 
 Migrating from the pi-roo extension, which used to bundle these tools: set `features.talk=false` in your pi-roo config, install pi-peer, then reload every Pi session. The storage namespace changed (`pi-roo/talk` → `pi-peer/talk`), so the cutover is a clean break with no dual-read migration.
 
@@ -164,8 +164,8 @@ Distribution is available from both npm and GitHub. The npm package is published
 
 ## Related Work
 
-- [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) — the host whose extension API this builds on.
-- HerdR — the pane/workspace environment that provides session identity and peer discovery.
+- [Pi coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent) — the host whose extension API this builds on.
+- Herdr — the pane/workspace environment that provides session identity and peer discovery.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 This document describes the architecture of the standalone **pi-peer**
 extension: a peer-to-peer chat runtime for Pi sessions running inside
-a HerdR workspace. It supersedes the earlier pi-roo subagent/loop architecture
+a Herdr workspace. It supersedes the earlier pi-roo subagent/loop architecture
 and the prior request/response (RPC) peer-talk protocol.
 
 ## Runtime Shape
@@ -14,7 +14,7 @@ The shipped runtime is a single package under `pi-extension/pi-peer/`:
 | `index.ts` | Standalone entrypoint; reads `PI_PEER_DISABLED`, registers exactly three tools (`talk_sessions`, `talk_latest`, `talk_to`). |
 | `service.ts` | Tool registration, session/busy lifecycle, inbox drain + message injection. |
 | `schemas.ts` | TypeBox parameter schemas for the three tools. |
-| `herdr.ts` | HerdR workspace identity (`HERDR_ENV`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`), peer status/liveness, talk root directory. |
+| `herdr.ts` | Herdr workspace identity (`HERDR_ENV`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`), peer status/liveness, talk root directory. |
 | `history.ts` | Bounded event history (max 10 events, no thinking), current-lineage rebuild, publish/read. |
 | `protocol.ts` | `PeerRecord` / `PeerMessage` envelopes, atomic mailbox paths, `publicPeerId` (single user-facing id formatter: `peer-<last 3 chars of session id>`), and the inbound `<peer_message>` renderer. |
 | `storage.ts` | Atomic JSON persistence (`safeKey`, write-temp-then-rename). |
@@ -33,7 +33,7 @@ no mux spawning anywhere in the runtime.
 | History | `pi-extension/pi-peer/history.ts` | v2: max 10 events, current-lineage rebuild, no thinking. |
 | Protocol | `pi-extension/pi-peer/protocol.ts` | v1 chat envelopes, atomic mailbox paths, inbound renderer. |
 | Storage | `<agent-dir>/pi-peer/talk/<workspace-id>/` | `sessions/`, `latest/`, `inbox/`. |
-| Workspace identity | `pi-extension/pi-peer/herdr.ts` | HerdR pane env + socket; verified on every liveness read. |
+| Workspace identity | `pi-extension/pi-peer/herdr.ts` | Herdr pane env + socket; verified on every liveness read. |
 | Tests | `test/peer/`, `test/integration/` | Unit + mocked two-peer lifecycle. |
 | Harness | `docs/`, `harness.db` | Generic Harness process; product docs describe only pi-peer. |
 
@@ -95,7 +95,7 @@ no reply file, no `<peer_pong>`.
   rebuilt from its own current-lineage session, and `talk_latest` reads only
   the published `latest/<session-id>.json` artifact.
 - Registration records are removed at `session_shutdown`; panes that are no
-  longer alive on the HerdR socket are excluded from discovery, and a `talk_to`
+  longer alive on the Herdr socket are excluded from discovery, and a `talk_to`
   to a missing/dead/ambiguous target fails loudly **before** any enqueue.
 - Identity is dual-layer: the **full session id** is the internal identity
   (artifact paths, inbox addressing, history source), while the **public peer
@@ -122,14 +122,14 @@ id** — the public peer id is only a display/resolution alias and never a
 storage key. The namespace is a clean break from the
 legacy `pi-roo/talk`; there is no dual-read migration.
 
-## HerdR Requirement
+## Herdr Requirement
 
-The extension is HerdR-only:
+The extension is Herdr-only:
 
-- Each Pi session must run inside an active HerdR pane (`HERDR_ENV=1`,
+- Each Pi session must run inside an active Herdr pane (`HERDR_ENV=1`,
   `HERDR_PANE_ID` set).
 - `HERDR_SOCKET_PATH` must be an absolute path to the workspace socket.
-- Workspace identity is derived from the pane's HerdR metadata and verified
+- Workspace identity is derived from the pane's Herdr metadata and verified
   with the CLI on each status read, so records for dead panes are never
   presented as live peers.
 

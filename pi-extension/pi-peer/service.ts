@@ -325,7 +325,7 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_sessions",
     label: "Talk Sessions",
-    description: "List live Pi peer sessions in the current HerdR workspace.",
+    description: "List live Pi peer sessions in the current Herdr workspace.",
     promptSnippet: "Use `talk_sessions` to find a peer's public id (e.g. `peer-abc`) before calling `talk_to`.",
     parameters: TalkSessionsParams,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
@@ -358,7 +358,7 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_to",
     label: "Talk To",
-    description: "Send a message to another live Pi session in the current HerdR workspace. Returns confirmation that the message was sent (durably queued in the peer's mailbox); the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
+    description: "Send a message to another live Pi session in the current Herdr workspace. Returns confirmation that the message was sent (durably queued in the peer's mailbox); the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
     promptSnippet: "Use `talk_to` to send a chat message to another Pi session; call `talk_sessions` first when the target is unknown.",
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {

@@ -35,9 +35,9 @@ Status values:
 | System prompts | `AGENTS.md` plus Harness policy docs | Covered | `AGENTS.md` is the stable shim; docs carry evolving operating instructions. |
 | Tool descriptions | `README.md`, `docs/product/overview.md`, `scripts/README.md`, pi tool descriptions in `pi-extension/pi-peer/index.ts` | Partial | Commands and Harness CLI are documented, but there is no generated command reference. |
 | Tool implementations | `pi-extension/pi-peer/*`, `scripts/bin/harness-cli`, `scripts/schema/*` | Covered | Product tools and Harness durable-layer tools are separate implementation surfaces. |
-| Middleware | Feature intake workflow, peer busy/queue lock, HerdR liveness checks | Partial | Some runtime guards exist, but Harness policies are not centrally enforced. |
+| Middleware | Feature intake workflow, peer busy/queue lock, Herdr liveness checks | Partial | Some runtime guards exist, but Harness policies are not centrally enforced. |
 | Skills | `docs/templates/*`, `docs/FEATURE_INTAKE.md`, `docs/CONTEXT_RULES.md`, `docs/TRACE_SPEC.md` | Partial | Procedures exist as markdown rather than installable agent skills. |
-| Peer sessions | `talk_sessions`/`talk_latest`/`talk_to`, `pi-extension/pi-peer/*` | Covered | The product itself provides peer-to-peer session communication between HerdR panes. |
+| Peer sessions | `talk_sessions`/`talk_latest`/`talk_to`, `pi-extension/pi-peer/*` | Covered | The product itself provides peer-to-peer session communication between Herdr panes. |
 | Long-term memory | `harness.db`, `docs/decisions/*`, `docs/stories/*`, `docs/product/*`, `docs/GLOSSARY.md` | Covered | Durable records and docs preserve task history and product vocabulary. |
 
 ## File Inventory

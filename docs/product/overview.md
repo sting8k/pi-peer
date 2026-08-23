@@ -1,7 +1,7 @@
 # Product Overview — pi-peer
 
 **pi-peer** is a standalone Pi coding-agent extension that enables peer-to-peer
-chat between independently running Pi sessions inside a HerdR workspace. It is
+chat between independently running Pi sessions inside a Herdr workspace. It is
 symmetric, natural chat between equal agents — not RPC or task delegation to a
 subagent.
 
@@ -20,14 +20,14 @@ no slash commands, no widgets. The product contract is defined here, in
 │  talk_sessions           │ ◄──────► │  talk_sessions           │
 │  pi-peer/talk/<ws>       │  +history│  pi-peer/talk/<ws>       │
 └──────────────────────────┘          └──────────────────────────┘
-                shared HerdR workspace (HERDR_SOCKET_PATH)
+                shared Herdr workspace (HERDR_SOCKET_PATH)
 ```
 
 ## Tools
 
 | Tool | Purpose | Parameters |
 | --- | --- | --- |
-| `talk_sessions` | List live peers in the current HerdR workspace. | none |
+| `talk_sessions` | List live peers in the current Herdr workspace. | none |
 | `talk_latest` | Read the N most recent **completed** events a peer published. | `target` (required), `count` (1–10, default 1) |
 | `talk_to` | Send a chat message to a peer; returns **delivery confirmation only**. | `target` (required), `message` (required) |
 
@@ -78,7 +78,7 @@ is a presentation-only alias derived by one central formatter.
 | Requirement | Value |
 | --- | --- |
 | Pi | `@earendil-works/pi-coding-agent` extension API (peer dependency). |
-| HerdR | Active pane per session: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`. |
+| Herdr | Active pane per session: `HERDR_ENV=1`, `HERDR_PANE_ID`, absolute `HERDR_SOCKET_PATH`. |
 | Agent dir | `PI_CODING_AGENT_DIR` or `~/.pi/agent`; storage under `pi-peer/talk/<workspace-id>/`. |
 | Opt-out | `PI_PEER_DISABLED=1`. |
 

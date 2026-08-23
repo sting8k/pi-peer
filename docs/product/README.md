@@ -1,7 +1,7 @@
 # Product Docs — pi-peer
 
 This folder is the current product contract for the standalone **pi-peer**
-extension (peer-to-peer Pi communication over a HerdR workspace). It describes
+extension (peer-to-peer Pi communication over a Herdr workspace). It describes
 only pi-peer; the pi-roo subagent/loop/advisor product is out of scope here.
 
 ## Files

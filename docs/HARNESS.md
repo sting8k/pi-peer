@@ -2,7 +2,7 @@
 
 The Harness is the repo-level operating system for safe human/agent work. In
 this repository, the product is the standalone pi-peer extension (peer-to-peer
-Pi communication over a HerdR workspace) and the Harness is
+Pi communication over a Herdr workspace) and the Harness is
 what agents use to classify work, preserve context, validate changes, and leave
 trace evidence.
 
@@ -269,7 +269,7 @@ npm test
 
 npm run test:integration
   mocked two-session peer lifecycle tests (request/reply, busy queueing, history);
-  live HerdR smoke is opt-in and documented separately
+  live Herdr smoke is opt-in and documented separately
 ```
 
 Future product or release work may add broader checks, but agents must not claim

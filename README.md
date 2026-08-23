@@ -119,18 +119,13 @@ Each peer publishes its own bounded history (max 10 events: user, assistant text
 
 ## Guarantees
 
-- **Liveness decides delivery.** Registrations, refreshed every 10 s, are the authoritative signal. A peer that shut down cleanly fails your `talk_to` immediately; a crashed one fails it once its registration goes stale (about a minute) plus two confirming checks. Dead peers cannot be listed or targeted.
-- **Durable, at-least-once mailbox.** Every message is written atomically (temp file + rename) and claimed via a `.processing` rename before injection. The claim is held through the turn (consumed at `agent_end`), not just until the host accepts the injection. A failed injection is requeued, and orphaned `.processing` claims are reclaimed on reload/rebind and at startup, so a host-accepted-but-unconsumed message is recoverable (at-least-once). This is a host-lifecycle guarantee, not proof the model consumed the message.
-- **Fair, serial delivery.** One message per poll tick, injected in per-runtime
-  creation (filename) order — oldest first within a runtime. Across processes,
-  messages sharing a creation timestamp have a deterministic filename order,
-  but no global cross-process enqueue order is claimed. An idle receiver gets a
-  fresh user turn; until `agent_start` engages it, no further plain turn is
-  opened (an idle-burst latch), so a burst steers into the engaged turn rather
-  than overlapping. A busy receiver is steered — regardless of sender. No
-  same-caller restriction, no batch, no route/cycle machinery.
-- **A reply is another `talk_to`.** No `agent_end` auto-reply, no `<peer_pong>`, no waiter, no response file. The conversation is carried by plain `<peer_message>` inbound messages.
-- **Ambiguity fails closed.** Two peers sharing a public id resolve to an error, never to a guess.
+| Guarantee | Rule |
+| --- | --- |
+| **Liveness decides delivery** | Registrations (refreshed every 10 s) are the authoritative signal. Clean shutdown fails `talk_to` immediately; a crash fails it once the registration goes stale (~1 min + two confirming checks). Dead peers cannot be listed or targeted. |
+| **Durable, at-least-once mailbox** | Atomic writes (temp file + rename). Messages are claimed via a `.processing` rename and held through the turn, consumed at `agent_end`; failed injections requeue, and orphaned claims are reclaimed on reload/rebind/startup. Host-lifecycle guarantee — not proof the model consumed the message. |
+| **Fair, serial delivery** | One message per poll tick, oldest first (per-runtime filename order). An idle receiver gets a fresh turn; while that turn is engaging, a burst steers into it instead of overlapping. Busy receivers are steered regardless of sender. No same-caller restriction, no batching, no routing. |
+| **A reply is another `talk_to`** | No `agent_end` auto-reply, no `<peer_pong>`, no waiters. The conversation is carried by plain `<peer_message>` inbound messages. |
+| **Ambiguity fails closed** | Two peers sharing a public id resolve to an error, never to a guess. |
 
 For the full flow, invariants, and cleanup rules, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -150,8 +145,8 @@ Writes are atomic (temp file plus rename) and the mailbox directory is created w
 
 ```sh
 npm install
-npm test                  # 52 tests (3 suites)
-npm run test:focused      # 46 unit tests
+npm test                  # 61 tests (5 suites)
+npm run test:focused      # 55 peer tests
 npm run test:integration  # 6 mocked two-peer lifecycle tests
 npm run typecheck         # tsc --noEmit
 ```

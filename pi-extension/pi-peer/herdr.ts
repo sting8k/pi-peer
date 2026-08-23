@@ -160,6 +160,26 @@ export async function probePaneCountAsync(
 }
 
 /**
+ * Best-effort display name of a workspace (what a released tab should show).
+ * Degrades to undefined on any failure; callers fall back to the workspace id.
+ */
+export async function probeWorkspaceNameAsync(
+  workspaceId: string,
+  socketPath: string,
+  options?: { signal?: AbortSignal; run?: typeof herdrRunAsync },
+): Promise<string | undefined> {
+  try {
+    const run = options?.run ?? herdrRunAsync;
+    const raw = await run(["workspace", "get", workspaceId], socketPath, { signal: options?.signal });
+    const decoded = decodeHerdrJson<{ workspace?: { label?: string } }>(raw, "workspace get");
+    const label = decoded?.workspace?.label;
+    return typeof label === "string" && label.trim() ? label : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Establish the current peer's Herdr context. Requires Pi to run inside an
  * active Herdr pane (workspace identity originates from the pane metadata).
  */

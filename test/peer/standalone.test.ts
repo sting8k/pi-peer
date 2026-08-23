@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
-import { getTalkRootDir, HerdrUnavailableError, probePaneCountAsync } from "../../pi-extension/pi-peer/herdr.ts";
+import { getTalkRootDir, HerdrUnavailableError, probePaneCountAsync, probeWorkspaceNameAsync } from "../../pi-extension/pi-peer/herdr.ts";
 import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
@@ -34,6 +34,7 @@ const noopPaneLabelDeps = {
   clearPaneLabel: async () => {},
   renameTab: async () => {},
   probePaneCount: async () => undefined as number | undefined,
+  probeWorkspaceName: async () => undefined as string | undefined,
 };
 
 describe("pi-peer outside Herdr", () => {
@@ -112,6 +113,18 @@ describe("herdr paneCount probe", () => {
   });
 });
 
+
+describe("herdr workspaceName probe", () => {
+  it("extracts the workspace label; degrades to undefined on any failure", async () => {
+    const run = async () => JSON.stringify({ result: { workspace: { label: "pi-peer" } } });
+    assert.equal(await probeWorkspaceNameAsync("w35", "/tmp/s.sock", { run }), "pi-peer", "label extracted (result is unwrapped by decodeHerdrJson)");
+    assert.equal(await probeWorkspaceNameAsync("w35", "/tmp/s.sock", { run: async () => "{bad" }), undefined, "malformed JSON degrades");
+    const throwing = async () => { throw new Error("socket dead"); };
+    assert.equal(await probeWorkspaceNameAsync("w35", "/tmp/s.sock", { run: throwing }), undefined, "CLI error never rejects");
+    const emptyLabel = async () => JSON.stringify({ result: { workspace: { label: "" } } });
+    assert.equal(await probeWorkspaceNameAsync("w35", "/tmp/s.sock", { run: emptyLabel }), undefined, "empty label degrades to undefined");
+  });
+});
 describe("pi-peer standalone runtime", () => {
   it("entrypoint registers exactly the three talk tools", () => {
     const { api, registeredTools, registeredCommands, registeredRenderers } = createMockExtensionApi();
@@ -836,6 +849,7 @@ describe("pi-peer standalone runtime", () => {
       renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
       clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
       renameTab: async (id: string, label: string) => { ops.push(`tab:${id}:${label}`); },
+      probeWorkspaceName: async (wsId: string) => (wsId === "ws-a" ? "Alpha" : "Beta"),
       rootDir: () => root,
     });
     const fire = (name: string, event: any = { type: name }) => {
@@ -853,12 +867,12 @@ describe("pi-peer standalone runtime", () => {
       tabId = "tab-b";
       fire("session_start");
       await waitUntil(() => ops.length === 3, "stale tab released, new tab labeled");
-      assert.equal(ops[1], "tab:tab-a:ws-a", "stale tab restored to ITS OWN workspace name");
+      assert.equal(ops[1], "tab:tab-a:Alpha", "stale tab restored to its own workspace NAME");
       assert.match(ops[2], /^tab:tab-b:/, "new tab labeled with peer B name");
 
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       await waitUntil(() => ops.length === 4, "shutdown releases tab-b");
-      assert.equal(ops[3], "tab:tab-b:ws-b");
+      assert.equal(ops[3], "tab:tab-b:Beta");
     } finally {
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       rmSync(root, { recursive: true, force: true });

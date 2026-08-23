@@ -7,10 +7,12 @@ import { join } from "node:path";
 import { TalkLatestParams, TalkSessionsParams, TalkToParams } from "./schemas.ts";
 import {
   clearPaneLabelAsync,
+  clearTabLabelAsync,
   getCurrentHerdrPeerContextAsync,
   getHerdrPeerStatusAsync,
   getTalkRootDir,
   renamePaneAsync,
+  renameTabAsync,
   type HerdrPeerContext,
 } from "./herdr.ts";
 import { readJson, writeAtomic } from "./storage.ts";
@@ -52,6 +54,8 @@ export type TalkDeps = {
   getPeerStatus?: typeof getHerdrPeerStatusAsync;
   renamePane?: typeof renamePaneAsync;
   clearPaneLabel?: typeof clearPaneLabelAsync;
+  renameTab?: typeof renameTabAsync;
+  clearTabLabel?: typeof clearTabLabelAsync;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
 };
@@ -173,18 +177,28 @@ export function registerTalkTools(
   const getStatus = deps.getPeerStatus ?? getHerdrPeerStatusAsync;
   const renamePane = deps.renamePane ?? renamePaneAsync;
   const clearPaneLabel = deps.clearPaneLabel ?? clearPaneLabelAsync;
+  const renameTab = deps.renameTab ?? renameTabAsync;
+  const clearTabLabel = deps.clearTabLabel ?? clearTabLabelAsync;
   const hasBusyOverride = typeof deps.isBusy === "function";
   // Standalone runtime self-tracks busy through agent_start/agent_end unless a
   // caller injects an explicit busy function (test/runtime override).
   let selfBusy = false;
   const isBusy = hasBusyOverride ? deps.isBusy! : () => selfBusy;
-  // Pane-label mutations are serialized: a slow rename must never complete
-  // after a later clear/rename and leave a stale peer name on the pane.
-  // Errors are swallowed inside the queue (cosmetic, never block lifecycle).
-  let paneLabelQueue: Promise<void> = Promise.resolve();
-  const enqueuePaneLabelOp = (op: () => Promise<void>): void => {
-    paneLabelQueue = paneLabelQueue.then(op).catch(() => {});
+  // Surface-label mutations are serialized: a slow rename must never complete
+  // after a later clear/rename and leave a stale peer name. The visible name
+  // surface is the tab when the peer is its only pane (pane labels are hidden
+  // until a split exists), otherwise the pane itself. Errors are swallowed
+  // inside the queue (cosmetic, never block lifecycle).
+  let labelQueue: Promise<void> = Promise.resolve();
+  const enqueueLabelOp = (op: () => Promise<void>): void => {
+    labelQueue = labelQueue.then(op).catch(() => {});
   };
+  type LabeledSurface = { kind: "pane" | "tab"; id: string };
+  let labeledSurface: LabeledSurface | null = null;
+  const renameSurface = (surface: LabeledSurface, label: string) =>
+    surface.kind === "pane" ? renamePane(surface.id, label) : renameTab(surface.id, label);
+  const clearSurface = (surface: LabeledSurface) =>
+    surface.kind === "pane" ? clearPaneLabel(surface.id) : clearTabLabel(surface.id);
   // Lifecycle generation: bumped on shutdown. A bind that was awaiting its
   // peer context when shutdown landed must not commit a runtime, write a
   // registration, or enqueue a pane rename — it belongs to a dead session.
@@ -317,11 +331,20 @@ export function registerTalkTools(
       removeOwnedRecord(current.root, current.record);
     }
     runtime = { peer, record, root };
-    // Cosmetic, best-effort: label our pane with the peer display name. Fires
-    // only on fresh runtime creation (bind/switch), never the cached fast-path,
-    // so a manual pane rename mid-session is never fought over. Serialized so
-    // it cannot complete after a subsequent switch's rename or a shutdown clear.
-    enqueuePaneLabelOp(() => renamePane(peer.paneId, record.name));
+    // Cosmetic, best-effort: label the visible name surface with the peer
+    // display name — the tab when this peer is its only pane, else the pane.
+    // Fires only on fresh runtime creation (bind/switch), never the cached
+    // fast-path, so a manual rename mid-session is never fought over.
+    // Serialized so an op cannot complete after a later op for this surface.
+    const surface: LabeledSurface = peer.paneCount === 1 && peer.tabId
+      ? { kind: "tab", id: peer.tabId }
+      : { kind: "pane", id: peer.paneId };
+    if (labeledSurface && (labeledSurface.kind !== surface.kind || labeledSurface.id !== surface.id)) {
+      const stale = labeledSurface;
+      enqueueLabelOp(() => clearSurface(stale));
+    }
+    enqueueLabelOp(() => renameSurface(surface, record.name));
+    labeledSurface = surface;
     if (!interval) {
       interval = setInterval(() => {
         if (!runtime) return;
@@ -458,11 +481,12 @@ export function registerTalkTools(
       // inbox/latest artifacts are not lifecycle-owned and are left for the
       // cross-session GC sweep.
       removeOwnedRecord(runtime.root, runtime.record);
-      // Return the pane label: a dead pane must not keep advertising the peer
-      // name. Cosmetic, best-effort, serialized behind any in-flight rename so
-      // the clear always lands last.
-      const paneId = runtime.peer.paneId;
-      enqueuePaneLabelOp(() => clearPaneLabel(paneId));
+      // Return the label on whichever surface this runtime named (tab or
+      // pane): a dead surface must not keep advertising the peer name.
+      // Serialized behind any in-flight rename so the clear lands last.
+      const surface = labeledSurface;
+      labeledSurface = null;
+      if (surface) enqueueLabelOp(() => clearSurface(surface));
     }
     if (interval) clearInterval(interval);
     interval = null;

@@ -23,6 +23,9 @@ export interface HerdrPeerContext {
   tabId?: string;
   socketPath: string;
   workspaceId: string;
+  /** Panes in the owning tab, read at bind time. 1 means the tab bar is the
+   * only visible name surface; >1 means pane labels are visible. */
+  paneCount?: number;
 }
 
 export type HerdrAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
@@ -123,6 +126,28 @@ function herdrAgentStatusFrom(pane: HerdrPane): HerdrAgentStatus {
 }
 
 /**
+ * Best-effort pane count of the owning tab (label surface selection only).
+ * Any failure — CLI error, timeout, malformed JSON, missing field — degrades
+ * to `undefined` (callers fall back to the pane surface); it must NEVER fail
+ * the peer bind. Injectable `run` for unit tests.
+ */
+export async function probePaneCountAsync(
+  tabId: string,
+  socketPath: string,
+  options?: { signal?: AbortSignal; run?: typeof herdrRunAsync },
+): Promise<number | undefined> {
+  try {
+    const run = options?.run ?? herdrRunAsync;
+    const raw = await run(["tab", "get", tabId], socketPath, { signal: options?.signal });
+    const tab = decodeHerdrJson<{ tab?: { pane_count?: number } }>(raw, "tab get");
+    const count = tab?.tab?.pane_count;
+    return typeof count === "number" ? count : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Establish the current peer's Herdr context. Requires Pi to run inside an
  * active Herdr pane (workspace identity originates from the pane metadata).
  */
@@ -133,12 +158,17 @@ export async function getCurrentHerdrPeerContextAsync(signal?: AbortSignal): Pro
   const socketPath = herdrSocketPath();
   const pane = await getHerdrPaneAsync(process.env.HERDR_PANE_ID, socketPath, { signal });
   if (!pane.workspace_id) throw new Error("Herdr pane get did not include workspace_id");
+  // Tab metadata is cosmetic (label surface selection only): a failed or
+  // malformed probe must degrade to `paneCount: undefined` (pane surface)
+  // rather than fail the bind — identity comes from pane/workspace, not this.
+  const paneCount = pane.tab_id ? await probePaneCountAsync(pane.tab_id, socketPath, { signal }) : undefined;
   return {
     paneId: process.env.HERDR_PANE_ID,
     terminalId: pane.terminal_id,
     tabId: pane.tab_id,
     socketPath,
     workspaceId: pane.workspace_id,
+    paneCount,
   };
 }
 
@@ -172,4 +202,17 @@ export async function renamePaneAsync(paneId: string, label: string, signal?: Ab
  */
 export async function clearPaneLabelAsync(paneId: string, signal?: AbortSignal): Promise<void> {
   await herdrRunAsync(["pane", "rename", paneId, "--clear"], undefined, { signal });
+}
+
+/**
+ * Label a tab (single-pane sessions have no visible pane labels; the tab
+ * bar is their only name surface). `herdr tab rename` has no --clear; an
+ * empty label restores default rendering. Best-effort, swallow errors.
+ */
+export async function renameTabAsync(tabId: string, label: string, signal?: AbortSignal): Promise<void> {
+  await herdrRunAsync(["tab", "rename", tabId, label], undefined, { signal });
+}
+
+export async function clearTabLabelAsync(tabId: string, signal?: AbortSignal): Promise<void> {
+  await herdrRunAsync(["tab", "rename", tabId, ""], undefined, { signal });
 }

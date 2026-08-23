@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
-import { getTalkRootDir } from "../../pi-extension/pi-peer/herdr.ts";
+import { getTalkRootDir, probePaneCountAsync } from "../../pi-extension/pi-peer/herdr.ts";
 import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
@@ -26,12 +26,28 @@ function peerMessage(from: string, fromName: string, to: string, message: string
   return { version: 1, type: "peer_message", id, from, fromName, to, message, createdAt: nowIso() };
 }
 
-// Pane-label CLI calls are always injected in tests: the default impl spawns
-// the real `herdr` binary against a fake socket context.
+// Pane/tab-label CLI calls are always injected in tests: the default impl
+// spawns the real `herdr` binary against a fake socket context.
 const noopPaneLabelDeps = {
   renamePane: async () => {},
   clearPaneLabel: async () => {},
+  renameTab: async () => {},
+  clearTabLabel: async () => {},
 };
+
+describe("herdr paneCount probe", () => {
+  it("degrades to undefined on CLI failure, malformed JSON, or missing field", async () => {
+    const run = async () => { throw new Error("socket dead"); };
+    assert.equal(await probePaneCountAsync("t1", "/tmp/s.sock", { run }), undefined, "CLI error never rejects");
+    assert.equal(await probePaneCountAsync("t1", "/tmp/s.sock", { run: async () => "not json{{{" }), undefined, "malformed JSON degrades");
+    assert.equal(await probePaneCountAsync("t1", "/tmp/s.sock", { run: async () => JSON.stringify({ result: { tab: {} } }) }), undefined, "missing pane_count degrades");
+  });
+
+  it("returns the tab pane_count on a healthy probe", async () => {
+    const run = async () => JSON.stringify({ result: { tab: { pane_count: 2 } } });
+    assert.equal(await probePaneCountAsync("t1", "/tmp/s.sock", { run }), 2);
+  });
+});
 
 describe("pi-peer standalone runtime", () => {
   it("entrypoint registers exactly the three talk tools", () => {
@@ -499,6 +515,114 @@ describe("pi-peer standalone runtime", () => {
 
       // (A tool call after shutdown is impossible in a real host: tools die
       // with the session. The generation guard covers the bind-pending window.)
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("single-pane session labels the tab, not the pane; shutdown clears the tab", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    const sessionId = "session-tab";
+    const ctx: any = {
+      cwd: "/work/tab-label",
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, "transcripts", `${sessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-tab", terminalId: "terminal-tab", tabId: "tab-lone",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1", paneCount: 1,
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
+      renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
+      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      fire("session_start");
+      await waitUntil(() => ops.length === 1, "tab rename on single-pane bind");
+      const record = JSON.parse(readFileSync(recordPath(root, sessionId), "utf8"));
+      assert.deepEqual(ops, [`tab:tab-lone:${record.name}`], "labels the tab, never the pane");
+
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await waitUntil(() => ops.length === 2, "tab clear on shutdown");
+      assert.deepEqual(ops[1], "tab-clear:tab-lone");
+    } finally {
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rebind after a split moves the label: tab cleared, pane renamed", async () => {
+    const root = createTestDir();
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const ops: string[] = [];
+    let currentSessionId = "session-split-1";
+    let paneCount = 1;
+    const ctx: any = {
+      cwd: "/work/split",
+      sessionManager: {
+        getSessionId: () => currentSessionId,
+        getSessionFile: () => join(root, "transcripts", `${currentSessionId}.jsonl`),
+      },
+    };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+      },
+      async sendUserMessage() {}
+    };
+    registerTalkTools(api, {
+      getCurrentPeer: async () => ({
+        paneId: "pane-split", terminalId: "terminal-split", tabId: "tab-split",
+        socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1", paneCount,
+      }),
+      getPeerStatus: async () => "idle",
+      renamePane: async (paneId: string, label: string) => { ops.push(`pane:${paneId}:${label}`); },
+      clearPaneLabel: async (paneId: string) => { ops.push(`pane-clear:${paneId}`); },
+      renameTab: async (tabId: string, label: string) => { ops.push(`tab:${tabId}:${label}`); },
+      clearTabLabel: async (tabId: string) => { ops.push(`tab-clear:${tabId}`); },
+      rootDir: () => root,
+    });
+    const fire = (name: string, event: any = { type: name }) => {
+      for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+    };
+    try {
+      // First bind: single pane -> tab labeled.
+      fire("session_start");
+      await waitUntil(() => ops.length === 1, "tab rename on first bind");
+      assert.match(ops[0], /^tab:tab-split:/);
+
+      // A pane is split; the next bind (session switch) sees paneCount 2.
+      paneCount = 2;
+      currentSessionId = "session-split-2";
+      fire("session_start");
+      await waitUntil(() => ops.length === 3, "stale tab cleared and pane renamed on rebind");
+      assert.equal(ops[1], "tab-clear:tab-split", "stale tab label cleared");
+      const secondName = JSON.parse(readFileSync(recordPath(root, "session-split-2"), "utf8")).name;
+      assert.equal(ops[2], `pane:pane-split:${secondName}`, "pane is now the visible surface");
+
+      fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+      await waitUntil(() => ops.length === 4, "pane clear on shutdown");
+      assert.equal(ops[3], "pane-clear:pane-split");
     } finally {
       fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
       rmSync(root, { recursive: true, force: true });

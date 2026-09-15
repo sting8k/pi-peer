@@ -89,7 +89,7 @@ async function executeTalkTo(
   const target = params.target.trim();
   if (!target) throw new Error("talk_to requires a target");
   if (!message) throw new Error("talk_to requires a non-empty message");
-  const peers = await liveRecords(runtime.root, runtime.record.workspaceId, runtime.peer.socketPath, getStatus, signal);
+  const peers = await liveRecords(runtime.root, runtime.peer.socketPath, getStatus, signal);
   const targetRecord = resolveTarget(peers.map((entry) => entry.record), target);
   if (targetRecord.sessionId === runtime.record.sessionId) throw new Error("talk_to cannot target the current session");
   const sent: PeerMessage = {
@@ -124,7 +124,7 @@ async function executeTalkLatest(
   if (!Number.isInteger(count) || count < 1 || count > HISTORY_LIMIT) {
     throw new Error(`talk_latest count must be an integer between 1 and ${HISTORY_LIMIT}`);
   }
-  const peers = await liveRecords(runtime.root, runtime.record.workspaceId, runtime.peer.socketPath, getStatus, signal);
+  const peers = await liveRecords(runtime.root, runtime.peer.socketPath, getStatus, signal);
   const targetRecord = resolveTarget(peers.map((entry) => entry.record), target);
   const peerStatus = peers.find((entry) => entry.record.sessionId === targetRecord.sessionId)?.status ?? "unknown";
   const currentTurnInProgress = peerStatus === "working" || peerStatus === "blocked";
@@ -320,7 +320,7 @@ export function registerTalkTools(
     // The bind crossed a shutdown while awaiting the peer context: committing
     // now would resurrect a dead session (registration, pane label, footer).
     if (bindGeneration !== lifecycleGeneration) return null;
-    const root = rootDir(peer.workspaceId);
+    const root = rootDir(peer.roomId ?? peer.workspaceId);
     const existing = readJson(recordPath(root, sessionId));
     const name = isPeerRecord(existing) && existing.sessionId === sessionId
       ? existing.name
@@ -430,7 +430,7 @@ export function registerTalkTools(
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
       if (!current) throw new Error("pi-peer unavailable: session ended during bind");
-      const peers = await liveRecords(current.root, current.record.workspaceId, current.peer.socketPath, getStatus, signal);
+      const peers = await liveRecords(current.root, current.peer.socketPath, getStatus, signal);
       const lines = peers.map(({ record, status }) => {
         const base = `${publicPeerId(record.sessionId)}  ${record.name}  ${status}${record.sessionId === current.record.sessionId ? "  (current)" : ""}`;
         const queued = inboxCount(current.root, record.sessionId);

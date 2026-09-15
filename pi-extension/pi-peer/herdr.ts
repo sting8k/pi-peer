@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-import { safeKey } from "./storage.ts";
+import { readJson, safeKey } from "./storage.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +23,11 @@ export interface HerdrPeerContext {
   tabId?: string;
   socketPath: string;
   workspaceId: string;
+  /** Talk-room namespace override. Defaults to the workspace. Provisioned
+   * directory rooms (paseo.ts) share one talk root per project directory;
+   * a herdr-pane session in that directory joins the same room when one
+   * already exists — identity (labels, status) stays with its own pane. */
+  roomId?: string;
   /** Panes in the owning tab, read at bind time. 1 means the tab bar is the
    * only visible name surface; >1 means pane labels are visible. */
   paneCount?: number;
@@ -35,6 +40,7 @@ interface HerdrPane {
   terminal_id: string;
   tab_id?: string;
   workspace_id?: string;
+  cwd?: string;
 }
 
 interface HerdrResponse<T> {
@@ -182,6 +188,27 @@ export async function probeWorkspaceNameAsync(
   }
 }
 
+/** Shared paseo-room map (paseo.ts provisions, this module bridges): keys are
+ * canonical directory paths, values the Herdr workspace of the room. */
+export function defaultPaseoMapPath(): string {
+  return join(getAgentConfigDir(), "pi-peer", "paseo-map.json");
+}
+
+/** Canonical map key for a directory (trailing slashes collapse; root stays "/"). */
+export function canonicalDirKey(cwd: string): string {
+  return cwd.replace(/\/+$/, "") || "/";
+}
+
+/** Herdr-pane bridge: the room of this directory, when one is provisioned. */
+export function lookupDirectoryRoom(
+  cwd: string | undefined,
+  mapPath = defaultPaseoMapPath(),
+): string | undefined {
+  if (!cwd) return undefined;
+  const room = readJson(mapPath)?.[canonicalDirKey(cwd)];
+  return typeof room === "string" && room ? room : undefined;
+}
+
 export interface HerdrContextResolveOptions {
   /** Injectable herdr CLI runner for the legacy pane path (tests). */
   run?: typeof herdrRunAsync;
@@ -216,6 +243,12 @@ export async function getCurrentHerdrPeerContextAsync(
       tabId: pane.tab_id,
       socketPath,
       workspaceId: pane.workspace_id,
+      // Directory-room bridge: if a paseo-provisioned room already exists for
+      // this pane's directory, join its talk root so pane sessions and
+      // paseo-spawned agents in the same folder see each other. Identity
+      // (label surface, status checks) stays with the pane's own workspace;
+      // no room is ever provisioned from this branch.
+      roomId: lookupDirectoryRoom(pane.cwd),
       paneCount,
     };
   }

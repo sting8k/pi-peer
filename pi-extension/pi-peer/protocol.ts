@@ -328,14 +328,15 @@ export function isRegisteredLive(root: string, sessionId: string): boolean {
 
 export async function liveRecords(
   root: string,
-  workspaceId: string,
   socketPath: string,
   getStatus: (peerContext: HerdrPeerContext, signal?: AbortSignal) => Promise<HerdrAgentStatus>,
   signal?: AbortSignal,
 ): Promise<Array<{ record: PeerRecord; status: HerdrAgentStatus }>> {
   const result: Array<{ record: PeerRecord; status: HerdrAgentStatus }> = [];
   for (const record of loadRecords(root)) {
-    if (record.workspaceId !== workspaceId) continue;
+    // The room root IS the visibility scope: herdr-pane peers and
+    // paseo-provisioned peers in the same directory room mix here even when
+    // their identity workspaces differ (see herdr.ts roomId).
     // A crashed process stops heartbeating its registration; its stale record
     // is not a live peer even if the Herdr pane still exists.
     if (!isRegisteredLive(root, record.sessionId)) continue;
@@ -345,7 +346,7 @@ export async function liveRecords(
         terminalId: record.terminalId,
         tabId: record.tabId,
         socketPath,
-        workspaceId,
+        workspaceId: record.workspaceId,
       }, signal);
       result.push({ record, status });
     } catch {

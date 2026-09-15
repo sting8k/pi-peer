@@ -32,12 +32,16 @@ const execFileAsync = promisify(execFile);
  *     would isolate two agents sharing one checkout — the opposite of the
  *     directory-room rule). The paseo workspace id is only reported as
  *     best-effort provenance metadata.
- *  2. Herdr room — `paseo-map.json` maps dir → herdrWsId; mapped rooms are
- *     validated with `herdr workspace get` and recreated when gone. Herdr-pane
- *     sessions in the same directory join the room through the bridge in
- *     herdr.ts (identity stays with their own pane's workspace).
- *  3. A fresh tab (pane) is created in the room for this agent, the `HERDR_*`
- *     env is adopted so child processes inherit the context.
+ *  2. Herdr room — `paseo-map.json` maps dir → { room: herdrWsId, panes };
+ *     mapped rooms are validated with `herdr workspace get` and recreated when
+ *     gone. Herdr-pane sessions in the same directory join the room through
+ *     the bridge in herdr.ts (identity stays with their own pane's workspace).
+ *  3. A tab (pane) is created in the room for this agent and the `HERDR_*`
+ *     env is adopted so child processes inherit the context. The pane is
+ *     recorded per paseo agentId in the map and REUSED on reload/restart:
+ *     same agent → same pane → same peer id, so identity survives reloads and
+ *     no duplicate tabs pile up. A recorded pane that died (or strayed to
+ *     another room) falls back to a fresh tab.
  *
  * Fail-closed: every provisioning failure degrades to "peer talk disabled"
  * with a logged cause, never a pi startup crash.
@@ -95,7 +99,21 @@ export async function provisionPaseoHerdrContextAsync(
     const ctx = { signal, run, runPaseo, socketPath, mapPath: options.mapPath, paseoHome: options.paseoHome };
 
     const ensured = await ensureDirectoryRoom(cwd, ctx);
-    const pane = ensured.pane ?? await createRoomPane(ensured.workspaceId, agentId, cwd, ctx);
+    // Pane reuse: a brand-new room's root pane is this agent's pane; else the
+    // pane recorded for this agent is adopted when still alive in the room;
+    // otherwise a fresh tab is created. Every non-reused pane is recorded so
+    // the next reload binds back to the same pane (same peer id).
+    const reused = ensured.pane ? null : await reuseRoomPane(ensured.workspaceId, agentId, cwd, ctx);
+    const pane = reused ?? ensured.pane ?? await createRoomPane(ensured.workspaceId, agentId, cwd, ctx);
+    if (!reused) {
+      savePaneEntry(
+        ctx.mapPath ?? defaultPaseoMapPath(),
+        canonicalDirKey(cwd),
+        ensured.workspaceId,
+        agentId,
+        pane.pane_id,
+      );
+    }
     if (!pane.workspace_id) throw new Error("herdr pane create did not include workspace_id");
     adoptHerdrEnv(pane, socketPath);
     const paneCount = pane.tab_id
@@ -150,12 +168,14 @@ async function ensureDirectoryRoom(
   const dirKey = canonicalDirKey(cwd);
   const map = readJson(mapPath) ?? {};
   const mapped = map[dirKey];
-  if (typeof mapped === "string" && mapped) {
+  // Schema v2 entries carry { room, panes }; legacy flat values are the room itself.
+  const mappedRoom = mapped && typeof mapped === "object" ? (mapped as { room?: unknown }).room : mapped;
+  if (typeof mappedRoom === "string" && mappedRoom) {
     try {
-      await ctx.run(["workspace", "get", mapped], ctx.socketPath, { signal: ctx.signal });
+      await ctx.run(["workspace", "get", mappedRoom], ctx.socketPath, { signal: ctx.signal });
       // Fresh pane per agent session: agents sharing the directory share the
       // room, each gets its own tab.
-      return { workspaceId: mapped, pane: null };
+      return { workspaceId: mappedRoom, pane: null };
     } catch {
       // Mapped room is gone (closed/GC'd) — fall through and recreate.
     }
@@ -203,6 +223,33 @@ async function createRoomPane(
   return created.root_pane;
 }
 
+/**
+ * Pane reuse: the pane recorded for this paseo agent in the room map, when it
+ * is still alive in the room. `herdr pane get` failing (dead pane) or the pane
+ * living in another workspace (strayed/re-created room) both return null so
+ * the caller falls through to a fresh tab — never an identity mismatch.
+ */
+async function reuseRoomPane(
+  workspaceId: string,
+  agentId: string,
+  cwd: string,
+  ctx: { run: HerdrCliRun; socketPath: string; mapPath?: string; signal?: AbortSignal },
+): Promise<PaseoHerdrPane | null> {
+  const mapPath = ctx.mapPath ?? defaultPaseoMapPath();
+  const paneId = loadPaseoMap(mapPath)[canonicalDirKey(cwd)]?.panes[agentId];
+  if (!paneId) return null;
+  let pane: PaseoHerdrPane | undefined;
+  try {
+    const raw = await ctx.run(["pane", "get", paneId], ctx.socketPath, { signal: ctx.signal });
+    pane = decodeHerdrJson<{ pane?: PaseoHerdrPane }>(raw, "pane get")?.pane;
+  } catch {
+    return null; // pane gone — fall through to a fresh tab
+  }
+  if (!pane?.pane_id || !pane.terminal_id) return null;
+  if (pane.workspace_id !== workspaceId) return null; // alive but in another room
+  return pane;
+}
+
 function roomLabel(cwd: string): string {
   return basename(cwd) || "paseo-room";
 }
@@ -242,10 +289,14 @@ export function paseoAgentDirName(cwd: string): string {
  * (`paseo ls`, `herdr workspace list`) — absence from a list is the only
  * "dead" signal, so no transient CLI failure can be misread as "gone".
  * A room with fresh peer registrations is never swept (someone still uses
- * it — e.g. herdr-pane peers bridged into it). Legacy workspace-keyed map
- * entries (v2.3.x) can never match a live agent cwd and are cleaned up
- * here once their rooms go quiet. Fail-closed: a failed listing aborts the
- * sweep without touching the map; a failed close keeps the entry.
+ * it — e.g. herdr-pane peers bridged into it). For dirs that stay live, the
+ * per-agent pane records are pruned: an agent fully gone from the paseo
+ * listing has its pane closed (best-effort) and its entry dropped; a
+ * closed-but-still-listed agent keeps its pane (resumable). Legacy
+ * workspace-keyed map entries (v2.3.x) can never match a live agent cwd and
+ * are cleaned up here once their rooms go quiet. Fail-closed: a failed
+ * listing aborts the sweep without touching the map; a failed room close
+ * keeps the entry.
  */
 export async function sweepOrphanedPaseoRooms(
   signal?: AbortSignal,
@@ -253,54 +304,93 @@ export async function sweepOrphanedPaseoRooms(
 ): Promise<void> {
   try {
     const mapPath = options.mapPath ?? defaultPaseoMapPath();
-    const map = readJson(mapPath);
-    if (!map || typeof map !== "object") return;
-    const entries = Object.entries(map).filter(([, wsId]) => typeof wsId === "string" && wsId);
+    const map = loadPaseoMap(mapPath);
+    const entries = Object.entries(map);
     if (entries.length === 0) return;
 
     const run = options.run ?? herdrRunAsync;
     const runPaseo = options.runPaseo ?? defaultPaseoRun;
     const socketPath = resolveSocketPath(options.socketPath);
     // A missing/broken listing is "unknown", not "all dead" — abort, keep map.
-    const liveAgentDirs = livePaseoAgentDirs(await runPaseo(["ls", "--json"]), homedir());
+    const { liveDirs, listedAgentsByDir } = parsePaseoListing(await runPaseo(["ls", "--json"]), homedir());
     const liveHerdrWsIds = parseHerdrWorkspaceIds(await run(["workspace", "list"], socketPath, { signal }));
 
-    for (const [dirKey, herdrWsId] of entries) {
-      if (liveAgentDirs.has(dirKey)) continue;
-      if (liveHerdrWsIds.has(herdrWsId as string)) {
-        if (roomHasFreshActivity(herdrWsId as string)) continue;
-        try {
-          await run(["workspace", "close", herdrWsId as string], socketPath, { signal });
-        } catch {
-          // Close failed (herdr busy?) — keep the entry so a later sweep retries.
-          continue;
+    const droppedDirs = new Set<string>();
+    const prunedPanes = new Map<string, string[]>();
+    for (const [dirKey, entry] of entries) {
+      if (!liveDirs.has(dirKey)) {
+        if (liveHerdrWsIds.has(entry.room)) {
+          if (roomHasFreshActivity(entry.room)) continue;
+          try {
+            await run(["workspace", "close", entry.room], socketPath, { signal });
+          } catch {
+            // Close failed (herdr busy?) — keep the entry so a later sweep retries.
+            continue;
+          }
         }
+        // Absent from the herdr listing = confirmed dead; entry is stale either way.
+        droppedDirs.add(dirKey);
+        continue;
       }
-      // Absent from the herdr listing = confirmed dead; entry is stale either way.
-      const fresh = readJson(mapPath) ?? {};
-      delete fresh[dirKey];
-      writeAtomic(mapPath, fresh);
+      // Dir still alive: prune panes of agents fully gone from the paseo
+      // listing — closed-but-still-listed agents keep their pane (resumable).
+      const listed = listedAgentsByDir.get(dirKey);
+      for (const [agentId, paneId] of Object.entries(entry.panes)) {
+        if (listed?.has(agentId)) continue;
+        try {
+          await run(["pane", "close", paneId], socketPath, { signal });
+        } catch {
+          // Best-effort: the stale pane record goes regardless.
+        }
+        const removed = prunedPanes.get(dirKey) ?? [];
+        removed.push(agentId);
+        prunedPanes.set(dirKey, removed);
+      }
     }
+    if (droppedDirs.size === 0 && prunedPanes.size === 0) return;
+    // Re-merge over the freshest file: a concurrent provisioning between the
+    // listing and this write must not be clobbered.
+    const fresh = loadPaseoMap(mapPath);
+    for (const dirKey of droppedDirs) delete fresh[dirKey];
+    for (const [dirKey, agentIds] of prunedPanes) {
+      for (const agentId of agentIds) delete fresh[dirKey]?.panes[agentId];
+    }
+    writeAtomic(mapPath, fresh);
   } catch {
     // Opportunistic GC: never surfaces, never fails the provisioning above.
   }
 }
 
-/** Live (running/idle) agent directories from the paseo listing; `~` in the
- * display cwd expands back to home. Throws on anything unexpected so the
- * sweep aborts instead of misreading "unparseable" as "nobody is alive". */
-function livePaseoAgentDirs(raw: string, home: string): Set<string> {
+/** Agent listing from the paseo daemon: the directories with live
+ * (running/idle) agents, plus — for every listed agent regardless of status —
+ * the agent ids seen in its directory (pane pruning needs "removed entirely"
+ * vs "closed but listed"). `~` in the display cwd expands back to home.
+ * Throws on anything unexpected so the sweep aborts instead of misreading
+ * "unparseable" as "nobody is alive". */
+function parsePaseoListing(raw: string, home: string): {
+  liveDirs: Set<string>;
+  listedAgentsByDir: Map<string, Set<string>>;
+} {
   const parsed = JSON.parse(raw) as unknown;
   if (!Array.isArray(parsed)) throw new Error("unexpected paseo agent listing");
-  const dirs = new Set<string>();
+  const liveDirs = new Set<string>();
+  const listedAgentsByDir = new Map<string, Set<string>>();
   for (const agent of parsed) {
-    const record = agent && typeof agent === "object" ? agent as { status?: unknown; cwd?: unknown } : {};
-    if (record.status !== "running" && record.status !== "idle") continue;
+    const record = agent && typeof agent === "object"
+      ? agent as { id?: unknown; status?: unknown; cwd?: unknown }
+      : {};
     if (typeof record.cwd !== "string" || !record.cwd) continue;
     const absolute = record.cwd.startsWith("~") ? join(home, record.cwd.slice(1)) : record.cwd;
-    dirs.add(canonicalDirKey(absolute));
+    const dirKey = canonicalDirKey(absolute);
+    if (typeof record.id === "string" && record.id) {
+      const listed = listedAgentsByDir.get(dirKey) ?? new Set<string>();
+      listed.add(record.id);
+      listedAgentsByDir.set(dirKey, listed);
+    }
+    if (record.status !== "running" && record.status !== "idle") continue;
+    liveDirs.add(dirKey);
   }
-  return dirs;
+  return { liveDirs, listedAgentsByDir };
 }
 
 /** Same fail-closed contract for the herdr workspace listing. */
@@ -344,11 +434,46 @@ function adoptHerdrEnv(pane: PaseoHerdrPane, socketPath: string): void {
   if (!process.env.HERDR_SOCKET_PATH) process.env.HERDR_SOCKET_PATH = socketPath;
 }
 
+/** Map entry schema v2: the room's herdr workspace + the pane recorded per
+ * paseo agentId (identity across reloads). */
+interface PaseoMapEntry {
+  room: string;
+  panes: Record<string, string>;
+}
+
+/** Load the dir map, normalizing legacy flat "dir → wsId" values to schema v2
+ * in place. Legacy `wks_*` workspace-keyed entries normalize to entry shape
+ * too — they never match a live agent cwd, so the sweep cleans them as before. */
+function loadPaseoMap(mapPath: string): Record<string, PaseoMapEntry> {
+  const map = readJson(mapPath) ?? {};
+  for (const [key, value] of Object.entries(map)) {
+    if (typeof value === "string" && value) map[key] = { room: value, panes: {} };
+  }
+  return map as Record<string, PaseoMapEntry>;
+}
+
 function saveMapEntry(mapPath: string, dirKey: string, herdrWsId: string): void {
   // Merge over the freshest file contents: a concurrent provisioning of
   // another agent in the same directory must not be clobbered.
-  const map = readJson(mapPath) ?? {};
-  map[dirKey] = herdrWsId;
+  const map = loadPaseoMap(mapPath);
+  // A recreated room invalidates its old panes' identity — start panes empty.
+  map[dirKey] = { room: herdrWsId, panes: {} };
+  writeAtomic(mapPath, map);
+}
+
+/** Record the pane a paseo agent owns in its room, preserving the panes of
+ * the directory's other agents (fresh read + merge, like saveMapEntry). */
+function savePaneEntry(
+  mapPath: string,
+  dirKey: string,
+  herdrWsId: string,
+  agentId: string,
+  paneId: string,
+): void {
+  const map = loadPaseoMap(mapPath);
+  const entry = map[dirKey];
+  const panes = entry && entry.room === herdrWsId ? entry.panes : {};
+  map[dirKey] = { room: herdrWsId, panes: { ...panes, [agentId]: paneId } };
   writeAtomic(mapPath, map);
 }
 

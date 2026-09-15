@@ -189,7 +189,7 @@ export async function probeWorkspaceNameAsync(
 }
 
 /** Shared paseo-room map (paseo.ts provisions, this module bridges): keys are
- * canonical directory paths, values the Herdr workspace of the room. */
+ * canonical directory paths, values `{ room, panes }` entries (schema v2). */
 export function defaultPaseoMapPath(): string {
   return join(getAgentConfigDir(), "pi-peer", "paseo-map.json");
 }
@@ -199,13 +199,16 @@ export function canonicalDirKey(cwd: string): string {
   return cwd.replace(/\/+$/, "") || "/";
 }
 
-/** Herdr-pane bridge: the room of this directory, when one is provisioned. */
+/** Herdr-pane bridge: the room of this directory, when one is provisioned.
+ * Reads both map shapes: schema v2 `{ room, panes }` and the legacy flat
+ * "dir → wsId" value (normalized away on the next provision write). */
 export function lookupDirectoryRoom(
   cwd: string | undefined,
   mapPath = defaultPaseoMapPath(),
 ): string | undefined {
   if (!cwd) return undefined;
-  const room = readJson(mapPath)?.[canonicalDirKey(cwd)];
+  const entry = readJson(mapPath)?.[canonicalDirKey(cwd)];
+  const room = entry && typeof entry === "object" ? (entry as { room?: unknown }).room : entry;
   return typeof room === "string" && room ? room : undefined;
 }
 

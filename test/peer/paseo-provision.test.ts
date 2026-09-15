@@ -48,6 +48,8 @@ function rootPane(workspaceId: string, paneId: string) {
  */
 function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
   const calls: Array<{ args: string[] }> = [];
+  const alivePanes = new Map<string, object>();
+  const closedPanes: string[] = [];
   const run = async (args: string[]) => {
     calls.push({ args });
     const [cmd, sub, operand] = args;
@@ -58,11 +60,25 @@ function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
     if (cmd === "workspace" && sub === "create") {
       const wsId = `wNew${++createdCounter.n}`;
       liveWs.push(wsId); // a created room is alive
-      return JSON.stringify({ result: { root_pane: rootPane(wsId, `${wsId}:p1`) } });
+      const pane = rootPane(wsId, `${wsId}:p1`);
+      alivePanes.set(pane.pane_id, pane);
+      return JSON.stringify({ result: { root_pane: pane } });
     }
     if (cmd === "tab" && sub === "create") {
       const wsId = args[args.indexOf("--workspace") + 1];
-      return JSON.stringify({ result: { root_pane: rootPane(wsId, `${wsId}:p9`) } });
+      const pane = rootPane(wsId, `${wsId}:p9`);
+      alivePanes.set(pane.pane_id, pane);
+      return JSON.stringify({ result: { root_pane: pane } });
+    }
+    if (cmd === "pane" && sub === "get") {
+      const pane = alivePanes.get(operand!);
+      if (!pane) throw new Error("pane not found");
+      return JSON.stringify({ result: { pane } });
+    }
+    if (cmd === "pane" && sub === "close") {
+      if (!alivePanes.delete(operand!)) throw new Error("pane not found");
+      closedPanes.push(operand!);
+      return JSON.stringify({ result: { type: "ok" } });
     }
     if (cmd === "tab" && sub === "get") {
       return JSON.stringify({ result: { tab: { pane_count: 2 } } });
@@ -70,7 +86,7 @@ function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
     if (cmd === "workspace" && sub === "report-metadata") return JSON.stringify({ result: { type: "ok" } });
     throw new Error(`unexpected herdr invocation: ${args.join(" ")}`);
   };
-  return { run, calls, createdCounter };
+  return { run, calls, createdCounter, alivePanes, closedPanes };
 }
 
 /** Fake paseo `ls` (sweep) + agent state home (provenance read). */
@@ -127,7 +143,9 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.equal(ctx.roomId, "wNew1", "provisioned agents: room is the workspace");
       assert.equal(ctx.paneId, "wNew1:p1");
       assert.equal(ctx.paneCount, 2);
-      assert.equal(readJson(s.mapPath)?.["/work/checkout"], "wNew1", "map keyed by canonical dir");
+      const entry = readJson(s.mapPath)?.["/work/checkout"];
+      assert.equal(entry?.room, "wNew1", "map keyed by canonical dir");
+      assert.equal(entry?.panes?.["agent-1"], "wNew1:p1", "the agent's pane is recorded for reuse");
       assert.equal(process.env.HERDR_ENV, "1");
       assert.equal(process.env.HERDR_PANE_ID, "wNew1:p1");
       assert.equal(process.env.HERDR_WORKSPACE_ID, "wNew1");
@@ -159,6 +177,9 @@ describe("paseo provisioning (directory rooms)", () => {
 
       assert.equal(ctxA.workspaceId, ctxB.workspaceId, "same dir reuses the room regardless of paseo workspace");
       assert.equal(ctxB.paneId, ctxB.workspaceId + ":p9", "second agent gets its own tab in the shared room");
+      const entry = readJson(s.mapPath)?.["/work/checkout"];
+      assert.equal(entry?.panes?.["agent-1"], ctxA.paneId, "agent-1 pane recorded");
+      assert.equal(entry?.panes?.["agent-2"], ctxB.paneId, "agent-2 pane recorded alongside");
       assert.equal(s.herdr.createdCounter.n, 1, "exactly one room workspace");
     } finally {
       s.cleanup();
@@ -219,7 +240,7 @@ describe("paseo provisioning (directory rooms)", () => {
       process.env.PASEO_AGENT_CWD = "/work/checkout";
       process.env.PASEO_HOME = s.home;
       writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
-      writeFileSync(s.mapPath, JSON.stringify({ "/work/checkout": "wDead" }));
+      writeFileSync(s.mapPath, JSON.stringify({ "/work/checkout": { room: "wDead", panes: {} } }));
       const paseo = fakePaseo();
 
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
@@ -230,7 +251,117 @@ describe("paseo provisioning (directory rooms)", () => {
       });
 
       assert.equal(ctx.workspaceId, "wNew1", "dead mapping replaced by a fresh room");
-      assert.equal(readJson(s.mapPath)?.["/work/checkout"], "wNew1", "map healed");
+      assert.equal(readJson(s.mapPath)?.["/work/checkout"]?.room, "wNew1", "map healed");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("reuses the recorded pane on reload — same agent, same pane, no new tab", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      const paseo = fakePaseo();
+      const deps = { run: s.herdr.run as any, runPaseo: paseo.runPaseo, mapPath: s.mapPath, scheduleSweep: () => {} };
+
+      const ctxA = await provisionPaseoHerdrContextAsync(undefined, deps);
+      const ctxB = await provisionPaseoHerdrContextAsync(undefined, deps);
+
+      assert.equal(ctxA.paneId, "wNew1:p1");
+      assert.equal(ctxB.paneId, ctxA.paneId, "reload binds back to the same pane (same peer id)");
+      assert.ok(!s.herdr.calls.some((c) => c.args[0] === "tab" && c.args[1] === "create"), "no tab create on reload");
+      assert.equal(readJson(s.mapPath)?.["/work/checkout"]?.panes?.["agent-1"], "wNew1:p1");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("creates a fresh tab when the recorded pane is dead", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      writeFileSync(s.mapPath, JSON.stringify({
+        "/work/checkout": { room: "wExisting", panes: { "agent-1": "wExisting:pGone" } },
+      }));
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wExisting", "the room itself is still reused");
+      assert.equal(ctx.paneId, "wExisting:p9", "dead recorded pane falls back to a fresh tab");
+      assert.equal(readJson(s.mapPath)?.["/work/checkout"]?.panes?.["agent-1"], "wExisting:p9", "entry healed to the new pane");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("treats a pane that strayed to another workspace as dead", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      writeFileSync(s.mapPath, JSON.stringify({
+        "/work/checkout": { room: "wExisting", panes: { "agent-1": "wOther:p7" } },
+      }));
+      s.herdr.alivePanes.set("wOther:p7", {
+        pane_id: "wOther:p7", terminal_id: "term-x", tab_id: "wOther:t1", workspace_id: "wOther",
+      });
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wExisting");
+      assert.equal(ctx.paneId, "wExisting:p9", "alive-but-wrong-room pane is not adopted");
+      assert.equal(readJson(s.mapPath)?.["/work/checkout"]?.panes?.["agent-1"], "wExisting:p9");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("migrates a legacy flat map entry on load (room reused, panes start empty)", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      writeFileSync(s.mapPath, JSON.stringify({ "/work/checkout": "wExisting" }));
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wExisting", "flat dir → wsId value still resolves to the room");
+      assert.equal(s.herdr.createdCounter.n, 0, "no new workspace for a migrated entry");
+      assert.deepEqual(readJson(s.mapPath)?.["/work/checkout"], {
+        room: "wExisting", panes: { "agent-1": "wExisting:p9" },
+      }, "entry rewritten as schema v2 with the agent's pane");
     } finally {
       s.cleanup();
     }
@@ -307,8 +438,9 @@ describe("paseo provisioning (directory rooms)", () => {
 });
 
 describe("paseo orphan sweep (directory rooms)", () => {
-  function sweepHerdr(liveWs: string[], closes: string[], opts: { listFail?: boolean; closeFail?: boolean } = {}) {
+  function sweepHerdr(liveWs: string[], closes: string[], opts: { listFail?: boolean; closeFail?: boolean; paneCloseFail?: boolean } = {}) {
     const calls: string[][] = [];
+    const paneCloses: string[] = [];
     const run = async (args: string[]) => {
       calls.push(args);
       const [cmd, sub, operand] = args;
@@ -321,9 +453,14 @@ describe("paseo orphan sweep (directory rooms)", () => {
         closes.push(operand!);
         return JSON.stringify({ result: { type: "ok" } });
       }
+      if (cmd === "pane" && sub === "close") {
+        if (opts.paneCloseFail) throw new Error("herdr busy");
+        paneCloses.push(operand!);
+        return JSON.stringify({ result: { type: "ok" } });
+      }
       throw new Error(`unexpected herdr invocation: ${args.join(" ")}`);
     };
-    return { run, calls };
+    return { run, calls, paneCloses };
   }
 
   function sweepPaseo(agents: Array<{ id: string; cwd: string; status?: string }>, opts: { fail?: boolean; malformed?: boolean } = {}) {
@@ -348,7 +485,37 @@ describe("paseo orphan sweep (directory rooms)", () => {
     await sweepOrphanedPaseoRooms(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
 
     assert.deepEqual(closes, ["wOrphan"], "only the orphaned room is closed");
-    assert.deepEqual(readJson(mapPath), { [busyKey]: "wLive" }, "orphan entry dropped; live dir kept (~ expanded)");
+    assert.deepEqual(
+      readJson(mapPath),
+      { [busyKey]: { room: "wLive", panes: {} } },
+      "orphan entry dropped; live dir kept (~ expanded), rewritten as schema v2",
+    );
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("prunes panes of removed agents but keeps closed-but-listed agents' panes", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    const busyKey = join(homedir(), "work", "busy");
+    writeFileSync(mapPath, JSON.stringify({
+      [busyKey]: {
+        room: "wLive",
+        panes: { "agent-gone": "wLive:p2", "agent-closed": "wLive:p3", "a1": "wLive:p4" },
+      },
+    }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr(["wLive"], closes);
+    const paseo = sweepPaseo([
+      { id: "a1", cwd: "~/work/busy", status: "running" },
+      { id: "agent-closed", cwd: "~/work/busy", status: "closed" },
+    ]);
+
+    await sweepOrphanedPaseoRooms(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(herdr.paneCloses, ["wLive:p2"], "removed agent's pane is closed");
+    assert.deepEqual(closes, [], "the room of a live dir is never closed");
+    assert.deepEqual(readJson(mapPath), {
+      [busyKey]: { room: "wLive", panes: { "agent-closed": "wLive:p3", "a1": "wLive:p4" } },
+    }, "removed agent pruned; closed-but-listed and live agents keep their panes");
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
 

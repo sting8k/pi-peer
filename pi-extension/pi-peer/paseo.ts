@@ -98,10 +98,6 @@ export async function provisionPaseoHerdrContextAsync(
     const pane = ensured.pane ?? await createRoomPane(ensured.workspaceId, agentId, cwd, ctx);
     if (!pane.workspace_id) throw new Error("herdr pane create did not include workspace_id");
     adoptHerdrEnv(pane, socketPath);
-    // Live-view pane: attach to this agent's paseo stream in the room tab so
-    // the herdr UI shows the real session (best-effort — a plain shell pane
-    // stays fine when this fails; the tty buffers input until the shell is up).
-    await ctx.run(["pane", "run", pane.pane_id, `paseo attach ${agentId}`], ctx.socketPath, { signal }).catch(() => {});
     const paneCount = pane.tab_id
       ? await probePaneCountAsync(pane.tab_id, socketPath, { signal, run })
       : undefined;

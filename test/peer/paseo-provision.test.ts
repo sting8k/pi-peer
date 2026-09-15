@@ -64,7 +64,6 @@ function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
       const wsId = args[args.indexOf("--workspace") + 1];
       return JSON.stringify({ result: { root_pane: rootPane(wsId, `${wsId}:p9`) } });
     }
-    if (cmd === "pane" && sub === "run") return JSON.stringify({ result: { type: "ok" } });
     if (cmd === "tab" && sub === "get") {
       return JSON.stringify({ result: { tab: { pane_count: 2 } } });
     }
@@ -136,8 +135,6 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.ok(create!.args.includes("checkout"), "room labeled with the folder name");
       const meta = s.herdr.calls.find((c) => c.args[1] === "report-metadata");
       assert.ok(meta!.args.some((a) => String(a).startsWith("paseo_workspace_id=wks_provenance")), "provenance tag from the state file");
-      const liveView = s.herdr.calls.find((c) => c.args[1] === "run");
-      assert.deepEqual(liveView!.args.slice(2), ["wNew1:p1", "paseo attach agent-1"], "pane shows the agent session (live view)");
     } finally {
       s.cleanup();
     }
@@ -163,8 +160,6 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.equal(ctxA.workspaceId, ctxB.workspaceId, "same dir reuses the room regardless of paseo workspace");
       assert.equal(ctxB.paneId, ctxB.workspaceId + ":p9", "second agent gets its own tab in the shared room");
       assert.equal(s.herdr.createdCounter.n, 1, "exactly one room workspace");
-      const liveViewB = s.herdr.calls.filter((c) => c.args[1] === "run").at(-1);
-      assert.deepEqual(liveViewB!.args.slice(2), [ctxB.paneId, "paseo attach agent-2"], "each agent's session shows in its own pane");
     } finally {
       s.cleanup();
     }

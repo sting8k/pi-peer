@@ -59,7 +59,7 @@ Provisioning is fail-closed: any failure (Paseo daemon down, herdr CLI error, ti
 
 ### Orphan GC
 
-Each provisioning schedules a once-per-process sweep of `paseo-map.json`: entries whose Paseo workspace no longer exists get their Herdr workspace closed and the entry dropped. A failed or unparseable Paseo listing aborts the sweep untouched (no GC on uncertain data), and the sweep can only ever close workspaces pi-peer itself provisioned. Known limitation: if two agents provision the same Paseo workspace simultaneously, the losing (double-created) workspace is not in the map and will not be swept — that needs a herdr metadata read API.
+Each provisioning schedules a once-per-process sweep of `paseo-map.json`: entries whose Paseo workspace is absent from `paseo workspace ls` get their Herdr workspace closed — but only if it is still present in the authoritative `herdr workspace list`; absence there means it is already gone and only the stale entry is dropped. A failed listing aborts the sweep untouched (no GC on uncertain data), and a failed close keeps the entry for a later sweep. The sweep can only ever close workspaces pi-peer itself provisioned. Known limitation: if two agents provision the same Paseo workspace simultaneously, the losing (double-created) workspace is not in the map and will not be swept — that needs a herdr metadata read API.
 
 ## Install
 

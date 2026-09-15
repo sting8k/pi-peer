@@ -224,8 +224,12 @@ function defaultScheduleSweep(sweep: () => Promise<void>): void {
  * herdr metadata tokens are write-only (not readable back), so the map file
  * is both the record of what pi-peer provisioned and the GC scan list — it
  * can therefore only ever touch workspaces pi-peer itself provisioned.
- * Fail-closed: a failed or unparseable paseo listing aborts the sweep without
- * touching the map; any other error is swallowed (the sweep is opportunistic).
+ * Membership comes from the two authoritative listings (paseo workspace ls,
+ * herdr workspace list) — absence from a list is the only "dead" signal, so
+ * no transient CLI failure can ever be misread as a workspace being gone.
+ * Fail-closed: a failed listing aborts the sweep without touching the map;
+ * a failed close keeps the entry for a later sweep; anything else is
+ * swallowed (the sweep is opportunistic).
  */
 export async function sweepOrphanedPaseoWorkspaces(
   signal?: AbortSignal,
@@ -243,19 +247,19 @@ export async function sweepOrphanedPaseoWorkspaces(
     const socketPath = resolveSocketPath(options.socketPath);
     // A missing/broken listing is "unknown", not "all dead" — abort, keep map.
     const livePaseoWsIds = parsePaseoWorkspaceIds(await runPaseo(["workspace", "ls", "--json"]));
+    const liveHerdrWsIds = parseHerdrWorkspaceIds(await run(["workspace", "list"], socketPath, { signal }));
 
     for (const [paseoWsId, herdrWsId] of entries) {
       if (livePaseoWsIds.has(paseoWsId)) continue;
-      // get-then-close: if the herdr workspace is already gone the CLI error
-      // is swallowed and only the stale map entry is dropped.
-      try {
-        await run(["workspace", "get", herdrWsId as string], socketPath, { signal });
-        await run(["workspace", "close", herdrWsId as string], socketPath, { signal });
-      } catch {
-        // Not closeable (already dead or transient herdr failure) — drop the
-        // entry either way; an uncloseable live workspace is orphaned until
-        // herdr grows a metadata read API (see README limitation).
+      if (liveHerdrWsIds.has(herdrWsId as string)) {
+        try {
+          await run(["workspace", "close", herdrWsId as string], socketPath, { signal });
+        } catch {
+          // Close failed (herdr busy?) — keep the entry so a later sweep retries.
+          continue;
+        }
       }
+      // Absent from the herdr listing = confirmed dead; entry is stale either way.
       const fresh = readJson(mapPath) ?? {};
       delete fresh[paseoWsId];
       writeAtomic(mapPath, fresh);
@@ -274,6 +278,21 @@ function parsePaseoWorkspaceIds(raw: string): Set<string> {
   for (const ws of parsed) {
     if (ws && typeof ws === "object" && typeof (ws as { workspaceId?: unknown }).workspaceId === "string") {
       ids.add((ws as { workspaceId: string }).workspaceId);
+    }
+  }
+  return ids;
+}
+
+/** Same fail-closed contract for the herdr workspace listing. */
+function parseHerdrWorkspaceIds(raw: string): Set<string> {
+  const decoded = decodeHerdrJson<{ type?: unknown; workspaces?: unknown }>(raw, "workspace list");
+  if (!decoded || decoded.type !== "workspace_list" || !Array.isArray(decoded.workspaces)) {
+    throw new Error("unexpected herdr workspace listing");
+  }
+  const ids = new Set<string>();
+  for (const ws of decoded.workspaces) {
+    if (ws && typeof ws === "object" && typeof (ws as { workspace_id?: unknown }).workspace_id === "string") {
+      ids.add((ws as { workspace_id: string }).workspace_id);
     }
   }
   return ids;

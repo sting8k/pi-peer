@@ -309,17 +309,18 @@ describe("paseo provisioning on windows-style cwds", () => {
 });
 
 describe("paseo orphan sweep (phase-2 GC)", () => {
-  /** Fake herdr with explicit live/dead workspaces; records every close. */
-  function sweepHerdr(liveHerdrWs: string[], closes: string[], deadHerdr = false) {
+  /** Fake herdr driven by an authoritative live-workspace list; records closes. */
+  function sweepHerdr(liveHerdrWs: string[], closes: string[], opts: { listFail?: boolean; closeFail?: boolean } = {}) {
     const calls: string[][] = [];
     const run = async (args: string[]) => {
       calls.push(args);
       const [cmd, sub, operand] = args;
-      if (cmd === "workspace" && sub === "get") {
-        if (deadHerdr || !liveHerdrWs.includes(operand!)) throw new Error("workspace not found");
-        return JSON.stringify({ result: { workspace: { workspace_id: operand } } });
+      if (cmd === "workspace" && sub === "list") {
+        if (opts.listFail) throw new Error("socket hiccup");
+        return JSON.stringify({ result: { type: "workspace_list", workspaces: liveHerdrWs.map((id) => ({ workspace_id: id })) } });
       }
       if (cmd === "workspace" && sub === "close") {
+        if (opts.closeFail) throw new Error("herdr busy");
         closes.push(operand!);
         return JSON.stringify({ result: { type: "ok" } });
       }
@@ -353,17 +354,30 @@ describe("paseo orphan sweep (phase-2 GC)", () => {
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
 
-  it("removes the entry without closing when the herdr ws is dead too", async () => {
+  it("removes the entry without closing when absent from the herdr listing (confirmed dead)", async () => {
     const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
-    writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wDead" }));
+    writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wGone" }));
     const closes: string[] = [];
-    const herdr = sweepHerdr([], closes, true);
+    const herdr = sweepHerdr([], closes);
     const paseo = sweepPaseo([]);
 
     await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
 
     assert.deepEqual(closes, [], "no close on an already-dead ws");
     assert.deepEqual(readJson(mapPath), {}, "stale entry dropped");
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("keeps the entry for a later sweep when the close fails", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wStuck" }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr(["wStuck"], closes, { closeFail: true });
+    const paseo = sweepPaseo([]);
+
+    await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(readJson(mapPath), { wks_DEAD: "wStuck" }, "close failure keeps the entry (retry later)");
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
 
@@ -377,24 +391,28 @@ describe("paseo orphan sweep (phase-2 GC)", () => {
     await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
 
     assert.deepEqual(closes, [], "own/alive ws never closed");
-    assert.ok(!herdr.calls.some((c) => c[1] === "get"), "not even probed");
     assert.deepEqual(readJson(mapPath), { wks_SELF: "wSelf" });
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
 
-  it("aborts without touching the map when the paseo listing fails or is malformed", async () => {
-    for (const opts of [{ fail: true }, { malformed: true }]) {
+  it("aborts without touching the map when either listing fails or is malformed", async () => {
+    const cases = [
+      { paseo: { fail: true }, herdr: {} },
+      { paseo: { malformed: true }, herdr: {} },
+      { paseo: {}, herdr: { listFail: true } },
+    ];
+    for (const c of cases) {
       const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
       writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wOrphan" }));
       const closes: string[] = [];
-      const herdr = sweepHerdr([], closes);
-      const paseo = sweepPaseo([], opts);
+      const herdr = sweepHerdr(["wOrphan"], closes, c.herdr);
+      const paseo = sweepPaseo([], c.paseo);
 
       await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
 
       assert.deepEqual(closes, [], "fail-closed: no GC on uncertain data");
       assert.deepEqual(readJson(mapPath), { wks_DEAD: "wOrphan" }, "map intact");
-      assert.equal(herdr.calls.length, 0, "no herdr calls at all");
+      assert.ok(!herdr.calls.some((args) => args[1] === "close"), "no close calls at all");
       rmSync(join(mapPath, ".."), { recursive: true, force: true });
     }
   });

@@ -6,6 +6,7 @@ import { after, describe, it } from "node:test";
 
 import { getCurrentHerdrPeerContextAsync, HerdrUnavailableError } from "../../pi-extension/pi-peer/herdr.ts";
 import {
+  paseoAgentDirName,
   provisionPaseoHerdrContextAsync,
 } from "../../pi-extension/pi-peer/paseo.ts";
 import { readJson } from "../../pi-extension/pi-peer/storage.ts";
@@ -79,7 +80,7 @@ function fakePaseo(opts: { stateWorkspaceId?: string; inspectWorkspaceId?: strin
 }
 
 function writeAgentState(paseoHome: string, agentCwd: string, agentId: string, workspaceId: string) {
-  const dir = join(paseoHome, "agents", agentCwd.replace(/^[/\\]+/, "").replace(/[/\\]+$/, "").replace(/[/\\]+/g, "-"));
+  const dir = join(paseoHome, "agents", paseoAgentDirName(agentCwd));
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${agentId}.json`), JSON.stringify({ id: agentId, cwd: agentCwd, workspaceId }));
 }
@@ -244,6 +245,55 @@ describe("paseo provisioning", () => {
         HerdrUnavailableError,
         "any provisioning failure degrades to peer-talk disabled",
       );
+    } finally {
+      s.cleanup();
+    }
+  });
+});
+
+describe("paseo provisioning on windows-style cwds", () => {
+  it("derives the paseo agent dir exactly like the daemon for drive-letter cwds", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-win";
+      process.env.PASEO_AGENT_CWD = "C:\\Users\\bean\\proj";
+      process.env.PASEO_HOME = s.home;
+      // State file stored under the daemon's own win32-derived slug.
+      writeAgentState(s.home, "C:\\Users\\bean\\proj", "agent-win", "wks_WIN");
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+      });
+
+      assert.equal(ctx.workspaceId, "wNew1", "drive-letter cwd resolves via C-Users-bean-proj slug (colon stripped)");
+      assert.equal(readJson(s.mapPath)?.wks_WIN, "wNew1");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("derives the paseo agent dir for UNC cwds", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-unc";
+      process.env.PASEO_AGENT_CWD = "\\\\server\\share\\x";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "\\\\server\\share\\x", "agent-unc", "wks_UNC");
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+      });
+
+      assert.equal(ctx.workspaceId, "wNew1", "UNC cwd resolves via server-share-x slug");
+      assert.equal(readJson(s.mapPath)?.wks_UNC, "wNew1");
     } finally {
       s.cleanup();
     }

@@ -2,6 +2,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import path from "node:path";
 
 import {
   decodeHerdrJson,
@@ -139,13 +140,20 @@ function readPaseoAgentStateWorkspaceId(
 }
 
 /**
- * Directory name the Paseo daemon derives from an agent cwd (mirrors
- * `projectDirNameFromCwd` in paseo's agent-storage: separators collapse to
- * "-", root and trailing slashes drop out). "/a/b/c" → "a-b-c".
+ * Directory name the Paseo daemon derives from an agent cwd — an exact
+ * mirror of `projectDirNameFromCwd` in paseo's agent-storage (win32 parse
+ * handles drive letters, UNC roots, and Unix roots on all platforms;
+ * `[:\\/]+` collapses to "-", dash edges strip, root-only → "root").
+ * "C:\\Users\\bean\\proj" → "C-Users-bean-proj", "//server/share/x" →
+ * "server-share-x", "/a/b/c" → "a-b-c".
  */
-function paseoAgentDirName(cwd: string): string {
-  const name = cwd.replace(/^[/\\]+/, "").replace(/[/\\]+$/, "").replace(/[/\\]+/g, "-");
-  return name || "root";
+export function paseoAgentDirName(cwd: string): string {
+  const { root } = path.win32.parse(cwd);
+  const withoutRoot = cwd.slice(root.length).replace(/[\\/]+$/, "");
+  const sanitizedRoot = root.replace(/[:\\/]+/g, "-").replace(/^-+|-+$/g, "");
+  const prefix = sanitizedRoot ? sanitizedRoot + "-" : "";
+  if (!withoutRoot) return sanitizedRoot || "root";
+  return prefix + withoutRoot.replace(/[\\/]+/g, "-");
 }
 
 async function ensureHerdrWorkspace(

@@ -63,6 +63,8 @@ export interface PaseoProvisionOptions {
   mapPath?: string;
   /** Herdr socket (injectable for tests; default HERDR_SOCKET_PATH ?? ~/.config/herdr/herdr.sock). */
   socketPath?: string;
+  /** Sweep scheduler (injectable for tests; default fire-and-forget). */
+  scheduleSweep?: (sweep: () => Promise<void>) => void;
 }
 
 interface PaseoHerdrPane {
@@ -93,6 +95,16 @@ export async function provisionPaseoHerdrContextAsync(
     const paneCount = pane.tab_id
       ? await probePaneCountAsync(pane.tab_id, socketPath, { signal, run })
       : undefined;
+    // Opportunistic GC: once per process, fire-and-forget so it never delays
+    // the agent's own startup; failures are swallowed inside the sweep.
+    if (!sweepScheduled) {
+      sweepScheduled = true;
+      try {
+        (options.scheduleSweep ?? defaultScheduleSweep)(() => sweepOrphanedPaseoWorkspaces(signal, options));
+      } catch {
+        // Scheduling is best-effort; the provisioning result stands either way.
+      }
+    }
     return {
       paneId: pane.pane_id,
       terminalId: pane.terminal_id,
@@ -192,6 +204,79 @@ async function ensureHerdrWorkspace(
   // later GC phase — the map file above stays the only lookup.
   await ctx.run(["workspace", "report-metadata", herdrWsId, "--source", "pi-peer", "--token", `paseo_workspace_id=${paseoWsId}`], ctx.socketPath, { signal: ctx.signal }).catch(() => {});
   return { workspaceId: herdrWsId, pane: created.root_pane };
+}
+
+/** Once-per-process guard: ensureRuntime re-binds on session restarts; the
+ * sweep must not re-run (and re-list workspaces) on every bind. */
+let sweepScheduled = false;
+
+/** Test-only: the once-per-process sweep flag is module-global. */
+export function resetPaseoSweepFlagForTests(): void {
+  sweepScheduled = false;
+}
+
+function defaultScheduleSweep(sweep: () => Promise<void>): void {
+  void sweep().catch(() => {});
+}
+
+/**
+ * Close Herdr workspaces whose Paseo workspace no longer exists. Map-driven:
+ * herdr metadata tokens are write-only (not readable back), so the map file
+ * is both the record of what pi-peer provisioned and the GC scan list — it
+ * can therefore only ever touch workspaces pi-peer itself provisioned.
+ * Fail-closed: a failed or unparseable paseo listing aborts the sweep without
+ * touching the map; any other error is swallowed (the sweep is opportunistic).
+ */
+export async function sweepOrphanedPaseoWorkspaces(
+  signal?: AbortSignal,
+  options: PaseoProvisionOptions = {},
+): Promise<void> {
+  try {
+    const mapPath = options.mapPath ?? defaultMapPath();
+    const map = readJson(mapPath);
+    if (!map || typeof map !== "object") return;
+    const entries = Object.entries(map).filter(([, wsId]) => typeof wsId === "string" && wsId);
+    if (entries.length === 0) return;
+
+    const run = options.run ?? herdrRunAsync;
+    const runPaseo = options.runPaseo ?? defaultPaseoRun;
+    const socketPath = resolveSocketPath(options.socketPath);
+    // A missing/broken listing is "unknown", not "all dead" — abort, keep map.
+    const livePaseoWsIds = parsePaseoWorkspaceIds(await runPaseo(["workspace", "ls", "--json"]));
+
+    for (const [paseoWsId, herdrWsId] of entries) {
+      if (livePaseoWsIds.has(paseoWsId)) continue;
+      // get-then-close: if the herdr workspace is already gone the CLI error
+      // is swallowed and only the stale map entry is dropped.
+      try {
+        await run(["workspace", "get", herdrWsId as string], socketPath, { signal });
+        await run(["workspace", "close", herdrWsId as string], socketPath, { signal });
+      } catch {
+        // Not closeable (already dead or transient herdr failure) — drop the
+        // entry either way; an uncloseable live workspace is orphaned until
+        // herdr grows a metadata read API (see README limitation).
+      }
+      const fresh = readJson(mapPath) ?? {};
+      delete fresh[paseoWsId];
+      writeAtomic(mapPath, fresh);
+    }
+  } catch {
+    // Opportunistic GC: never surfaces, never fails the provisioning above.
+  }
+}
+
+/** Parses the paseo workspace listing; throws on anything unexpected so the
+ * sweep aborts instead of misreading "unparseable" as "nothing is live". */
+function parsePaseoWorkspaceIds(raw: string): Set<string> {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) throw new Error("unexpected paseo workspace listing");
+  const ids = new Set<string>();
+  for (const ws of parsed) {
+    if (ws && typeof ws === "object" && typeof (ws as { workspaceId?: unknown }).workspaceId === "string") {
+      ids.add((ws as { workspaceId: string }).workspaceId);
+    }
+  }
+  return ids;
 }
 
 async function createWorkspacePane(

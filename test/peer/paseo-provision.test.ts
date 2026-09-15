@@ -8,6 +8,8 @@ import { getCurrentHerdrPeerContextAsync, HerdrUnavailableError } from "../../pi
 import {
   paseoAgentDirName,
   provisionPaseoHerdrContextAsync,
+  resetPaseoSweepFlagForTests,
+  sweepOrphanedPaseoWorkspaces,
 } from "../../pi-extension/pi-peer/paseo.ts";
 import { readJson } from "../../pi-extension/pi-peer/storage.ts";
 import { restoreEnvVar } from "./helpers.ts";
@@ -116,6 +118,7 @@ describe("paseo provisioning", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
 
@@ -149,6 +152,7 @@ describe("paseo provisioning", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
       assert.equal(ctx.workspaceId, "wNew1");
@@ -172,6 +176,7 @@ describe("paseo provisioning", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
 
@@ -191,7 +196,7 @@ describe("paseo provisioning", () => {
       process.env.PASEO_HOME = s.home;
       process.env.PASEO_AGENT_CWD = "/work/checkout";
       const paseo = fakePaseo();
-      const deps = { run: s.herdr.run as any, runPaseo: paseo.runPaseo, mapPath: s.mapPath };
+      const deps = { run: s.herdr.run as any, runPaseo: paseo.runPaseo, mapPath: s.mapPath, scheduleSweep: () => {} };
 
       process.env.PASEO_AGENT_ID = "agent-1";
       writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
@@ -221,6 +226,7 @@ describe("paseo provisioning", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
 
@@ -266,6 +272,7 @@ describe("paseo provisioning on windows-style cwds", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
 
@@ -289,11 +296,132 @@ describe("paseo provisioning on windows-style cwds", () => {
       const ctx = await provisionPaseoHerdrContextAsync(undefined, {
         run: s.herdr.run as any,
         runPaseo: paseo.runPaseo,
+        scheduleSweep: () => {}, // sweep interference would race these assertions
         mapPath: s.mapPath,
       });
 
       assert.equal(ctx.workspaceId, "wNew1", "UNC cwd resolves via server-share-x slug");
       assert.equal(readJson(s.mapPath)?.wks_UNC, "wNew1");
+    } finally {
+      s.cleanup();
+    }
+  });
+});
+
+describe("paseo orphan sweep (phase-2 GC)", () => {
+  /** Fake herdr with explicit live/dead workspaces; records every close. */
+  function sweepHerdr(liveHerdrWs: string[], closes: string[], deadHerdr = false) {
+    const calls: string[][] = [];
+    const run = async (args: string[]) => {
+      calls.push(args);
+      const [cmd, sub, operand] = args;
+      if (cmd === "workspace" && sub === "get") {
+        if (deadHerdr || !liveHerdrWs.includes(operand!)) throw new Error("workspace not found");
+        return JSON.stringify({ result: { workspace: { workspace_id: operand } } });
+      }
+      if (cmd === "workspace" && sub === "close") {
+        closes.push(operand!);
+        return JSON.stringify({ result: { type: "ok" } });
+      }
+      throw new Error(`unexpected herdr invocation: ${args.join(" ")}`);
+    };
+    return { run, calls };
+  }
+
+  function sweepPaseo(liveIds: string[], opts: { fail?: boolean; malformed?: boolean } = {}) {
+    const calls: string[][] = [];
+    const runPaseo = async (args: string[]) => {
+      calls.push(args);
+      if (opts.fail) throw new Error("paseo daemon unreachable");
+      if (opts.malformed) return "not json{{{";
+      return JSON.stringify(liveIds.map((id) => ({ workspaceId: id })));
+    };
+    return { runPaseo, calls };
+  }
+
+  it("closes the herdr ws and removes the entry when the paseo ws is dead", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wOrphan", wks_ALIVE: "wLive" }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr(["wOrphan", "wLive"], closes);
+    const paseo = sweepPaseo(["wks_ALIVE"]);
+
+    await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(closes, ["wOrphan"], "only the orphaned ws is closed");
+    assert.deepEqual(readJson(mapPath), { wks_ALIVE: "wLive" }, "dead entry removed, live entry kept");
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("removes the entry without closing when the herdr ws is dead too", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wDead" }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr([], closes, true);
+    const paseo = sweepPaseo([]);
+
+    await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(closes, [], "no close on an already-dead ws");
+    assert.deepEqual(readJson(mapPath), {}, "stale entry dropped");
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("never touches entries whose paseo ws is alive (incl. the running agent's own ws)", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    writeFileSync(mapPath, JSON.stringify({ wks_SELF: "wSelf" }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr(["wSelf"], closes);
+    const paseo = sweepPaseo(["wks_SELF"]);
+
+    await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(closes, [], "own/alive ws never closed");
+    assert.ok(!herdr.calls.some((c) => c[1] === "get"), "not even probed");
+    assert.deepEqual(readJson(mapPath), { wks_SELF: "wSelf" });
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("aborts without touching the map when the paseo listing fails or is malformed", async () => {
+    for (const opts of [{ fail: true }, { malformed: true }]) {
+      const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+      writeFileSync(mapPath, JSON.stringify({ wks_DEAD: "wOrphan" }));
+      const closes: string[] = [];
+      const herdr = sweepHerdr([], closes);
+      const paseo = sweepPaseo([], opts);
+
+      await sweepOrphanedPaseoWorkspaces(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+      assert.deepEqual(closes, [], "fail-closed: no GC on uncertain data");
+      assert.deepEqual(readJson(mapPath), { wks_DEAD: "wOrphan" }, "map intact");
+      assert.equal(herdr.calls.length, 0, "no herdr calls at all");
+      rmSync(join(mapPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("schedules the sweep once per process across repeated provisions", async () => {
+    resetPaseoSweepFlagForTests();
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      const paseo = fakePaseo();
+      const scheduled: Array<() => Promise<void>> = [];
+      const deps = {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: (sweep: () => Promise<void>) => { scheduled.push(sweep); },
+      };
+
+      await provisionPaseoHerdrContextAsync(undefined, deps);
+      await provisionPaseoHerdrContextAsync(undefined, deps);
+
+      assert.equal(scheduled.length, 1, "exactly one sweep per process");
+      await scheduled[0](); // the scheduled sweep itself must be safe to run
     } finally {
       s.cleanup();
     }

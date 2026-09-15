@@ -55,7 +55,11 @@ Agents spawned by the [Paseo daemon](https://github.com/getpaseo/paseo) only rec
 2. Maps that Paseo workspace to a Herdr workspace via `<agent dir>/pi-peer/paseo-map.json`, creating one on first use (`herdr workspace create`, labeled with the Paseo workspace title and tagged `paseo_workspace_id` metadata). Dead mappings are healed; agents sharing a Paseo workspace share the Herdr workspace, each in its own tab.
 3. Creates a fresh tab in that workspace, adopts the `HERDR_*` env so child processes inherit the context, and binds peer talk exactly like a Herdr-pane session.
 
-Provisioning is fail-closed: any failure (Paseo daemon down, herdr CLI error, timeout) logs one line and leaves peer talk disabled — pi starts normally. Orphaned Herdr workspaces whose Paseo workspace was archived are left in place (phase-2 GC).
+Provisioning is fail-closed: any failure (Paseo daemon down, herdr CLI error, timeout) logs one line and leaves peer talk disabled — pi starts normally.
+
+### Orphan GC
+
+Each provisioning schedules a once-per-process sweep of `paseo-map.json`: entries whose Paseo workspace no longer exists get their Herdr workspace closed and the entry dropped. A failed or unparseable Paseo listing aborts the sweep untouched (no GC on uncertain data), and the sweep can only ever close workspaces pi-peer itself provisioned. Known limitation: if two agents provision the same Paseo workspace simultaneously, the losing (double-created) workspace is not in the map and will not be swept — that needs a herdr metadata read API.
 
 ## Install
 

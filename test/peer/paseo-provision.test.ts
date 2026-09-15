@@ -137,7 +137,7 @@ describe("paseo provisioning (directory rooms)", () => {
       const meta = s.herdr.calls.find((c) => c.args[1] === "report-metadata");
       assert.ok(meta!.args.some((a) => String(a).startsWith("paseo_workspace_id=wks_provenance")), "provenance tag from the state file");
       const liveView = s.herdr.calls.find((c) => c.args[1] === "run");
-      assert.deepEqual(liveView!.args.slice(2), ["wNew1:p1", "paseo logs -f agent-1"], "pane streams the agent transcript (live view)");
+      assert.deepEqual(liveView!.args.slice(2), ["wNew1:p1", "paseo attach agent-1"], "pane shows the agent session (live view)");
     } finally {
       s.cleanup();
     }
@@ -164,7 +164,7 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.equal(ctxB.paneId, ctxB.workspaceId + ":p9", "second agent gets its own tab in the shared room");
       assert.equal(s.herdr.createdCounter.n, 1, "exactly one room workspace");
       const liveViewB = s.herdr.calls.filter((c) => c.args[1] === "run").at(-1);
-      assert.deepEqual(liveViewB!.args.slice(2), [ctxB.paneId, "paseo logs -f agent-2"], "each agent streams into its own pane");
+      assert.deepEqual(liveViewB!.args.slice(2), [ctxB.paneId, "paseo attach agent-2"], "each agent's session shows in its own pane");
     } finally {
       s.cleanup();
     }

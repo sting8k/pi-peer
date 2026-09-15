@@ -77,7 +77,7 @@ function herdrSocketPath(): string {
   return socketPath;
 }
 
-function decodeHerdrJson<T>(stdout: string, operation: string): T {
+export function decodeHerdrJson<T>(stdout: string, operation: string): T {
   try {
     const parsed = JSON.parse(stdout) as T | HerdrResponse<T>;
     if (parsed && typeof parsed === "object" && "result" in parsed) {
@@ -105,9 +105,11 @@ function herdrPaneFrom(value: unknown): HerdrPane {
 interface HerdrRunAsyncOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Injectable runner seam (tests pass fakes through probe/context calls). */
+  run?: typeof herdrRunAsync;
 }
 
-async function herdrRunAsync(
+export async function herdrRunAsync(
   args: string[],
   socketPath = herdrSocketPath(),
   options: HerdrRunAsyncOptions = {},
@@ -126,7 +128,8 @@ async function getHerdrPaneAsync(
   socketPath: string,
   options: HerdrRunAsyncOptions = {},
 ): Promise<HerdrPane> {
-  const raw = await herdrRunAsync(["pane", "get", paneId], socketPath, options);
+  const run = options.run ?? herdrRunAsync;
+  const raw = await run(["pane", "get", paneId], socketPath, options);
   return herdrPaneFrom(decodeHerdrJson(raw, "pane get"));
 }
 
@@ -179,29 +182,51 @@ export async function probeWorkspaceNameAsync(
   }
 }
 
+export interface HerdrContextResolveOptions {
+  /** Injectable herdr CLI runner for the legacy pane path (tests). */
+  run?: typeof herdrRunAsync;
+  /** Injectable paseo provisioning step (tests); defaults to ./paseo.ts. */
+  provisionPaseo?: (signal?: AbortSignal) => Promise<HerdrPeerContext>;
+}
+
 /**
- * Establish the current peer's Herdr context. Requires Pi to run inside an
- * active Herdr pane (workspace identity originates from the pane metadata).
+ * Establish the current peer's Herdr context. Resolver chain:
+ *  1. `HERDR_ENV=1` + `HERDR_PANE_ID` — bound by a Herdr pane (unchanged).
+ *  2. `PASEO_AGENT_ID` — agent spawned by the Paseo daemon (no HERDR_* env);
+ *     provisions a Herdr workspace 1:1 with its Paseo workspace (./paseo.ts).
+ *  3. Otherwise the peer runtime is simply unavailable.
  */
-export async function getCurrentHerdrPeerContextAsync(signal?: AbortSignal): Promise<HerdrPeerContext> {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-    throw new HerdrUnavailableError();
+export async function getCurrentHerdrPeerContextAsync(
+  signal?: AbortSignal,
+  options: HerdrContextResolveOptions = {},
+): Promise<HerdrPeerContext> {
+  if (process.env.HERDR_ENV === "1" && process.env.HERDR_PANE_ID) {
+    const socketPath = herdrSocketPath();
+    const pane = await getHerdrPaneAsync(process.env.HERDR_PANE_ID, socketPath, { signal, run: options.run });
+    if (!pane.workspace_id) throw new Error("Herdr pane get did not include workspace_id");
+    // Tab metadata is cosmetic (label surface selection only): a failed or
+    // malformed probe must degrade to `paneCount: undefined` (pane surface)
+    // rather than fail the bind — identity comes from pane/workspace, not this.
+    const paneCount = pane.tab_id
+      ? await probePaneCountAsync(pane.tab_id, socketPath, { signal, run: options.run })
+      : undefined;
+    return {
+      paneId: process.env.HERDR_PANE_ID,
+      terminalId: pane.terminal_id,
+      tabId: pane.tab_id,
+      socketPath,
+      workspaceId: pane.workspace_id,
+      paneCount,
+    };
   }
-  const socketPath = herdrSocketPath();
-  const pane = await getHerdrPaneAsync(process.env.HERDR_PANE_ID, socketPath, { signal });
-  if (!pane.workspace_id) throw new Error("Herdr pane get did not include workspace_id");
-  // Tab metadata is cosmetic (label surface selection only): a failed or
-  // malformed probe must degrade to `paneCount: undefined` (pane surface)
-  // rather than fail the bind — identity comes from pane/workspace, not this.
-  const paneCount = pane.tab_id ? await probePaneCountAsync(pane.tab_id, socketPath, { signal }) : undefined;
-  return {
-    paneId: process.env.HERDR_PANE_ID,
-    terminalId: pane.terminal_id,
-    tabId: pane.tab_id,
-    socketPath,
-    workspaceId: pane.workspace_id,
-    paneCount,
-  };
+  if (process.env.PASEO_AGENT_ID) {
+    if (options.provisionPaseo) return options.provisionPaseo(signal);
+    // Dynamic import: paseo.ts statically depends on this module, so the
+    // chain must not create a static module cycle.
+    const { provisionPaseoHerdrContextAsync } = await import("./paseo.ts");
+    return provisionPaseoHerdrContextAsync(signal);
+  }
+  throw new HerdrUnavailableError();
 }
 
 /**

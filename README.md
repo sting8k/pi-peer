@@ -44,8 +44,18 @@ A message is delivered to an **idle** receiver as a normal user message (trigger
 ## Requirements
 
 - [Pi coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent) running inside a Herdr pane.
-- `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket.
+- `HERDR_ENV=1`, `HERDR_PANE_ID`, and `HERDR_SOCKET_PATH` set for each session — these provide session identity and the workspace socket. When running as a Paseo-spawned agent instead, pi-peer provisions these itself (see below).
 - Node 22.19+ for development (required by the Pi coding-agent SDK).
+
+## Paseo integration
+
+Agents spawned by the [Paseo daemon](https://github.com/getpaseo/paseo) only receive `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` in their environment — no `HERDR_*` variables. When pi-peer starts in such a process it provisions a Herdr context itself:
+
+1. Resolves the agent's Paseo workspace id from the daemon's agent state file (with a `paseo inspect --json` fallback for newer CLIs). `PASEO_AGENT_CWD` is never used as an identity key — two Paseo workspaces can share one checkout.
+2. Maps that Paseo workspace to a Herdr workspace via `<agent dir>/pi-peer/paseo-map.json`, creating one on first use (`herdr workspace create`, labeled with the Paseo workspace title and tagged `paseo_workspace_id` metadata). Dead mappings are healed; agents sharing a Paseo workspace share the Herdr workspace, each in its own tab.
+3. Creates a fresh tab in that workspace, adopts the `HERDR_*` env so child processes inherit the context, and binds peer talk exactly like a Herdr-pane session.
+
+Provisioning is fail-closed: any failure (Paseo daemon down, herdr CLI error, timeout) logs one line and leaves peer talk disabled — pi starts normally. Orphaned Herdr workspaces whose Paseo workspace was archived are left in place (phase-2 GC).
 
 ## Install
 

@@ -1,6 +1,6 @@
 # pi-peer
 
-Peer-to-peer chat between Pi coding-agent sessions sharing a Herdr room — the workspace they run in, or a provisioned directory room under Paseo. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
+Peer-to-peer chat between Pi coding-agent sessions that share a room — their Herdr workspace, or a shared folder room under Paseo. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
 
 It is symmetric, natural chat between equal agents — not RPC or task delegation to a subagent. There is no request/response correlation, no `timeoutMs`, no waiting, and no `<peer_pong>`. Three tools, nothing else.
 
@@ -37,29 +37,29 @@ It is symmetric, natural chat between equal agents — not RPC or task delegatio
             └────────────────────────────────────────────────
 ```
 
-Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run. The "room" is normally the session's own herdr workspace — for Paseo-spawned agents it is a shared provisioned directory room (see below), so all agents in one folder end up under the same `<room-id>`.
+Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run. The "room" is normally just the Herdr workspace the session runs in — under Paseo, pi-peer makes one shared room per folder instead (see below), so every agent in the same folder meets there.
 
 A message is delivered to an **idle** receiver as a normal user message (trigger behavior) and to a **busy** receiver as a steer (`deliverAs: "steer"`) straight into its running turn — regardless of who sent it. A reply is simply another `talk_to` in the opposite direction, so whichever side is idle gets triggered and whichever is busy gets steered. Nothing ever waits for a turn boundary to *lose* a message.
 
 ## Requirements
 
-- [Pi coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent), plus a reachable [Herdr](https://herdr.dev) server — required. Either run pi inside a herdr pane (the pane provides `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`), or spawn agents via Paseo and let pi-peer provision those itself (see below; needs the `herdr` CLI on PATH and the server socket up).
-- Optional: the [Paseo daemon](https://github.com/getpaseo/paseo), for headless/remote agent spawning. Not needed for the classic pi-in-herdr-pane setup.
+- [Pi coding agent](https://github.com/earendil-works/pi/blob/main/packages/coding-agent) and a running [Herdr](https://herdr.dev) server — both required. Two ways to give a session its identity: run pi inside a herdr pane (the pane hands it `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`), or let Paseo spawn the agent — pi-peer then sets those up itself (it just needs the `herdr` CLI on PATH and the server socket reachable).
+- Optional: the [Paseo daemon](https://github.com/getpaseo/paseo), if you want to spawn agents headlessly or from other devices. The classic "pi inside a herdr pane" setup doesn't need it.
 - Node 22.19+ for development (required by the Pi coding-agent SDK).
 
 ## Paseo integration
 
-Agents spawned by the [Paseo daemon](https://github.com/getpaseo/paseo) only receive `PASEO_AGENT_ID` + `PASEO_AGENT_CWD` — no `HERDR_*` variables. pi-peer then provisions a **directory room** itself:
+When Paseo spawns an agent, the agent only knows two things: its own id and the folder it works in — no Herdr context at all. pi-peer fills that gap:
 
-- Room key = the canonical `PASEO_AGENT_CWD`, so every agent working in the same folder shares one Herdr workspace — "same folder = same room" (paseo's per-conversation workspace id is only reported as provenance metadata).
-- The first agent in a folder creates the room (named after the folder); each agent owns one tab, recorded per paseo agentId. A reload reuses the same pane — same peer id, mailbox continues, no duplicate tabs.
-- **Bridge:** a pi session running in a real herdr pane joins the provisioned room of its directory when one exists (identity stays with its own pane; panes never provision rooms, and are never GC'd).
-- **GC:** a once-per-process sweep closes rooms whose directory no longer has a live paseo agent, and prunes panes of agents fully removed from paseo. Fail-closed — any failed listing aborts the sweep untouched.
-- Provisioning is fail-closed too: any error (daemon down, herdr CLI error, timeout) logs one line and leaves peer talk disabled — pi starts normally.
+- **One folder = one room.** The first agent in a folder creates a Herdr workspace named after it; every other agent in the same folder joins that room. (We key on the folder, not paseo's workspace id — paseo makes a fresh workspace per conversation, which would split agents that share a checkout.)
+- **Every agent owns one tab**, and pi-peer remembers which tab belongs to which agent. Restart or reload an agent and it takes its tab back — same identity, same mailbox, no duplicate tabs.
+- **Panes join too.** If you open pi yourself in a herdr pane inside that folder, it joins the same room — hand-run sessions and paseo agents see each other. Panes only ever join; they never create rooms.
+- **Housekeeping.** On start, each agent quickly sweeps: rooms whose folder has no live paseo agent get closed, and tabs of agents deleted from paseo get removed. If the sweep can't get a trustworthy listing, it cleans nothing.
+- **Degrades quietly.** If provisioning fails for any reason, pi-peer logs one line and the session simply runs without peer talk — pi starts normally either way.
 
 ### Running headless
 
-Paseo-spawned agents need a reachable herdr server: the `herdr` CLI on PATH and the server socket (`~/.config/herdr/herdr.sock` — any open herdr TUI provides it too). For a headless daemon setup, run `herdr server` alongside the paseo daemon.
+Paseo-spawned agents need a herdr server they can reach: the `herdr` CLI on PATH and its socket at `~/.config/herdr/herdr.sock` (any open herdr window provides the socket too). On a daemon machine, run `herdr server` next to the paseo daemon.
 
 macOS — `~/Library/LaunchAgents/local.herdr-server.plist` (adjust paths):
 

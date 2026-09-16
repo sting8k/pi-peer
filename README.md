@@ -61,7 +61,28 @@ When Paseo spawns an agent, the agent only knows two things: its own id and the 
 
 Paseo-spawned agents need a herdr server they can reach: the `herdr` CLI on PATH and its socket at `~/.config/herdr/herdr.sock` (any open herdr window provides the socket too). On a daemon machine, run `herdr server` next to the paseo daemon.
 
-macOS — `~/Library/LaunchAgents/local.herdr-server.plist` (adjust paths):
+Paseo agents inherit the daemon's environment, and service managers give you a minimal PATH — so the reliable pattern is one small wrapper script that pins PATH, starts `herdr server` if needed, then execs the paseo daemon. Save it as `~/bin/paseo-daemon.sh` (chmod +x, adjust paths):
+
+```sh
+#!/bin/sh
+# Paseo daemon + herdr server launcher for service managers.
+# Pin PATH: launchd/systemd units see a minimal environment, so point at
+# wherever node, paseo, and herdr actually live.
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+export HOME="${HOME:-$(cd ~ && pwd)}"
+
+# Herdr headless server: needed by pi-peer's provisioning (its socket is the
+# API). Idempotent — skip when any herdr instance already owns the socket
+# (e.g. an open herdr window).
+if [ ! -S "$HOME/.config/herdr/herdr.sock" ]; then
+  nohup herdr server >>"$HOME/.local/share/herdr-server.log" 2>&1 &
+fi
+
+# No HERDR_* here on purpose: agents must self-provision via pi-peer.
+exec paseo daemon start --foreground
+```
+
+macOS — `~/Library/LaunchAgents/local.paseo-daemon.plist` pointing at that script:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -69,39 +90,38 @@ macOS — `~/Library/LaunchAgents/local.herdr-server.plist` (adjust paths):
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>local.herdr-server</string>
+  <string>local.paseo-daemon</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>-c</string>
-    <string>[ -S "$HOME/.config/herdr/herdr.sock" ] || exec $HOME/.local/bin/herdr server; exec sleep infinity</string>
+    <string>-lc</string>
+    <string>exec "$HOME/bin/paseo-daemon.sh"</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/herdr-server.log</string>
+  <string>/tmp/paseo-daemon.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/herdr-server.log</string>
+  <string>/tmp/paseo-daemon.log</string>
 </dict>
 </plist>
 ```
 
 ```sh
-launchctl load ~/Library/LaunchAgents/local.herdr-server.plist
+launchctl load ~/Library/LaunchAgents/local.paseo-daemon.plist
 ```
 
-The socket check makes it idempotent — if a herdr TUI already owns the socket, the job parks on `sleep infinity` instead of fighting it.
-
-Linux — `~/.config/systemd/user/herdr-server.service` (adjust `ExecStart`):
+Linux — `~/.config/systemd/user/paseo-daemon.service` running the same script:
 
 ```ini
 [Unit]
-Description=Herdr headless server
+Description=Paseo daemon (+ herdr server)
+After=default.target
 
 [Service]
-ExecStart=%h/.local/bin/herdr server
+ExecStart=%h/bin/paseo-daemon.sh
 Restart=on-failure
 RestartSec=3
 
@@ -111,11 +131,11 @@ WantedBy=default.target
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now herdr-server
+systemctl --user enable --now paseo-daemon
 loginctl enable-linger "$USER"   # keep it running without a login session
 ```
 
-Both assume a single user machine; on multi-seat boxes scope the units per user.
+If you only need herdr (no paseo), the same units work with `ExecStart`/`ProgramArguments` pointing straight at `herdr server`. On multi-seat boxes, scope the units per user.
 
 ## Install
 

@@ -2,7 +2,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, win32 as pathWin32 } from "node:path";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 
 import {
   canonicalDirKey,
@@ -32,10 +32,14 @@ const execFileAsync = promisify(execFile);
  *     would isolate two agents sharing one checkout — the opposite of the
  *     directory-room rule). The paseo workspace id is only reported as
  *     best-effort provenance metadata.
- *  2. Herdr room — `paseo-map.json` maps dir → { room: herdrWsId, panes };
- *     mapped rooms are validated with `herdr workspace get` and recreated when
- *     gone. Herdr-pane sessions in the same directory join the room through
- *     the bridge in herdr.ts (identity stays with their own pane's workspace).
+ *  2. Herdr room — `paseo-map.json` maps dir → { room: herdrWsId, panes,
+ *     owned }; mapped rooms are validated with `herdr workspace get`. On a
+ *     miss (or a dead room) a workspace the user already opened for the same
+ *     directory is ADOPTED (`pane list` cwd match, owned:false) before a new
+ *     one is created (owned:true) — one dir must not become two sidebar
+ *     entries. Herdr-pane sessions in the same directory join the room
+ *     through the bridge in herdr.ts (identity stays with their own pane's
+ *     workspace).
  *  3. A tab (pane) is created in the room for this agent and the `HERDR_*`
  *     env is adopted so child processes inherit the context. The pane is
  *     recorded per paseo agentId in the map and REUSED on reload/restart:
@@ -112,6 +116,7 @@ export async function provisionPaseoHerdrContextAsync(
         ensured.workspaceId,
         agentId,
         pane.pane_id,
+        ensured.owned,
       );
     }
     if (!pane.workspace_id) throw new Error("herdr pane create did not include workspace_id");
@@ -163,22 +168,30 @@ function defaultScheduleSweep(sweep: () => Promise<void>): void {
 async function ensureDirectoryRoom(
   cwd: string,
   ctx: { run: HerdrCliRun; socketPath: string; mapPath?: string; paseoHome?: string; signal?: AbortSignal },
-): Promise<{ workspaceId: string; pane: PaseoHerdrPane | null }> {
+): Promise<{ workspaceId: string; pane: PaseoHerdrPane | null; owned: boolean }> {
   const mapPath = ctx.mapPath ?? defaultPaseoMapPath();
   const dirKey = canonicalDirKey(cwd);
   const map = readJson(mapPath) ?? {};
   const mapped = map[dirKey];
-  // Schema v2 entries carry { room, panes }; legacy flat values are the room itself.
+  // Schema v2 entries carry { room, panes, owned }; legacy flat values are the room itself.
   const mappedRoom = mapped && typeof mapped === "object" ? (mapped as { room?: unknown }).room : mapped;
   if (typeof mappedRoom === "string" && mappedRoom) {
     try {
       await ctx.run(["workspace", "get", mappedRoom], ctx.socketPath, { signal: ctx.signal });
       // Fresh pane per agent session: agents sharing the directory share the
       // room, each gets its own tab.
-      return { workspaceId: mappedRoom, pane: null };
+      const mappedOwned = mapped && typeof mapped === "object" ? (mapped as { owned?: unknown }).owned : undefined;
+      return { workspaceId: mappedRoom, pane: null, owned: mappedOwned !== false };
     } catch {
-      // Mapped room is gone (closed/GC'd) — fall through and recreate.
+      // Mapped room is gone (closed/GC'd) — fall through to adopt/recreate.
     }
+  }
+  // Adopt-before-create: a workspace the user already opened for this
+  // directory IS the room — one dir must not become two sidebar entries.
+  const adopted = await adoptWorkspaceForDir(cwd, ctx);
+  if (adopted) {
+    saveMapEntry(mapPath, dirKey, adopted, false);
+    return { workspaceId: adopted, pane: null, owned: false };
   }
   const raw = await ctx.run(
     ["workspace", "create", "--cwd", cwd, "--label", roomLabel(cwd)],
@@ -190,7 +203,7 @@ async function ensureDirectoryRoom(
     throw new Error("herdr workspace create did not include a root pane");
   }
   const herdrWsId = created.root_pane.workspace_id ?? created.root_pane.pane_id.split(":")[0];
-  saveMapEntry(mapPath, dirKey, herdrWsId);
+  saveMapEntry(mapPath, dirKey, herdrWsId, true);
   // Display-only provenance tag (the herdr CLI cannot read metadata back; for
   // the Herdr UI and humans only). The paseo workspace id is a nice-to-have:
   // the room is keyed by directory, not by the per-conversation workspace.
@@ -202,7 +215,52 @@ async function ensureDirectoryRoom(
       { signal: ctx.signal },
     ).catch(() => {});
   }
-  return { workspaceId: herdrWsId, pane: created.root_pane };
+  return { workspaceId: herdrWsId, pane: created.root_pane, owned: true };
+}
+
+/**
+ * Adopt-before-create: if the user already has a Herdr workspace with a pane
+ * in this directory, that workspace IS the room (one dir = one sidebar
+ * entry). `pane list` is the only listing carrying cwd — workspace get/list
+ * carry none — so the whole listing is filtered here; the FIRST matching
+ * pane's workspace wins. Best-effort: any failure or malformed output
+ * returns null and the caller creates a room as before; adoption never
+ * fails provisioning.
+ */
+async function adoptWorkspaceForDir(
+  cwd: string,
+  ctx: { run: HerdrCliRun; socketPath: string; signal?: AbortSignal },
+): Promise<string | null> {
+  let panes: unknown;
+  try {
+    const raw = await ctx.run(["pane", "list"], ctx.socketPath, { signal: ctx.signal });
+    const decoded = decodeHerdrJson<{ type?: unknown; panes?: unknown }>(raw, "pane list");
+    if (decoded?.type !== "pane_list") return null;
+    panes = decoded.panes;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(panes)) return null;
+  for (const pane of panes) {
+    const record = pane && typeof pane === "object" ? pane as { cwd?: unknown; workspace_id?: unknown } : {};
+    if (typeof record.workspace_id !== "string" || !record.workspace_id) continue;
+    if (typeof record.cwd !== "string" || !record.cwd) continue;
+    if (sameDirectory(record.cwd, cwd)) return record.workspace_id;
+  }
+  return null;
+}
+
+/**
+ * Directory equality across symlinks: herdr reports resolved cwds (e.g.
+ * /tmp → /private/tmp) so both sides go through realpathSync; a realpath
+ * failure falls back to the canonical string compare.
+ */
+function sameDirectory(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return canonicalDirKey(a) === canonicalDirKey(b);
+  }
 }
 
 async function createRoomPane(
@@ -319,13 +377,26 @@ export async function sweepOrphanedPaseoRooms(
     const prunedPanes = new Map<string, string[]>();
     for (const [dirKey, entry] of entries) {
       if (!liveDirs.has(dirKey)) {
-        if (liveHerdrWsIds.has(entry.room)) {
-          if (roomHasFreshActivity(entry.room)) continue;
-          try {
-            await run(["workspace", "close", entry.room], socketPath, { signal });
-          } catch {
-            // Close failed (herdr busy?) — keep the entry so a later sweep retries.
-            continue;
+        if (entry.owned) {
+          if (liveHerdrWsIds.has(entry.room)) {
+            if (roomHasFreshActivity(entry.room)) continue;
+            try {
+              await run(["workspace", "close", entry.room], socketPath, { signal });
+            } catch {
+              // Close failed (herdr busy?) — keep the entry so a later sweep retries.
+              continue;
+            }
+          }
+        } else {
+          // Adopted room = the user's workspace: never `workspace close` it.
+          // Retire only the panes pi-peer tracked for this dir (best-effort),
+          // then drop the entry — the user's room stays untouched.
+          for (const paneId of Object.values(entry.panes)) {
+            try {
+              await run(["pane", "close", paneId], socketPath, { signal });
+            } catch {
+              // Best-effort: the entry is dropped regardless.
+            }
           }
         }
         // Absent from the herdr listing = confirmed dead; entry is stale either way.
@@ -435,10 +506,14 @@ function adoptHerdrEnv(pane: PaseoHerdrPane, socketPath: string): void {
 }
 
 /** Map entry schema v2: the room's herdr workspace + the pane recorded per
- * paseo agentId (identity across reloads). */
+ * paseo agentId (identity across reloads) + whether pi-peer owns the room.
+ * `owned:false` marks an adopted user workspace — the sweep retires its
+ * tracked panes but never `workspace close`s the room itself. Missing/legacy
+ * → true: every room written before this field was pi-peer-created. */
 interface PaseoMapEntry {
   room: string;
   panes: Record<string, string>;
+  owned: boolean;
 }
 
 /** Load the dir map, normalizing legacy flat "dir → wsId" values to schema v2
@@ -447,33 +522,46 @@ interface PaseoMapEntry {
 function loadPaseoMap(mapPath: string): Record<string, PaseoMapEntry> {
   const map = readJson(mapPath) ?? {};
   for (const [key, value] of Object.entries(map)) {
-    if (typeof value === "string" && value) map[key] = { room: value, panes: {} };
+    if (typeof value === "string" && value) map[key] = { room: value, panes: {}, owned: true };
+    else if (value && typeof value === "object") {
+      // Entries predating `owned` were all pi-peer-created rooms.
+      const entry = value as PaseoMapEntry;
+      if (entry.owned !== false) entry.owned = true;
+    }
   }
   return map as Record<string, PaseoMapEntry>;
 }
 
-function saveMapEntry(mapPath: string, dirKey: string, herdrWsId: string): void {
+function saveMapEntry(mapPath: string, dirKey: string, herdrWsId: string, owned: boolean): void {
   // Merge over the freshest file contents: a concurrent provisioning of
   // another agent in the same directory must not be clobbered.
   const map = loadPaseoMap(mapPath);
   // A recreated room invalidates its old panes' identity — start panes empty.
-  map[dirKey] = { room: herdrWsId, panes: {} };
+  map[dirKey] = { room: herdrWsId, panes: {}, owned };
   writeAtomic(mapPath, map);
 }
 
-/** Record the pane a paseo agent owns in its room, preserving the panes of
- * the directory's other agents (fresh read + merge, like saveMapEntry). */
+/** Record the pane a paseo agent owns in its room, preserving the panes and
+ * the owned flag of the directory's entry (fresh read + merge, like
+ * saveMapEntry). `owned` — the room's provenance from ensureDirectoryRoom —
+ * is only used when the current entry tracks a different room (e.g. a
+ * concurrent provisioning rewrote it). */
 function savePaneEntry(
   mapPath: string,
   dirKey: string,
   herdrWsId: string,
   agentId: string,
   paneId: string,
+  owned: boolean,
 ): void {
   const map = loadPaseoMap(mapPath);
   const entry = map[dirKey];
-  const panes = entry && entry.room === herdrWsId ? entry.panes : {};
-  map[dirKey] = { room: herdrWsId, panes: { ...panes, [agentId]: paneId } };
+  const sameRoom = entry && entry.room === herdrWsId ? entry : undefined;
+  map[dirKey] = {
+    room: herdrWsId,
+    panes: { ...sameRoom?.panes, [agentId]: paneId },
+    owned: sameRoom?.owned ?? owned,
+  };
   writeAtomic(mapPath, map);
 }
 

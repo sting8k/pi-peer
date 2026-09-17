@@ -1,10 +1,10 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync, utimesSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { getCurrentHerdrPeerContextAsync, HerdrUnavailableError } from "../../pi-extension/pi-peer/herdr.ts";
+import { canonicalDirKey, getCurrentHerdrPeerContextAsync, HerdrUnavailableError } from "../../pi-extension/pi-peer/herdr.ts";
 import {
   paseoAgentDirName,
   provisionPaseoHerdrContextAsync,
@@ -50,9 +50,15 @@ function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
   const calls: Array<{ args: string[] }> = [];
   const alivePanes = new Map<string, object>();
   const closedPanes: string[] = [];
+  // Pre-existing panes for `pane list` (the adopt scan). Tests push user-opened
+  // panes here; created panes stay in alivePanes and are NOT listed back.
+  const listedPanes: object[] = [];
   const run = async (args: string[]) => {
     calls.push({ args });
     const [cmd, sub, operand] = args;
+    if (cmd === "pane" && sub === "list") {
+      return JSON.stringify({ result: { type: "pane_list", panes: listedPanes } });
+    }
     if (cmd === "workspace" && sub === "get") {
       if (!liveWs.includes(operand!)) throw new Error("workspace not found");
       return JSON.stringify({ result: { workspace: { workspace_id: operand } } });
@@ -86,7 +92,7 @@ function fakeHerdr(liveWs: string[], createdCounter: { n: number }) {
     if (cmd === "workspace" && sub === "report-metadata") return JSON.stringify({ result: { type: "ok" } });
     throw new Error(`unexpected herdr invocation: ${args.join(" ")}`);
   };
-  return { run, calls, createdCounter, alivePanes, closedPanes };
+  return { run, calls, createdCounter, alivePanes, closedPanes, listedPanes };
 }
 
 /** Fake paseo `ls` (sweep) + agent state home (provenance read). */
@@ -145,6 +151,7 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.equal(ctx.paneCount, 2);
       const entry = readJson(s.mapPath)?.["/work/checkout"];
       assert.equal(entry?.room, "wNew1", "map keyed by canonical dir");
+      assert.equal(entry?.owned, true, "no matching workspace → created room is pi-peer-owned");
       assert.equal(entry?.panes?.["agent-1"], "wNew1:p1", "the agent's pane is recorded for reuse");
       assert.equal(process.env.HERDR_ENV, "1");
       assert.equal(process.env.HERDR_PANE_ID, "wNew1:p1");
@@ -360,8 +367,104 @@ describe("paseo provisioning (directory rooms)", () => {
       assert.equal(ctx.workspaceId, "wExisting", "flat dir → wsId value still resolves to the room");
       assert.equal(s.herdr.createdCounter.n, 0, "no new workspace for a migrated entry");
       assert.deepEqual(readJson(s.mapPath)?.["/work/checkout"], {
-        room: "wExisting", panes: { "agent-1": "wExisting:p9" },
-      }, "entry rewritten as schema v2 with the agent's pane");
+        room: "wExisting", panes: { "agent-1": "wExisting:p9" }, owned: true,
+      }, "entry rewritten as schema v2 with the agent's pane (legacy → owned)");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("adopts a user-opened workspace for the same dir instead of creating a duplicate", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      // The user already has a workspace ("wU") with a pane sitting in this dir.
+      s.herdr.listedPanes.push({
+        pane_id: "wU:p1", terminal_id: "term-u1", tab_id: "wU:t1", workspace_id: "wU", cwd: "/work/checkout",
+      });
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wU", "the user's workspace becomes the room");
+      assert.equal(ctx.paneId, "wU:p9", "the agent still gets its own tab in it");
+      assert.ok(
+        !s.herdr.calls.some((c) => c.args[0] === "workspace" && c.args[1] === "create"),
+        "no workspace create for an adopted room",
+      );
+      const tabCreate = s.herdr.calls.find((c) => c.args[0] === "tab" && c.args[1] === "create");
+      assert.equal(tabCreate?.args[tabCreate.args.indexOf("--workspace") + 1], "wU", "tab created inside the adopted room");
+      assert.deepEqual(readJson(s.mapPath)?.["/work/checkout"], {
+        room: "wU", panes: { "agent-1": "wU:p9" }, owned: false,
+      }, "adopted room recorded as not-owned");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it("adopts across symlinks — herdr reports resolved cwds", async () => {
+    const s = provisionSetup();
+    const realDir = mkdtempSync(join(tmpdir(), "pi-peer-real-"));
+    const linkDir = join(tmpdir(), `pi-peer-link-${process.pid}-${Date.now()}`);
+    symlinkSync(realDir, linkDir);
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = linkDir;
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, linkDir, "agent-1", "wks_A");
+      // Herdr resolves symlinks: the pane's cwd is the realpath, not the link.
+      s.herdr.listedPanes.push({
+        pane_id: "wU:p1", terminal_id: "term-u1", tab_id: "wU:t1", workspace_id: "wU", cwd: realpathSync(realDir),
+      });
+      const paseo = fakePaseo();
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: s.herdr.run as any,
+        runPaseo: paseo.runPaseo,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wU", "realpath comparison matches the symlinked dir");
+      assert.equal(readJson(s.mapPath)?.[canonicalDirKey(linkDir)]?.owned, false, "map entry keyed by the literal cwd, marked adopted");
+    } finally {
+      s.cleanup();
+      rmSync(linkDir, { force: true });
+      rmSync(realDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to creating a room when the pane listing fails (adopt is fail-open)", async () => {
+    const s = provisionSetup();
+    try {
+      clearHerdrEnv();
+      process.env.PASEO_AGENT_ID = "agent-1";
+      process.env.PASEO_AGENT_CWD = "/work/checkout";
+      process.env.PASEO_HOME = s.home;
+      writeAgentState(s.home, "/work/checkout", "agent-1", "wks_A");
+      const run = async (args: string[]) => {
+        if (args[0] === "pane" && args[1] === "list") throw new Error("herdr too old for pane list");
+        return s.herdr.run(args);
+      };
+
+      const ctx = await provisionPaseoHerdrContextAsync(undefined, {
+        run: run as any,
+        mapPath: s.mapPath,
+        scheduleSweep: () => {},
+      });
+
+      assert.equal(ctx.workspaceId, "wNew1", "listing failure still provisions a fresh room");
+      assert.equal(readJson(s.mapPath)?.["/work/checkout"]?.owned, true);
     } finally {
       s.cleanup();
     }
@@ -487,7 +590,7 @@ describe("paseo orphan sweep (directory rooms)", () => {
     assert.deepEqual(closes, ["wOrphan"], "only the orphaned room is closed");
     assert.deepEqual(
       readJson(mapPath),
-      { [busyKey]: { room: "wLive", panes: {} } },
+      { [busyKey]: { room: "wLive", panes: {}, owned: true } },
       "orphan entry dropped; live dir kept (~ expanded), rewritten as schema v2",
     );
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
@@ -514,7 +617,7 @@ describe("paseo orphan sweep (directory rooms)", () => {
     assert.deepEqual(herdr.paneCloses, ["wLive:p2"], "removed agent's pane is closed");
     assert.deepEqual(closes, [], "the room of a live dir is never closed");
     assert.deepEqual(readJson(mapPath), {
-      [busyKey]: { room: "wLive", panes: { "agent-closed": "wLive:p3", "a1": "wLive:p4" } },
+      [busyKey]: { room: "wLive", panes: { "agent-closed": "wLive:p3", "a1": "wLive:p4" }, owned: true },
     }, "removed agent pruned; closed-but-listed and live agents keep their panes");
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
@@ -530,6 +633,23 @@ describe("paseo orphan sweep (directory rooms)", () => {
 
     assert.deepEqual(closes, [], "no close on an already-dead room");
     assert.deepEqual(readJson(mapPath), {}, "stale entry dropped");
+    rmSync(join(mapPath, ".."), { recursive: true, force: true });
+  });
+
+  it("never closes an adopted (owned:false) room — retires tracked panes and drops the entry", async () => {
+    const mapPath = join(mkdtempSync(join(tmpdir(), "pi-peer-sweep-")), "paseo-map.json");
+    writeFileSync(mapPath, JSON.stringify({
+      "/work/adopted": { room: "wUser", panes: { "a1": "wUser:p9", "a2": "wUser:p10" }, owned: false },
+    }));
+    const closes: string[] = [];
+    const herdr = sweepHerdr(["wUser"], closes);
+    const paseo = sweepPaseo([]);
+
+    await sweepOrphanedPaseoRooms(undefined, { run: herdr.run as any, runPaseo: paseo.runPaseo, mapPath });
+
+    assert.deepEqual(closes, [], "the user's workspace is never closed");
+    assert.deepEqual(herdr.paneCloses, ["wUser:p9", "wUser:p10"], "tracked pi-peer panes are retired");
+    assert.deepEqual(readJson(mapPath), {}, "adopted entry dropped");
     rmSync(join(mapPath, ".."), { recursive: true, force: true });
   });
 

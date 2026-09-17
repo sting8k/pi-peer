@@ -267,14 +267,18 @@ export async function getCurrentHerdrPeerContextAsync(
 
 /**
  * Verify a peer's identity is unchanged and read its live agent status.
- * Throws if the pane moved to another workspace/tab/terminal.
+ * Identity = pane + workspace + terminal; throws if the pane moved to
+ * another workspace or terminal. Tab is NOT identity: `herdr pane move`
+ * within a workspace keeps pane_id/terminal_id and only changes tab_id,
+ * so a tab change must not fail liveness (the record's tabId is cosmetic).
  */
 export async function getHerdrPeerStatusAsync(
   peer: HerdrPeerContext,
   signal?: AbortSignal,
+  options: HerdrRunAsyncOptions = {},
 ): Promise<HerdrAgentStatus> {
-  const current = await getHerdrPaneAsync(peer.paneId, peer.socketPath, { signal });
-  if (current.workspace_id !== peer.workspaceId || current.tab_id !== peer.tabId || current.terminal_id !== peer.terminalId) {
+  const current = await getHerdrPaneAsync(peer.paneId, peer.socketPath, { signal, run: options.run });
+  if (current.workspace_id !== peer.workspaceId || current.terminal_id !== peer.terminalId) {
     throw new Error("Herdr peer identity changed");
   }
   return herdrAgentStatusFrom(current);

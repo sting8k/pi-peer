@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
-import { getTalkRootDir, HerdrUnavailableError, probePaneCountAsync, probeWorkspaceNameAsync } from "../../pi-extension/pi-peer/herdr.ts";
+import { getHerdrPeerStatusAsync, getTalkRootDir, HerdrUnavailableError, probePaneCountAsync, probeWorkspaceNameAsync } from "../../pi-extension/pi-peer/herdr.ts";
 import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
@@ -125,6 +125,30 @@ describe("herdr workspaceName probe", () => {
     assert.equal(await probeWorkspaceNameAsync("w35", "/tmp/s.sock", { run: emptyLabel }), undefined, "empty label degrades to undefined");
   });
 });
+describe("herdr peer status identity", () => {
+  it("a same-workspace tab move is not an identity change (pane+terminal+workspace are)", async () => {
+    // `herdr pane move <pane> --tab <tab>` keeps pane_id + terminal_id and
+    // only changes tab_id — the peer must stay live (regression: tab_id was
+    // once part of the identity check and made moved peers vanish).
+    const peer = {
+      paneId: "w7:p1",
+      terminalId: "term-1",
+      tabId: "w7:t1",
+      socketPath: "/tmp/s.sock",
+      workspaceId: "w7",
+    };
+    const movedTab = async (args: string[]) => {
+      assert.deepEqual(args.slice(0, 2), ["pane", "get"]);
+      return JSON.stringify({ result: { pane: { pane_id: "w7:p1", terminal_id: "term-1", tab_id: "w7:t2", workspace_id: "w7", agent_status: "working" } } });
+    };
+    assert.equal(await getHerdrPeerStatusAsync(peer, undefined, { run: movedTab as any }), "working");
+
+    // Workspace/terminal moves still fail closed.
+    const movedWorkspace = async () => JSON.stringify({ result: { pane: { pane_id: "w7:p1", terminal_id: "term-1", tab_id: "w8:t1", workspace_id: "w8" } } });
+    await assert.rejects(getHerdrPeerStatusAsync(peer, undefined, { run: movedWorkspace as any }), /identity changed/);
+  });
+});
+
 describe("pi-peer standalone runtime", () => {
   it("entrypoint registers exactly the three talk tools", () => {
     const { api, registeredTools, registeredCommands, registeredRenderers } = createMockExtensionApi();

@@ -51,10 +51,10 @@ A message is delivered to an **idle** receiver as a normal user message (trigger
 
 A Paseo-spawned agent only gets `PASEO_AGENT_ID` + `PASEO_AGENT_CWD` — no `HERDR_*` — so pi-peer builds the context itself:
 
-- **One folder = one room** — a shared Herdr workspace named after the folder (not paseo's per-conversation workspace id, which would split agents sharing a checkout).
+- **One folder = one room** — a shared Herdr workspace named after the folder (not paseo's per-conversation workspace id, which would split agents sharing a checkout). A workspace you already opened for that folder is adopted instead of duplicated.
 - **One tab per agent**, remembered per paseo agentId — a reload takes its tab back: same identity, same mailbox, no duplicates.
 - **Panes join too** — a hand-run pi session in a herdr pane inside that folder sees the same room. Panes join, never create.
-- **Housekeeping** — on start, each agent closes rooms of folders with no live paseo agent and removes tabs of deleted agents. No trustworthy listing = no cleanup.
+- **Housekeeping** — on start, each agent closes rooms of folders with no live paseo agent and removes tabs of deleted agents. Adopted workspaces are never closed, only their agent tabs. No trustworthy listing = no cleanup.
 - **Degrades quietly** — provisioning failure means one log line and a session without peer talk; pi always starts.
 
 ### Running headless

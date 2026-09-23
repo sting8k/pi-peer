@@ -22,6 +22,7 @@ import {
   HISTORY_LIMIT,
   publishHistoryFromOwnSession,
   readHistory,
+  readUserMessageTexts,
 } from "./history.ts";
 import {
   DEAD_SESSION_SWEEP_MS,
@@ -308,6 +309,22 @@ export function registerTalkTools(
     }
   };
 
+  /** Predicate: the peer message is already persisted in this session's transcript. */
+  const deliveredIn = (ctx: any): ((message: PeerMessage) => boolean) => {
+    let texts: Set<string> | undefined;
+    return (message) => {
+      if (!texts) {
+        const sessionFile = ctx.sessionManager?.getSessionFile?.();
+        try {
+          texts = typeof sessionFile === "string" && sessionFile ? readUserMessageTexts(sessionFile) : new Set();
+        } catch {
+          texts = new Set(); // unreadable transcript: fall back to at-least-once
+        }
+      }
+      return texts.has(peerMessageTag(message).trim());
+    };
+  };
+
   const ensureRuntime = async (ctx: any, signal?: AbortSignal): Promise<Runtime | null> => {
     const sessionId = ctx.sessionManager.getSessionId();
     const current = runtime;
@@ -343,8 +360,9 @@ export function registerTalkTools(
     mkdirSync(sessionDir(root), { recursive: true, mode: 0o700 });
     writeAtomic(recordPath(root, sessionId), record);
     // Reclaim any `.processing` message orphaned by a crash mid-injection so
-    // it is redelivered rather than lost.
-    requeueProcessing(root, sessionId);
+    // it is redelivered rather than lost — unless the transcript shows it was
+    // already delivered (resume after a kill mid-turn must not replay it).
+    requeueProcessing(root, sessionId, deliveredIn(ctx));
     if (current) {
       // Session-switch ownership transfer: only after the new registration is
       // written and requeued, remove the previous runtime's owned live
@@ -488,7 +506,7 @@ export function registerTalkTools(
         if (!current) return;
         // A rebind may have missed agent_end; requeue any orphaned in-flight
         // claims so they retry (at-least-once) rather than being lost.
-        requeueProcessing(current.root, current.record.sessionId);
+        requeueProcessing(current.root, current.record.sessionId, deliveredIn(ctx));
         ctx.ui?.setStatus("pi-peer", `${current.record.name} · ${publicPeerId(current.record.sessionId)}`);
         publishHistoryFromOwnSession(current, ctx);
       })

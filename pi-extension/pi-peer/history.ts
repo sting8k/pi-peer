@@ -230,6 +230,20 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
 }
 
+/**
+ * Texts of every user message persisted in a session file (all branches).
+ * The host appends a user message only when it enters a turn (trigger or
+ * steer), so a match proves the message was delivered to this session.
+ */
+export function readUserMessageTexts(sessionFile: string): Set<string> {
+  const texts = new Set<string>();
+  for (const entry of getNewEntries(sessionFile, 0)) {
+    const message = (entry as Partial<MessageEntry>).message;
+    if (entry.type === "message" && message?.role === "user") texts.add(contentText(message.content));
+  }
+  return texts;
+}
+
 export function readHistory(root: string, sessionId: string): LatestPeerHistory {
   const value = readJson(latestPath(root, sessionId));
   if (isLatestPeerHistory(value) && value.sessionId === sessionId) return value;

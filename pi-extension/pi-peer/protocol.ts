@@ -306,13 +306,20 @@ export function resolveTarget(records: PeerRecord[], target: string): PeerRecord
  * message that was not fully injected is never lost. A pre-existing `.json`
  * (an id collision) wins and the `.processing` claim is dropped.
  */
-export function requeueProcessing(root: string, sessionId: string): void {
+export function requeueProcessing(
+  root: string,
+  sessionId: string,
+  isDelivered: (message: PeerMessage) => boolean = () => false,
+): void {
   const dir = inboxDir(root, sessionId);
   if (!existsSync(dir)) return;
   for (const name of readdirSync(dir).filter((entry) => entry.endsWith(".processing"))) {
     const processing = join(dir, name);
     const pending = join(dir, name.slice(0, -".processing".length));
-    if (existsSync(pending)) rmSync(processing, { force: true });
+    const message = readJson(processing);
+    // Already in the receiver's transcript (e.g. the process died mid-turn,
+    // before agent_end consumed the claim): consume, never redeliver.
+    if (existsSync(pending) || (isPeerMessage(message) && isDelivered(message))) rmSync(processing, { force: true });
     else renameSync(processing, pending);
   }
 }

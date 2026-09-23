@@ -81,7 +81,10 @@ no reply file, no `<peer_pong>`.
   held through the host turn (consumed at `agent_end`). If injection fails the
   claim is requeued; orphaned `.processing` files are reclaimed on reload/rebind
   and at startup, so a host-accepted-but-unconsumed message is recoverable
-  (at-least-once). This is a host-lifecycle guarantee, not proof the model
+  (at-least-once). An orphaned claim whose rendered `<peer_message>` is already
+  persisted as a user message in the session transcript (e.g. the process was
+  killed mid-turn, then resumed) is consumed instead of requeued, so resume
+  never replays it. This is a host-lifecycle guarantee, not proof the model
   consumed the message.
 - `agent_end` produces **no automatic reply** — a reply is a separate `talk_to`
   the agent chooses to send. No `<peer_pong>`, no response generation.

@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import piPeerExtension from "../../pi-extension/pi-peer/index.ts";
 import { getHerdrPeerStatusAsync, getTalkRootDir, HerdrUnavailableError, probePaneCountAsync, probeWorkspaceNameAsync } from "../../pi-extension/pi-peer/herdr.ts";
-import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
+import { DEAD_SESSION_SWEEP_MS, inboxDir, nowIso, peerMessageTag, publicPeerId, recordPath, sessionDir, sweepDeadSessions } from "../../pi-extension/pi-peer/protocol.ts";
 import { safeKey } from "../../pi-extension/pi-peer/storage.ts";
 import { registerTalkTools } from "../../pi-extension/pi-peer/service.ts";
 import { createMockExtensionApi, createTestDir, restoreEnvVar, importSpecifiers } from "./helpers.ts";
@@ -1315,6 +1315,45 @@ describe("pi-peer standalone runtime", () => {
       assert.equal(existsSync(join(inbox, "m1.json")), true, "message requeued to the inbox");
       await waitUntil(() => sentMessages.length === 2, "requeued message redelivered");
       assert.equal(sentMessages[1].options, undefined, "redelivered as a fresh user turn");
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("restart drops an orphaned claim already in the transcript and requeues the rest", async () => {
+    const root = createTestDir();
+    const sentMessages: string[] = [];
+    const handlers = new Map<string, Array<(...args: any[]) => any>>();
+    const sessionId = "session-resume";
+    const sessionFile = join(root, "transcripts", `${sessionId}.jsonl`);
+    const ctx = { cwd: "/work/resume", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile } };
+    const api: any = {
+      registerTool() {},
+      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      async sendUserMessage(content: any) { sentMessages.push(content); },
+    };
+    registerTalkTools(api, { ...noopPaneLabelDeps,
+      getCurrentPeer: async () => ({ paneId: "pane-resume", terminalId: "term-resume", tabId: "tab-resume", socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+      getPeerStatus: async () => "idle",
+      rootDir: () => root,
+    });
+    try {
+      // Previous process was killed mid-turn: two claims left as `.processing`,
+      // but only the first had entered the turn (persisted in the transcript).
+      const delivered = peerMessage("s1", "sender", sessionId, "Already seen.", "m1");
+      const pending = peerMessage("s1", "sender", sessionId, "Not seen yet.", "m2");
+      const inbox = inboxDir(root, sessionId);
+      mkdirSync(inbox, { recursive: true });
+      mkdirSync(join(root, "transcripts"), { recursive: true });
+      writeFileSync(join(inbox, "m1.json.processing"), JSON.stringify(delivered));
+      writeFileSync(join(inbox, "m2.json.processing"), JSON.stringify(pending));
+      writeFileSync(sessionFile, `${JSON.stringify({ type: "message", id: "e1", message: { role: "user", content: [{ type: "text", text: peerMessageTag(delivered as any) }] } })}\n`);
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "resume" }, ctx);
+      await waitUntil(() => sentMessages.length === 1, "undelivered claim redelivered");
+      assert.match(sentMessages[0], /Not seen yet\./);
+      assert.equal(existsSync(join(inbox, "m1.json.processing")) || existsSync(join(inbox, "m1.json")), false, "delivered claim consumed, not replayed");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(sentMessages.length, 1, "no duplicate delivery");
     } finally {
       for (const handler of handlers.get("session_shutdown") ?? []) handler({ type: "session_shutdown", reason: "quit" }, ctx);
       rmSync(root, { recursive: true, force: true });

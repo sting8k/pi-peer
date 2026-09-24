@@ -442,8 +442,11 @@ export function registerTalkTools(
         // declared Promise<void>) or on the drain chain. A superseded runtime
         // never heartbeats, so it cannot resurrect the record after the
         // owner quits or crashes; the session then reads as dead (fail-closed).
-        if (!currentRuntime.superseded && !ensureRecord(currentRuntime.root, currentRuntime.record)) {
-          supersede(currentRuntime);
+        // Ownership is read every tick: the owner's own heartbeat keeps the
+        // record fresh, so ensureRecord's mtime fast-path would never look.
+        if (!currentRuntime.superseded) {
+          if (ownsRegistration(currentRuntime.root, currentRuntime.record)) ensureRecord(currentRuntime.root, currentRuntime.record);
+          else supersede(currentRuntime);
         }
         // Label surface re-evaluation on the heartbeat cadence: a split or
         // pane-close between binds changes which surface is visible. Probe is

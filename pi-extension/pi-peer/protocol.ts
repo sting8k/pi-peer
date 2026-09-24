@@ -167,9 +167,7 @@ export function requeueClaimedMessage(processingPath: string): void {
   else renameSync(processingPath, pending);
 }
 
-/** Heartbeat the registration. Returns false when a valid record owned by
- * another registration (a later bind of the same session id) was observed. */
-export function ensureRecord(root: string, record: PeerRecord): boolean {
+export function ensureRecord(root: string, record: PeerRecord): void {
   const path = recordPath(root, record.sessionId);
   // Heartbeat: a live session refreshes its registration on a schedule so
   // peers can treat a stale record as death (a crashed process stops
@@ -181,13 +179,13 @@ export function ensureRecord(root: string, record: PeerRecord): boolean {
   } catch {
     // Missing or unreadable: (re)create the registration.
     writeAtomic(path, record);
-    return true;
+    return;
   }
-  if (Date.now() - mtimeMs < HEARTBEAT_INTERVAL_MS) return true;
+  if (Date.now() - mtimeMs < HEARTBEAT_INTERVAL_MS) return;
   const current = readJson(path);
   // Never clobber a record owned by a newer runtime; self-repair corrupt
   // records so an unreadable registration cannot stay alive forever.
-  if (isPeerRecord(current) && current.registrationId !== record.registrationId) return false;
+  if (isPeerRecord(current) && current.registrationId !== record.registrationId) return;
   try {
     // Touch the record (one syscall) instead of re-serializing it.
     utimesSync(path, new Date(), new Date());
@@ -195,7 +193,6 @@ export function ensureRecord(root: string, record: PeerRecord): boolean {
     // utimes failed (unlinked concurrently): restore the registration.
     writeAtomic(path, record);
   }
-  return true;
 }
 
 /**

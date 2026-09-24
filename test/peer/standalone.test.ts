@@ -316,6 +316,9 @@ describe("pi-peer standalone runtime", () => {
     await waitUntil(() => existsSync(record), "unsuperseded runtime restores its record");
     const imported = await start("pane-imported"); // later bind owns the registration
     try {
+      // Live path: nothing pending and the owner's record is fresh — the
+      // superseded runtime must still latch from its heartbeat alone.
+      await waitUntil(() => errors.some((line) => /no longer receives peer messages/.test(line)), "superseded runtime latches via heartbeat");
       const inbox = join(root, "inbox", sessionId);
       mkdirSync(inbox, { recursive: true });
       writeFileSync(join(inbox, "msg-1.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "For the owner.")));

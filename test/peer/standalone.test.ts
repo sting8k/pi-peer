@@ -282,15 +282,16 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
-  it("two processes bound to one session id: only the registration owner drains the shared inbox", async () => {
+  it("two processes bound to one session id: the superseded runtime stays dormant for good, even after the owner quits", async () => {
     const root = createTestDir();
     const sessionId = "session-duplicated";
     const ctx = { cwd: "/work/dup", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, `${sessionId}.jsonl`) } };
     const start = async (pane: string) => {
       const handlers = new Map<string, Array<(...args: any[]) => any>>();
       const received: string[] = [];
+      const tools = new Map<string, any>();
       const api: any = {
-        registerTool() {},
+        registerTool(tool: any) { tools.set(tool.name, tool); },
         on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
         async sendUserMessage(content: any) { received.push(String(content)); },
       };
@@ -302,12 +303,17 @@ describe("pi-peer standalone runtime", () => {
       for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
       await new Promise((resolve) => setTimeout(resolve, 20));
       const fire = (name: string, event: any) => { for (const handler of handlers.get(name) ?? []) handler(event, ctx); };
-      return { received, fire, stop: () => fire("session_shutdown", { type: "session_shutdown", reason: "quit" }) };
+      return { received, tools, fire, stop: () => fire("session_shutdown", { type: "session_shutdown", reason: "quit" }) };
     };
     const originalError = console.error;
     const errors: string[] = [];
     console.error = (...args: any[]) => { errors.push(args.join(" ")); };
     const original = await start("pane-original");
+    const record = recordPath(root, sessionId);
+    const inboxFiles = () => readdirSync(join(root, "inbox"), { recursive: true }).length;
+    // Never superseded: a missing record is restored by the heartbeat.
+    rmSync(record);
+    await waitUntil(() => existsSync(record), "unsuperseded runtime restores its record");
     const imported = await start("pane-imported"); // later bind owns the registration
     try {
       const inbox = join(root, "inbox", sessionId);
@@ -324,7 +330,24 @@ describe("pi-peer standalone runtime", () => {
       imported.fire("agent_end", { messages: [] });
       await waitUntil(() => imported.received.length === 2, "owner receives the second message");
       assert.equal(original.received.length, 0);
-      assert.equal(errors.filter((line) => /also open in another process/.test(line)).length, 1, "one notice per superseded runtime");
+
+      // The owner quits (removes its record). The superseded runtime must not
+      // take the session back: its conversation branch diverged.
+      imported.stop();
+      assert.equal(existsSync(record), false);
+      writeFileSync(join(inbox, "msg-3.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Third.")));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(existsSync(record), false, "superseded runtime never recreates the record");
+      assert.equal(existsSync(join(inbox, "msg-3.json")), true, "superseded runtime never claims after the owner quits");
+      assert.equal(original.received.length, 0);
+
+      const before = inboxFiles();
+      await assert.rejects(
+        original.tools.get("talk_to").execute("t", { target: "peer-xyz", message: "hi" }, undefined, undefined, ctx),
+        /open in another process/,
+      );
+      assert.equal(inboxFiles(), before, "talk_to from a superseded runtime writes nothing");
+      assert.equal(errors.filter((line) => /no longer receives peer messages/.test(line)).length, 1, "one notice per superseded runtime");
     } finally {
       console.error = originalError;
       imported.stop();

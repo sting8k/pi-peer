@@ -127,9 +127,14 @@ other; they relay through a common parent, which acts as the orchestrator.
   to a missing/dead/ambiguous target fails loudly **before** any enqueue.
 - Only the registration owner drains an inbox. Two processes can bind the same
   session id (e.g. a still-running session imported by Paseo); the later bind
-  rewrites the record's `registrationId` and wins. The superseded runtime stops
-  heartbeating it and never claims from the shared inbox (one stderr notice);
-  if the owner's record disappears, the heartbeat restores the older runtime.
+  rewrites the record's `registrationId` and wins. Superseded is **permanent
+  for that runtime** (the two conversation branches diverged): once it observes
+  another registration's record it never heartbeats, drains, publishes history,
+  or serves `talk_*` tools again (they fail with a restart hint; one stderr
+  notice). If the owner then quits or crashes, the session reads as dead
+  (fail-closed) and ages out like any dead session. Only a fresh bind — a new
+  process, or a `session_start` in this one — owns the session again. A missing
+  or unreadable record is still restored by a runtime that was never superseded.
 - Names are soft labels: a new name avoids only names held by another **live**
   (fresh-heartbeat) record in any room, and a resume keeps its name unless a
   live peer took it meanwhile. There is no post-write race recheck — a rare

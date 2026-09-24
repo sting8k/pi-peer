@@ -80,7 +80,12 @@ type Runtime = {
   peer: HerdrPeerContext;
   record: PeerRecord;
   root: string;
+  /** Latched once another bind of this session id took the registration.
+   * Permanent for this runtime: only a fresh bind can own the session again. */
+  superseded?: boolean;
 };
+
+const SUPERSEDED_ERROR = "pi-peer: this session is open in another process, so this process no longer uses peer talk. Restart or resume pi on this session to use peers here.";
 
 /**
  * Send-only `talk_to`: resolve a currently-live target, atomically enqueue one
@@ -261,7 +266,12 @@ export function registerTalkTools(
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
   let drainInFlight: Promise<void> | null = null;
-  let supersededNoticeFor: Runtime | null = null; // one notice per superseded runtime
+  /** Latch a runtime as superseded (permanent), with one notice. */
+  const supersede = (current: Runtime): void => {
+    if (current.superseded) return;
+    current.superseded = true;
+    console.error("pi-peer: this session is open in another process; this process no longer receives peer messages. Restart pi on this session to use peers here.");
+  };
   // Cross-session GC needs two observations: a peer waking from sleep must
   // refresh its registration before its artifacts can be removed.
   const deadSince = new Map<string, number>();
@@ -286,6 +296,7 @@ export function registerTalkTools(
    */
   const drainInbox = async (pi: ExtensionAPI, runtime: Runtime): Promise<void> => {
     if (turnStartPending) return;
+    if (runtime.superseded) return;
     if (bindInProgress) return; // a session bind is in flight; do not drain the old inbox
     const dir = inboxDir(runtime.root, runtime.record.sessionId);
     if (!existsSync(dir)) return;
@@ -293,12 +304,10 @@ export function registerTalkTools(
     if (pending.length === 0) return;
     // The inbox is keyed by session id, so a second process bound to the same
     // session shares it. Only the registration owner drains; a superseded
-    // runtime stays dormant instead of stealing the owner's messages.
+    // runtime stays dormant for good instead of stealing the owner's messages
+    // (or taking them back after the owner quits — the branches diverged).
     if (!ownsRegistration(runtime.root, runtime.record)) {
-      if (supersededNoticeFor !== runtime) {
-        supersededNoticeFor = runtime;
-        console.error("pi-peer: this session is also open in another process; peer messages are delivered there");
-      }
+      supersede(runtime);
       return;
     }
     for (const name of pending) {
@@ -357,6 +366,12 @@ export function registerTalkTools(
     const sessionId = ctx.sessionManager.getSessionId();
     const current = runtime;
     if (current && current.record.sessionId === sessionId) {
+      // A superseded runtime must not recreate the registration nor talk from
+      // a diverged conversation branch (replies would reach the other process).
+      if (current.superseded || !ownsRegistration(current.root, current.record)) {
+        supersede(current);
+        throw new Error(SUPERSEDED_ERROR);
+      }
       ensureRecord(current.root, current.record);
       return current;
     }
@@ -422,10 +437,14 @@ export function registerTalkTools(
       interval = setInterval(() => {
         if (!runtime) return;
         const currentRuntime = runtime;
-        // Heartbeat first, unconditionally: the registration liveness signal
-        // must not depend on sendUserMessage semantics (fire-and-forget in
-        // the host today, declared Promise<void>) or on the drain chain.
-        ensureRecord(currentRuntime.root, currentRuntime.record);
+        // Heartbeat first: the registration liveness signal must not depend on
+        // sendUserMessage semantics (fire-and-forget in the host today,
+        // declared Promise<void>) or on the drain chain. A superseded runtime
+        // never heartbeats, so it cannot resurrect the record after the
+        // owner quits or crashes; the session then reads as dead (fail-closed).
+        if (!currentRuntime.superseded && !ensureRecord(currentRuntime.root, currentRuntime.record)) {
+          supersede(currentRuntime);
+        }
         // Label surface re-evaluation on the heartbeat cadence: a split or
         // pane-close between binds changes which surface is visible. Probe is
         // cosmetic best-effort (undefined -> no-op). A rebind that lands
@@ -527,6 +546,9 @@ export function registerTalkTools(
     // Bind latch: hold the poll interval off the old runtime's inbox while the
     // async bind resolves, so a just-requeued message is not drained again.
     bindInProgress = true;
+    // A session (re)started in this process is a fresh bind: it takes the
+    // registration back from the other process instead of reusing the latch.
+    if (runtime && (runtime.superseded || !ownsRegistration(runtime.root, runtime.record))) runtime = null;
     for (const processing of inFlightClaims) requeueClaimedMessage(processing);
     selfBusy = false;
     turnStartPending = false;
@@ -566,7 +588,8 @@ export function registerTalkTools(
     // covered the turn (host lifecycle), not proof of model consumption.
     for (const processing of inFlightClaims) rmSync(processing, { force: true });
     inFlightClaims.clear();
-    if (!runtime) return;
+    // A superseded runtime's branch diverged: never overwrite the owner's history.
+    if (!runtime || runtime.superseded) return;
     // Session entries are persisted before the end event; rebuild from the
     // current lineage so ids are stable and no duplicate risk exists. No
     // automatic reply is produced: a reply is a separate `talk_to` the agent

@@ -167,7 +167,9 @@ export function requeueClaimedMessage(processingPath: string): void {
   else renameSync(processingPath, pending);
 }
 
-export function ensureRecord(root: string, record: PeerRecord): void {
+/** Heartbeat the registration. Returns false when a valid record owned by
+ * another registration (a later bind of the same session id) was observed. */
+export function ensureRecord(root: string, record: PeerRecord): boolean {
   const path = recordPath(root, record.sessionId);
   // Heartbeat: a live session refreshes its registration on a schedule so
   // peers can treat a stale record as death (a crashed process stops
@@ -179,13 +181,13 @@ export function ensureRecord(root: string, record: PeerRecord): void {
   } catch {
     // Missing or unreadable: (re)create the registration.
     writeAtomic(path, record);
-    return;
+    return true;
   }
-  if (Date.now() - mtimeMs < HEARTBEAT_INTERVAL_MS) return;
+  if (Date.now() - mtimeMs < HEARTBEAT_INTERVAL_MS) return true;
   const current = readJson(path);
   // Never clobber a record owned by a newer runtime; self-repair corrupt
   // records so an unreadable registration cannot stay alive forever.
-  if (isPeerRecord(current) && current.registrationId !== record.registrationId) return;
+  if (isPeerRecord(current) && current.registrationId !== record.registrationId) return false;
   try {
     // Touch the record (one syscall) instead of re-serializing it.
     utimesSync(path, new Date(), new Date());
@@ -193,6 +195,7 @@ export function ensureRecord(root: string, record: PeerRecord): void {
     // utimes failed (unlinked concurrently): restore the registration.
     writeAtomic(path, record);
   }
+  return true;
 }
 
 /**
@@ -276,10 +279,11 @@ function removeDeadSessionArtifacts(root: string, id: string): void {
 }
 
 /**
- * This runtime still owns its registration. Two processes can bind the same
- * session id (e.g. a live session imported into another host); the later bind
- * rewrites the record with its own registrationId and wins. A missing or
- * unreadable record counts as owned — the heartbeat restores it.
+ * No other registration owns this session's record. Two processes can bind the
+ * same session id (e.g. a live session imported into another host); the later
+ * bind rewrites the record with its own registrationId and wins. A missing or
+ * unreadable record counts as owned — the heartbeat restores it for a runtime
+ * that was never superseded.
  */
 export function ownsRegistration(root: string, record: PeerRecord): boolean {
   const current = readJson(recordPath(root, record.sessionId));

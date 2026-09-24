@@ -275,6 +275,17 @@ function removeDeadSessionArtifacts(root: string, id: string): void {
   rmSync(join(root, "inbox", id), { recursive: true, force: true });
 }
 
+/**
+ * This runtime still owns its registration. Two processes can bind the same
+ * session id (e.g. a live session imported into another host); the later bind
+ * rewrites the record with its own registrationId and wins. A missing or
+ * unreadable record counts as owned — the heartbeat restores it.
+ */
+export function ownsRegistration(root: string, record: PeerRecord): boolean {
+  const current = readJson(recordPath(root, record.sessionId));
+  return !isPeerRecord(current) || current.registrationId === record.registrationId;
+}
+
 export function removeOwnedRecord(root: string, record: PeerRecord): void {
   if (!record.registrationId) return;
   const path = recordPath(root, record.sessionId);

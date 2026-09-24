@@ -35,6 +35,7 @@ import {
   newMessageId,
   nowIso,
   peerMessageTag,
+  ownsRegistration,
   pickPeerName,
   registeredLiveRecords,
   HEARTBEAT_INTERVAL_MS,
@@ -260,6 +261,7 @@ export function registerTalkTools(
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
   let drainInFlight: Promise<void> | null = null;
+  let supersededNoticeFor: Runtime | null = null; // one notice per superseded runtime
   // Cross-session GC needs two observations: a peer waking from sleep must
   // refresh its registration before its artifacts can be removed.
   const deadSince = new Map<string, number>();
@@ -288,6 +290,17 @@ export function registerTalkTools(
     const dir = inboxDir(runtime.root, runtime.record.sessionId);
     if (!existsSync(dir)) return;
     const pending = readdirSync(dir).filter((name) => name.endsWith(".json")).sort();
+    if (pending.length === 0) return;
+    // The inbox is keyed by session id, so a second process bound to the same
+    // session shares it. Only the registration owner drains; a superseded
+    // runtime stays dormant instead of stealing the owner's messages.
+    if (!ownsRegistration(runtime.root, runtime.record)) {
+      if (supersededNoticeFor !== runtime) {
+        supersededNoticeFor = runtime;
+        console.error("pi-peer: this session is also open in another process; peer messages are delivered there");
+      }
+      return;
+    }
     for (const name of pending) {
       const path = join(dir, name);
       const message = readJson(path);

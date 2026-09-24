@@ -125,6 +125,11 @@ other; they relay through a common parent, which acts as the orchestrator.
 - Registration records are removed at `session_shutdown`; panes that are no
   longer alive on the Herdr socket are excluded from discovery, and a `talk_to`
   to a missing/dead/ambiguous target fails loudly **before** any enqueue.
+- Only the registration owner drains an inbox. Two processes can bind the same
+  session id (e.g. a still-running session imported by Paseo); the later bind
+  rewrites the record's `registrationId` and wins. The superseded runtime stops
+  heartbeating it and never claims from the shared inbox (one stderr notice);
+  if the owner's record disappears, the heartbeat restores the older runtime.
 - Names are soft labels: a new name avoids only names held by another **live**
   (fresh-heartbeat) record in any room, and a resume keeps its name unless a
   live peer took it meanwhile. There is no post-write race recheck — a rare

@@ -282,6 +282,57 @@ describe("pi-peer standalone runtime", () => {
     }
   });
 
+  it("two processes bound to one session id: only the registration owner drains the shared inbox", async () => {
+    const root = createTestDir();
+    const sessionId = "session-duplicated";
+    const ctx = { cwd: "/work/dup", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(root, `${sessionId}.jsonl`) } };
+    const start = async (pane: string) => {
+      const handlers = new Map<string, Array<(...args: any[]) => any>>();
+      const received: string[] = [];
+      const api: any = {
+        registerTool() {},
+        on(name: string, handler: (...args: any[]) => any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+        async sendUserMessage(content: any) { received.push(String(content)); },
+      };
+      registerTalkTools(api, { ...noopPaneLabelDeps,
+        getCurrentPeer: async () => ({ paneId: pane, terminalId: `t-${pane}`, tabId: `tab-${pane}`, socketPath: "/tmp/herdr.sock", workspaceId: "workspace-1" }),
+        getPeerStatus: async () => "idle",
+        rootDir: () => root,
+      });
+      for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start", reason: "startup" }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const fire = (name: string, event: any) => { for (const handler of handlers.get(name) ?? []) handler(event, ctx); };
+      return { received, fire, stop: () => fire("session_shutdown", { type: "session_shutdown", reason: "quit" }) };
+    };
+    const originalError = console.error;
+    const errors: string[] = [];
+    console.error = (...args: any[]) => { errors.push(args.join(" ")); };
+    const original = await start("pane-original");
+    const imported = await start("pane-imported"); // later bind owns the registration
+    try {
+      const inbox = join(root, "inbox", sessionId);
+      mkdirSync(inbox, { recursive: true });
+      writeFileSync(join(inbox, "msg-1.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "For the owner.")));
+      await waitUntil(() => imported.received.length === 1, "owner receives the message");
+      // The owner's idle-trigger latch now holds msg-2 in the inbox until
+      // agent_start, so it sits pending across several ticks of both pollers.
+      writeFileSync(join(inbox, "msg-2.json"), JSON.stringify(peerMessage("session-sender", "sender", sessionId, "Second.")));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(existsSync(join(inbox, "msg-2.json")), true, "superseded runtime does not claim the pending message");
+      assert.equal(original.received.length, 0, "superseded runtime receives nothing");
+      imported.fire("agent_start", { type: "agent_start" });
+      imported.fire("agent_end", { messages: [] });
+      await waitUntil(() => imported.received.length === 2, "owner receives the second message");
+      assert.equal(original.received.length, 0);
+      assert.equal(errors.filter((line) => /also open in another process/.test(line)).length, 1, "one notice per superseded runtime");
+    } finally {
+      console.error = originalError;
+      imported.stop();
+      original.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("agent_end emits no automatic reply and never creates waiter/reply artifacts", async () => {
     const root = createTestDir();
     const sentMessages: Array<{ content: any; options?: any }> = [];

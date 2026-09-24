@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { readJson, safeKey, writeAtomic } from "./storage.ts";
-import type { HerdrAgentStatus, HerdrPeerContext } from "./herdr.ts";
+import { canonicalDirKey, type HerdrAgentStatus, type HerdrPeerContext } from "./herdr.ts";
 
 /**
  * Peer-chat wire protocol (protocol v1) and mailbox operations for the
@@ -298,7 +299,7 @@ export function resolveTarget(records: PeerRecord[], target: string): PeerRecord
   const exactName = records.filter((record) => record.name === target);
   if (exactName.length === 1) return exactName[0];
   if (exactName.length > 1) throw new Error(`Peer name is ambiguous: ${target}`);
-  throw new Error(`Peer session not found: ${target}`);
+  throw new Error(`Peer session not found: ${target} (peers in sibling or unrelated folders are not visible; relay through a session in a shared parent folder)`);
 }
 
 /**
@@ -333,20 +334,73 @@ export function isRegisteredLive(root: string, sessionId: string): boolean {
   }
 }
 
+/** A peer as seen for visibility: its talk room root and bind-time cwd. */
+export interface PeerLocation {
+  root: string;
+  cwd: string;
+}
+
+/** `ancestor` is `descendant` or one of its parents, on separator boundaries
+ * (`/proj` is not a parent of `/project`). */
+function isAncestorOrEqual(ancestor: string, descendant: string): boolean {
+  if (ancestor === descendant) return true;
+  return descendant.startsWith(ancestor === "/" ? "/" : `${ancestor}/`);
+}
+
+/**
+ * The single visibility predicate for talk_sessions, talk_to, and
+ * talk_latest: two peers see each other when they share a room, or when one
+ * cwd is an ancestor-or-equal of the other (direct lineage, any depth, both
+ * directions). Siblings do not see each other — they relay through a parent.
+ * `/`, `$HOME`, and every ancestor of `$HOME` never count as an ancestor, so a
+ * session opened at `~` does not see the whole machine. Paths are compared
+ * after realpath on all sides; any realpath failure falls back to
+ * canonicalDirKey on all sides (as paseo.ts sameDirectory does).
+ */
+export function canSee(me: PeerLocation, peer: PeerLocation, home: string = homedir()): boolean {
+  if (me.root === peer.root) return true;
+  let a: string, b: string, h: string;
+  try {
+    a = realpathSync(me.cwd);
+    b = realpathSync(peer.cwd);
+    h = realpathSync(home);
+  } catch {
+    a = canonicalDirKey(me.cwd);
+    b = canonicalDirKey(peer.cwd);
+    h = canonicalDirKey(home);
+  }
+  const lineage = (ancestor: string, descendant: string) =>
+    !isAncestorOrEqual(ancestor, h) && isAncestorOrEqual(ancestor, descendant);
+  return lineage(a, b) || lineage(b, a);
+}
+
+/** Records with a fresh heartbeat across the given talk roots, tagged with the
+ * root they live in. No Herdr status read. */
+export function registeredLiveRecords(roots: string[]): Array<{ record: PeerRecord; root: string }> {
+  const result: Array<{ record: PeerRecord; root: string }> = [];
+  for (const root of new Set(roots)) {
+    for (const record of loadRecords(root)) {
+      // A crashed process stops heartbeating its registration; its stale
+      // record is not a live peer even if the Herdr pane still exists.
+      if (isRegisteredLive(root, record.sessionId)) result.push({ record, root });
+    }
+  }
+  return result;
+}
+
 export async function liveRecords(
-  root: string,
+  roots: string[],
+  me: PeerLocation,
   socketPath: string,
   getStatus: (peerContext: HerdrPeerContext, signal?: AbortSignal) => Promise<HerdrAgentStatus>,
   signal?: AbortSignal,
-): Promise<Array<{ record: PeerRecord; status: HerdrAgentStatus }>> {
-  const result: Array<{ record: PeerRecord; status: HerdrAgentStatus }> = [];
-  for (const record of loadRecords(root)) {
-    // The room root IS the visibility scope: herdr-pane peers and
-    // paseo-provisioned peers in the same directory room mix here even when
-    // their identity workspaces differ (see herdr.ts roomId).
-    // A crashed process stops heartbeating its registration; its stale record
-    // is not a live peer even if the Herdr pane still exists.
-    if (!isRegisteredLive(root, record.sessionId)) continue;
+): Promise<Array<{ record: PeerRecord; root: string; status: HerdrAgentStatus }>> {
+  const result: Array<{ record: PeerRecord; root: string; status: HerdrAgentStatus }> = [];
+  for (const { record, root } of registeredLiveRecords(roots)) {
+    // Visibility is decided before the status read: each getStatus spawns a
+    // Herdr CLI call. Same room (herdr-pane and paseo-provisioned peers mix
+    // there, see herdr.ts roomId) or same directory lineage.
+    if (!canSee(me, { root, cwd: record.cwd })) continue;
     try {
       const status = await getStatus({
         paneId: record.paneId,
@@ -355,7 +409,7 @@ export async function liveRecords(
         socketPath,
         workspaceId: record.workspaceId,
       }, signal);
-      result.push({ record, status });
+      result.push({ record, root, status });
     } catch {
       // A stale or moved Herdr pane is not a live peer.
     }

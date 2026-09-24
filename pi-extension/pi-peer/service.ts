@@ -11,6 +11,7 @@ import {
   getHerdrPeerStatusAsync,
   getTalkRootDir,
   HerdrUnavailableError,
+  listTalkRoots,
   probePaneCountAsync,
   probeWorkspaceNameAsync,
   renamePaneAsync,
@@ -31,11 +32,11 @@ import {
   isPeerMessage,
   isPeerRecord,
   liveRecords,
-  loadRecords,
   newMessageId,
   nowIso,
   peerMessageTag,
   pickPeerName,
+  registeredLiveRecords,
   HEARTBEAT_INTERVAL_MS,
   POLL_MS,
   publicPeerId,
@@ -66,7 +67,13 @@ export type TalkDeps = {
   surfaceCheckMs?: number;
   isBusy?: () => boolean;
   rootDir?: (workspaceId: string) => string;
+  /** Every talk room root to scan for cross-room (lineage) peers and live
+   * names. Defaults to `<agent dir>/pi-peer/talk/*`; when only `rootDir` is
+   * injected (test seam), defaults to no extra roots (own room only). */
+  talkRoots?: () => string[];
 };
+
+type VisiblePeers = (signal?: AbortSignal) => Promise<Awaited<ReturnType<typeof liveRecords>>>;
 
 type Runtime = {
   peer: HerdrPeerContext;
@@ -83,16 +90,19 @@ type Runtime = {
 async function executeTalkTo(
   params: TalkTo,
   runtime: Runtime,
-  getStatus: typeof getHerdrPeerStatusAsync,
+  visiblePeers: VisiblePeers,
   signal?: AbortSignal,
 ): Promise<any> {
   const message = params.message.trim();
   const target = params.target.trim();
   if (!target) throw new Error("talk_to requires a target");
   if (!message) throw new Error("talk_to requires a non-empty message");
-  const peers = await liveRecords(runtime.root, runtime.peer.socketPath, getStatus, signal);
+  const peers = await visiblePeers(signal);
   const targetRecord = resolveTarget(peers.map((entry) => entry.record), target);
   if (targetRecord.sessionId === runtime.record.sessionId) throw new Error("talk_to cannot target the current session");
+  // The receiver polls the inbox in its own room root, which may differ from
+  // ours for a lineage (cross-room) peer.
+  const targetRoot = peers.find((entry) => entry.record.sessionId === targetRecord.sessionId)!.root;
   const sent: PeerMessage = {
     version: 1,
     type: "peer_message",
@@ -103,7 +113,7 @@ async function executeTalkTo(
     message,
     createdAt: nowIso(),
   };
-  writeAtomic(join(inboxDir(runtime.root, targetRecord.sessionId), `${sent.id}.json`), sent);
+  writeAtomic(join(inboxDir(targetRoot, targetRecord.sessionId), `${sent.id}.json`), sent);
   return {
     content: [{
       type: "text",
@@ -116,7 +126,7 @@ async function executeTalkTo(
 async function executeTalkLatest(
   params: TalkLatest,
   runtime: Runtime,
-  getStatus: typeof getHerdrPeerStatusAsync,
+  visiblePeers: VisiblePeers,
   signal?: AbortSignal,
 ): Promise<any> {
   const target = params.target.trim();
@@ -125,12 +135,13 @@ async function executeTalkLatest(
   if (!Number.isInteger(count) || count < 1 || count > HISTORY_LIMIT) {
     throw new Error(`talk_latest count must be an integer between 1 and ${HISTORY_LIMIT}`);
   }
-  const peers = await liveRecords(runtime.root, runtime.peer.socketPath, getStatus, signal);
+  const peers = await visiblePeers(signal);
   const targetRecord = resolveTarget(peers.map((entry) => entry.record), target);
-  const peerStatus = peers.find((entry) => entry.record.sessionId === targetRecord.sessionId)?.status ?? "unknown";
+  const targetEntry = peers.find((entry) => entry.record.sessionId === targetRecord.sessionId)!;
+  const peerStatus = targetEntry.status;
   const currentTurnInProgress = peerStatus === "working" || peerStatus === "blocked";
   if (targetRecord.sessionId === runtime.record.sessionId) throw new Error("talk_latest cannot target the current session");
-  const history = readHistory(runtime.root, targetRecord.sessionId);
+  const history = readHistory(targetEntry.root, targetRecord.sessionId);
   if (history.events.length === 0) {
     throw new Error(`Peer ${publicPeerId(targetRecord.sessionId)} has no completed conversation events`);
   }
@@ -242,6 +253,10 @@ export function registerTalkTools(
   // redeliver a just-requeued message. Cleared once the bind completes or fails.
   let bindInProgress = false;
   const rootDir = deps.rootDir ?? getTalkRootDir;
+  const talkRoots = deps.talkRoots ?? (deps.rootDir ? () => [] : listTalkRoots);
+  const allRoots = (own: string) => [own, ...talkRoots()];
+  const visiblePeersOf = (current: Runtime): VisiblePeers => (signal) =>
+    liveRecords(allRoots(current.root), { root: current.root, cwd: current.record.cwd }, current.peer.socketPath, getStatus, signal);
   let runtime: Runtime | null = null;
   let interval: ReturnType<typeof setInterval> | null = null;
   let drainInFlight: Promise<void> | null = null;
@@ -339,12 +354,16 @@ export function registerTalkTools(
     if (bindGeneration !== lifecycleGeneration) return null;
     const root = rootDir(peer.roomId ?? peer.workspaceId);
     const existing = readJson(recordPath(root, sessionId));
-    const name = isPeerRecord(existing) && existing.sessionId === sessionId
+    // Names are soft labels: avoid only names held by another LIVE peer in any
+    // room (a dead record's name is reusable). A resume keeps its old name
+    // unless a live peer took it meanwhile. No post-write race recheck: a rare
+    // duplicate fails closed as ambiguous in resolveTarget; peer ids stay exact.
+    const taken = new Set(registeredLiveRecords(allRoots(root))
+      .filter(({ record }) => record.sessionId !== sessionId)
+      .map(({ record }) => record.name));
+    const name = isPeerRecord(existing) && existing.sessionId === sessionId && !taken.has(existing.name)
       ? existing.name
-      : pickPeerName(
-        sessionId,
-        new Set(loadRecords(root).filter((record) => record.sessionId !== sessionId).map((record) => record.name)),
-      );
+      : pickPeerName(sessionId, taken);
     const record: PeerRecord = {
       schemaVersion: 1,
       sessionId,
@@ -442,16 +461,16 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_sessions",
     label: "Talk Sessions",
-    description: "List live Pi peer sessions in the current Herdr workspace.",
-    promptSnippet: "Use `talk_sessions` to find a peer's public id (e.g. `peer-abc`) before calling `talk_to`.",
+    description: "List live Pi peer sessions visible to this one: same Herdr room, or a parent/child folder of this session's cwd (sibling folders are not visible). The peer id (`peer-xxx`) is the stable address; names are soft labels.",
+    promptSnippet: "Use `talk_sessions` to find a peer's public id (e.g. `peer-abc`) before calling `talk_to`; prefer the peer id when you must hit exactly one session.",
     parameters: TalkSessionsParams,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
       if (!current) throw new Error("pi-peer unavailable: session ended during bind");
-      const peers = await liveRecords(current.root, current.peer.socketPath, getStatus, signal);
-      const lines = peers.map(({ record, status }) => {
+      const peers = await visiblePeersOf(current)(signal);
+      const lines = peers.map(({ record, root, status }) => {
         const base = `${publicPeerId(record.sessionId)}  ${record.name}  ${status}${record.sessionId === current.record.sessionId ? "  (current)" : ""}`;
-        const queued = inboxCount(current.root, record.sessionId);
+        const queued = inboxCount(root, record.sessionId);
         return queued > 0 ? `${base}  (${queued} queued)` : base;
       });
       return {
@@ -464,26 +483,26 @@ export function registerTalkTools(
   pi.registerTool({
     name: "talk_latest",
     label: "Latest Peer Events",
-    description: "Fetch the N most recent completed conversation events published by another live Pi peer (count defaults to 1, max 10).",
+    description: "Fetch the N most recent completed conversation events published by another visible live Pi peer (count defaults to 1, max 10). Target by peer id (`peer-xxx`, stable) or name (soft label).",
     promptSnippet: "Use `talk_latest` to read the peer's most recent completed conversation events (user, assistant text, tool call, tool result) without reading its transcript.",
     parameters: TalkLatestParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
       if (!current) throw new Error("pi-peer unavailable: session ended during bind");
-      return executeTalkLatest(params as TalkLatest, current, getStatus, signal);
+      return executeTalkLatest(params as TalkLatest, current, visiblePeersOf(current), signal);
     },
   });
 
   pi.registerTool({
     name: "talk_to",
     label: "Talk To",
-    description: "Send a message to another live Pi session in the current Herdr workspace. Returns confirmation that the message was sent (durably queued in the peer's mailbox); the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
+    description: "Send a message to another visible live Pi session (same Herdr room, or a parent/child folder). Target by peer id (`peer-xxx`, the stable address — use it to hit exactly one session) or name (soft label). Returns confirmation that the message was sent (durably queued in the peer's mailbox); the peer's later reply arrives as a new <peer_message>. Do not reply merely to acknowledge unless useful.",
     promptSnippet: "Use `talk_to` to send a chat message to another Pi session; call `talk_sessions` first when the target is unknown.",
     parameters: TalkToParams,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const current = await ensureRuntime(ctx, signal);
       if (!current) throw new Error("pi-peer unavailable: session ended during bind");
-      return executeTalkTo(params as TalkTo, current, getStatus, signal);
+      return executeTalkTo(params as TalkTo, current, visiblePeersOf(current), signal);
     },
   });
 

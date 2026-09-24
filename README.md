@@ -1,13 +1,13 @@
 # pi-peer
 
-Peer-to-peer chat between Pi coding-agent sessions that share a room — their Herdr workspace, or a shared folder room under Paseo. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
+Peer-to-peer chat between Pi coding-agent sessions that share a room — their Herdr workspace, or a shared folder room under Paseo — or sit in the same direct folder lineage (parent/child, any depth), even across rooms. Two independently running sessions can find each other, read each other's recent history, and send each other messages.
 
 It is symmetric, natural chat between equal agents — not RPC or task delegation to a subagent. There is no request/response correlation, no `timeoutMs`, no waiting, and no `<peer_pong>`. Three tools, nothing else.
 
 ## Features
 
 - **`talk_to`** — send a message to another live session (`target` = public peer id `peer-xxx` or unique display name). Returns **delivery confirmation only**; a reply, if any, simply arrives later as a new `<peer_message>`.
-- **`talk_sessions`** — list live peers, one per line: `<peer-id>  <name>  <status>` with `idle | working | blocked | done | unknown`, `(current)` marker, and `(N queued)` for pending inbound. Every session gets a stable friendly pet name, unique per room.
+- **`talk_sessions`** — list live peers, one per line: `<peer-id>  <name>  <status>` with `idle | working | blocked | done | unknown`, `(current)` marker, and `(N queued)` for pending inbound. Every session gets a friendly pet name — an easy-to-say label that avoids names held by other live peers on the machine. The peer id `peer-xxx` is the stable address; use it when you must hit exactly one session.
 - **`talk_latest`** — read a peer's N most recent **completed** conversation events (`count` 1–10, default 1). Peers publish a bounded history only — thinking and live turns are never shared.
 - **No daemon.** Peers coordinate through an atomic file mailbox in the agent directory.
 - **Send-only semantics.** `talk_to` never blocks waiting for a response; the language of the conversation is handled by the agents replying with another `talk_to` in the opposite direction.
@@ -38,6 +38,13 @@ It is symmetric, natural chat between equal agents — not RPC or task delegatio
 ```
 
 Each session registers itself, heartbeats every 10 s, and polls its own mailbox. There is no central process to run. The "room" is normally just the Herdr workspace the session runs in — under Paseo, pi-peer makes one shared room per folder instead (see below), so every agent in the same folder meets there.
+
+**Visibility.** A session sees peers in its room **or** in its direct folder lineage — parents and children at any depth, across rooms. Siblings don't see each other; they go through the parent, which acts as the orchestrator. `$HOME` and above never count as a parent. A cross-room `talk_to` lands in the receiver's room mailbox.
+
+```
+/proj      sees /proj/a and /proj/b
+/proj/a    sees /proj, not /proj/b
+```
 
 A message is delivered to an **idle** receiver as a normal user message (trigger behavior) and to a **busy** receiver as a steer (`deliverAs: "steer"`) straight into its running turn — regardless of who sent it. A reply is simply another `talk_to` in the opposite direction, so whichever side is idle gets triggered and whichever is busy gets steered. Nothing ever waits for a turn boundary to *lose* a message.
 

@@ -1,5 +1,6 @@
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -73,6 +74,18 @@ export function getAgentConfigDir(): string {
 export function getTalkRootDir(workspaceId: string): string {
   // Sanitize at the owner seam so no caller can introduce a path traversal.
   return join(getAgentConfigDir(), "pi-peer", "talk", safeKey(workspaceId));
+}
+
+/** Every talk room root currently on disk (`<agent dir>/pi-peer/talk/*`). */
+export function listTalkRoots(): string[] {
+  const base = join(getAgentConfigDir(), "pi-peer", "talk");
+  try {
+    return readdirSync(base, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(base, entry.name));
+  } catch {
+    return [];
+  }
 }
 
 function herdrSocketPath(): string {

@@ -50,7 +50,7 @@ inbox/<peer-id>/*.json ──► sendUserMessage(<peer_message>, deliverAs: "ste
    │  idle: plain user message (trigger); busy: steer — regardless of sender
 agent_end ──► busy = false; publish latest/<session-id>.json (no automatic reply)
    │
-talk_to caller: resolve live target → writeAtomic(inbox/<peer-id>/<msg-id>.json)
+talk_to caller: resolve visible live target → writeAtomic(<target room>/inbox/<peer-id>/<msg-id>.json)
    └─ returns delivery confirmation immediately; never waits for a response
 session_shutdown ──► remove sessions/<session-id>.json, stop polling
 ```
@@ -59,6 +59,31 @@ There is no response/wake path: a reply is simply another `talk_to` from the
 peer, which enqueues a message into the original sender's inbox and is
 delivered by *that* peer's own drain (idle trigger or busy steer). No waiter,
 no reply file, no `<peer_pong>`.
+
+### Visibility
+
+One predicate, `canSee` (`protocol.ts`), scopes `talk_sessions`, `talk_to`, and
+`talk_latest`. A peer is visible when it shares the room (talk root), **or**
+when one record's bind-time `cwd` is an ancestor-or-equal of the other's —
+direct directory lineage, any depth, both directions. Siblings do not see each
+other; they relay through a common parent, which acts as the orchestrator.
+
+```
+/proj          sees /proj/a, /proj/b, /proj/a/x
+/proj/a        sees /proj, /proj/a/x         (not /proj/b)
+/proj          does not see /project         (separator boundary)
+```
+
+- `/`, `$HOME`, and every ancestor of `$HOME` never count as an ancestor, so a
+  session at `~` does not see the whole machine.
+- Paths are compared after `realpath`; on failure all sides fall back to the
+  trailing-slash-trimmed strings.
+- `liveRecords` scans every talk root (`<agent-dir>/pi-peer/talk/*`), filters by
+  heartbeat and `canSee` **before** the Herdr status read (one CLI spawn per
+  candidate), and tags each result with its root.
+- `talk_to` writes into the inbox under the **receiver's** root and
+  `talk_latest` reads the receiver's root; the receiver still polls only its
+  own inbox. Rooms and provisioning are unchanged.
 
 ### Invariants
 
@@ -100,6 +125,10 @@ no reply file, no `<peer_pong>`.
 - Registration records are removed at `session_shutdown`; panes that are no
   longer alive on the Herdr socket are excluded from discovery, and a `talk_to`
   to a missing/dead/ambiguous target fails loudly **before** any enqueue.
+- Names are soft labels: a new name avoids only names held by another **live**
+  (fresh-heartbeat) record in any room, and a resume keeps its name unless a
+  live peer took it meanwhile. There is no post-write race recheck — a rare
+  duplicate fails closed as ambiguous; the peer id is the stable address.
 - Identity is dual-layer: the **full session id** is the internal identity
   (artifact paths, inbox addressing, history source), while the **public peer
   id** (`peer-<last 3 chars>`) is a presentation-only alias used in tool output,
